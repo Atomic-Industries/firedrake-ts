@@ -90,8 +90,7 @@ class DAEProblem(object):
             when using an IMEX method for solving F(u̇, u, t) = G(u, t).
             If G is `None` the G(u, t) term in the equation is considered to be equal to zero.
         """
-        from firedrake import solving
-        from firedrake import function, Constant
+        from firedrake import Constant
 
         self.bcs = solving._extract_bcs(bcs)
         # Check form style consistency

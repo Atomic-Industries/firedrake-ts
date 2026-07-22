@@ -14,7 +14,6 @@ from firedrake.assemble import get_assembler
 
 from firedrake.solving_utils import _make_reasons, _SNESContext
 
-
 TSReasons = _make_reasons(PETSc.TS.ConvergedReason())
 
 
@@ -94,13 +93,13 @@ class _TSContext(_SNESContext):
             problem,
             mat_type,
             pmat_type,
-            appctx,
-            pre_jacobian_callback,
-            pre_function_callback,
-            post_jacobian_callback,
-            post_function_callback,
-            options_prefix,
-            transfer_manager,
+            appctx=appctx,
+            pre_jacobian_callback=pre_jacobian_callback,
+            pre_function_callback=pre_function_callback,
+            post_jacobian_callback=post_jacobian_callback,
+            post_function_callback=post_function_callback,
+            options_prefix=options_prefix,
+            transfer_manager=transfer_manager,
         )
 
         # Function to hold time derivative
