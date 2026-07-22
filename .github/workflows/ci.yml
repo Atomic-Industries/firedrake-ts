@@ -11,7 +11,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     container:
-      image: docker://firedrakeproject/firedrake-vanilla:latest
+      image: docker://firedrakeproject/firedrake-vanilla-default:2026.4.1
       options: --user root
 
     steps:
