@@ -7,16 +7,14 @@ from firedrake import function, cofunction, dmhooks
 from firedrake.exceptions import ConvergenceError
 from firedrake.petsc import PETSc
 from firedrake.formmanipulation import ExtractSubBlock
-from firedrake.utils import cached_property
+from functools import cached_property
 from firedrake.logging import warning
 from firedrake.assemble import get_assembler
 
 
 from firedrake.solving_utils import _make_reasons, _SNESContext
 
-
 TSReasons = _make_reasons(PETSc.TS.ConvergedReason())
-
 
 
 def check_ts_convergence(ts):
@@ -73,20 +71,36 @@ class _TSContext(_SNESContext):
     get the context (which is one of these objects) to find the
     Firedrake level information.
     """
-    @PETSc.Log.EventDecorator()
-    def __init__(self, problem, mat_type, pmat_type, appctx=None,
-                 pre_jacobian_callback=None, pre_function_callback=None,
-                 post_jacobian_callback=None, post_function_callback=None,
-                 options_prefix=None,
-                 transfer_manager=None,
-                 project_rhs=True,
-                 rhs_projection_parameters=None):
 
-        super().__init__(problem, mat_type, pmat_type, appctx,
-                 pre_jacobian_callback, pre_function_callback,
-                 post_jacobian_callback, post_function_callback,
-                 options_prefix,
-                 transfer_manager)
+    @PETSc.Log.EventDecorator()
+    def __init__(
+        self,
+        problem,
+        mat_type,
+        pmat_type,
+        appctx=None,
+        pre_jacobian_callback=None,
+        pre_function_callback=None,
+        post_jacobian_callback=None,
+        post_function_callback=None,
+        options_prefix=None,
+        transfer_manager=None,
+        project_rhs=True,
+        rhs_projection_parameters=None,
+    ):
+
+        super().__init__(
+            problem,
+            mat_type,
+            pmat_type,
+            appctx=appctx,
+            pre_jacobian_callback=pre_jacobian_callback,
+            pre_function_callback=pre_function_callback,
+            post_jacobian_callback=post_jacobian_callback,
+            post_function_callback=post_function_callback,
+            options_prefix=options_prefix,
+            transfer_manager=transfer_manager,
+        )
 
         # Function to hold time derivative
         self._xdot = problem.udot
@@ -98,19 +112,20 @@ class _TSContext(_SNESContext):
         self.G = problem.G
         self.dGdu = problem.dGdu
 
-        self.bcs_G = tuple(bc.extract_form('F') for bc in problem.bcs)
-        self.bcs_dGdu = tuple(bc.extract_form('J') for bc in problem.bcs)
+        self.bcs_G = tuple(bc.extract_form("F") for bc in problem.bcs)
+        self.bcs_dGdu = tuple(bc.extract_form("J") for bc in problem.bcs)
 
         if self.G is not None:
-            self._assemble_rhs_residual = get_assembler(self.G, bcs=self.bcs_G,
-                                                        form_compiler_parameters=self.fcp,
-                                                        zero_bc_nodes=True).assemble
+            self._assemble_rhs_residual = get_assembler(
+                self.G,
+                bcs=self.bcs_G,
+                form_compiler_parameters=self.fcp,
+                zero_bc_nodes=True,
+            ).assemble
             self.rhs_projection_parameters = rhs_projection_parameters
             self.project_rhs = project_rhs
             self._G_or_projected_G = self._projected_G if self.project_rhs else self._G
             self._rhs_jacobian_assembled = False
-
-
 
     def set_ifunction(self, ts):
         r"""Set the function to compute F(t,U,U_t) where F() = 0 is the DAE to be solved."""
@@ -130,7 +145,11 @@ class _TSContext(_SNESContext):
     def set_rhs_jacobian(self, ts):
         r"""Set the function to compute the Jacobian of G, where U_t = G(U,t), as well as the location to store the matrix."""
         if self.G is not None:
-            ts.setRHSJacobian(self.form_rhs_jacobian, J=self._rhs_jac.petscmat, P=self._rhs_pjac.petscmat)
+            ts.setRHSJacobian(
+                self.form_rhs_jacobian,
+                J=self._rhs_jac.petscmat,
+                P=self._rhs_pjac.petscmat,
+            )
 
     def set_nullspace(self, nullspace, ises=None, transpose=False, near=False):
         if nullspace is None:
@@ -146,6 +165,7 @@ class _TSContext(_SNESContext):
         from firedrake import replace, as_vector, split
         from firedrake_ts.ts_solver import DAEProblem as DAEP
         from firedrake.bcs import DirichletBC, EquationBC
+
         fields = tuple(tuple(f) for f in fields)
         splits = self._splits.get(tuple(fields))
         if splits is not None:
@@ -155,7 +175,7 @@ class _TSContext(_SNESContext):
         problem = self._problem
         splitter = ExtractSubBlock()
         for field in fields:
-            F = splitter.split(problem.F, argument_indices=(field, ))
+            F = splitter.split(problem.F, argument_indices=(field,))
             J = splitter.split(problem.J, argument_indices=(field, field))
             us = problem.u.subfunctions
             V = F.arguments()[0].function_space()
@@ -168,9 +188,9 @@ class _TSContext(_SNESContext):
             # subspace that shares data.
             pieces = [us[i].dat for i in field]
             if len(pieces) == 1:
-                val, = pieces
+                (val,) = pieces
                 subu = function.Function(V, val=val)
-                subsplit = (subu, )
+                subsplit = (subu,)
             else:
                 val = op2.MixedDat(pieces)
                 subu = function.Function(V, val=val)
@@ -216,20 +236,35 @@ class _TSContext(_SNESContext):
             bcs = []
             for bc in problem.bcs:
                 if isinstance(bc, DirichletBC):
-                    bc_temp = bc.reconstruct(field=field, V=V, g=bc.function_arg, sub_domain=bc.sub_domain)
+                    bc_temp = bc.reconstruct(
+                        field=field, V=V, g=bc.function_arg, sub_domain=bc.sub_domain
+                    )
                 elif isinstance(bc, EquationBC):
                     bc_temp = bc.reconstruct(field, V, subu, u)
                 if bc_temp is not None:
                     bcs.append(bc_temp)
-            new_problem = DAEP(F, subu,
-            		       problem.udot, problem.tspan,
-                	       bcs=bcs, J=J, Jp=Jp,
-                               form_compiler_parameters=problem.form_compiler_parameters,
-                               G=G, time=problem.time)
+            new_problem = DAEP(
+                F,
+                subu,
+                problem.udot,
+                problem.tspan,
+                bcs=bcs,
+                J=J,
+                Jp=Jp,
+                form_compiler_parameters=problem.form_compiler_parameters,
+                G=G,
+                time=problem.time,
+            )
             new_problem._constant_jacobian = problem._constant_jacobian
-            splits.append(type(self)(new_problem, mat_type=self.mat_type, pmat_type=self.pmat_type,
-                                     appctx=self.appctx,
-                                     transfer_manager=self.transfer_manager))
+            splits.append(
+                type(self)(
+                    new_problem,
+                    mat_type=self.mat_type,
+                    pmat_type=self.pmat_type,
+                    appctx=self.appctx,
+                    transfer_manager=self.transfer_manager,
+                )
+            )
         return self._splits.setdefault(tuple(fields), splits)
 
     @staticmethod
@@ -392,6 +427,7 @@ class _TSContext(_SNESContext):
         :arg P: the preconditioner matrix (a Mat)
         """
         from firedrake.bcs import DirichletBC
+
         dm = ksp.getDM()
         ctx = dmhooks.get_appctx(dm)
         problem = ctx._problem
@@ -454,14 +490,14 @@ class _TSContext(_SNESContext):
             self._assemble_rhs_residual(self._G)
             if self.project_rhs:
                 # TODO maybe the riesz_repre is the correct way?
-                #assign(self._projected_G, self._G.riesz_representation())
+                # assign(self._projected_G, self._G.riesz_representation())
                 self._rhs_projection_solver.solve(self._projected_G, self._G)
             # else assembled rhs residual that is saved in self._G is used
 
     @cached_property
     def _rhs_jac(self):
         if self.G is not None:
-	        return self._assembler_rhs_jac.allocate()
+            return self._assembler_rhs_jac.allocate()
         else:
             return None
 
@@ -472,7 +508,7 @@ class _TSContext(_SNESContext):
     @cached_property
     def _assemble_rhs_jac(self):
         if self.G is not None:
-	        return self._assembler_rhs_jac.assemble
+            return self._assembler_rhs_jac.assemble
         else:
             return None
 
@@ -482,4 +518,11 @@ class _TSContext(_SNESContext):
 
     @cached_property
     def _assembler_rhs_jac(self):
-        return get_assembler(self.dGdu, bcs=self.bcs_dGdu, form_compiler_parameters=self.fcp, mat_type=self.mat_type, options_prefix=self.options_prefix, appctx=self.appctx)
+        return get_assembler(
+            self.dGdu,
+            bcs=self.bcs_dGdu,
+            form_compiler_parameters=self.fcp,
+            mat_type=self.mat_type,
+            options_prefix=self.options_prefix,
+            appctx=self.appctx,
+        )

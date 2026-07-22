@@ -1,10 +1,12 @@
 import ufl
 from itertools import chain
+from functools import cached_property
 from contextlib import ExitStack
 
-from firedrake import dmhooks, slate, solving, solving_utils, ufl_expr, utils
+from firedrake import dmhooks, slate, solving, solving_utils, ufl_expr
 from firedrake import function
-from firedrake.petsc import PETSc, OptionsManager, flatten_parameters
+from firedrake.petsc import PETSc
+from petsctools import OptionsManager, flatten_parameters
 from firedrake.bcs import DirichletBC
 
 from firedrake_ts.solving_utils import check_ts_convergence, _TSContext
@@ -12,28 +14,44 @@ from firedrake_ts.solving_utils import check_ts_convergence, _TSContext
 
 def check_pde_args(F, G, J, Jp):
     if not isinstance(F, (ufl.BaseForm, slate.TensorBase)):
-        raise TypeError("Provided residual is a '%s', not a BaseForm or Slate Tensor" % type(F).__name__)
+        raise TypeError(
+            "Provided residual is a '%s', not a BaseForm or Slate Tensor"
+            % type(F).__name__
+        )
     if len(F.arguments()) != 1:
         raise ValueError("Provided residual is not a linear form")
     if G is not None and not isinstance(G, (ufl.BaseForm, slate.TensorBase)):
-        raise TypeError(f"Provided G residual is a '{type(G).__name__}', not a BaseForm or Slate Tensor")
+        raise TypeError(
+            f"Provided G residual is a '{type(G).__name__}', not a BaseForm or Slate Tensor"
+        )
     if G is not None and len(G.arguments()) != 1:
         raise ValueError("Provided G residual is not a linear form")
     if not isinstance(J, (ufl.BaseForm, slate.TensorBase)):
-        raise TypeError("Provided Jacobian is a '%s', not a BaseForm or Slate Tensor" % type(J).__name__)
+        raise TypeError(
+            "Provided Jacobian is a '%s', not a BaseForm or Slate Tensor"
+            % type(J).__name__
+        )
     if len(J.arguments()) != 2:
         raise ValueError("Provided Jacobian is not a bilinear form")
     if Jp is not None and not isinstance(Jp, (ufl.BaseForm, slate.TensorBase)):
-        raise TypeError("Provided preconditioner is a '%s', not a BaseForm or Slate Tensor" % type(Jp).__name__)
+        raise TypeError(
+            "Provided preconditioner is a '%s', not a BaseForm or Slate Tensor"
+            % type(Jp).__name__
+        )
     if Jp is not None and len(Jp.arguments()) != 2:
         raise ValueError("Provided preconditioner is not a bilinear form")
 
 
 def is_form_consistent(is_linear, bcs):
     # Check form style consistency
-    if not (is_linear == all(bc.is_linear for bc in bcs if not isinstance(bc, DirichletBC))
-            or not is_linear == all(not bc.is_linear for bc in bcs if not isinstance(bc, DirichletBC))):
-        raise TypeError("Form style mismatch: some forms are given in 'F == 0' style, but others are given in 'A == b' style.")
+    if not (
+        is_linear == all(bc.is_linear for bc in bcs if not isinstance(bc, DirichletBC))
+        or not is_linear
+        == all(not bc.is_linear for bc in bcs if not isinstance(bc, DirichletBC))
+    ):
+        raise TypeError(
+            "Form style mismatch: some forms are given in 'F == 0' style, but others are given in 'A == b' style."
+        )
 
 
 class DAEProblem(object):
@@ -72,8 +90,7 @@ class DAEProblem(object):
             when using an IMEX method for solving F(u̇, u, t) = G(u, t).
             If G is `None` the G(u, t) term in the equation is considered to be equal to zero.
         """
-        from firedrake import solving
-        from firedrake import function, Constant
+        from firedrake import Constant
 
         self.bcs = solving._extract_bcs(bcs)
         # Check form style consistency
@@ -90,7 +107,8 @@ class DAEProblem(object):
 
         if not isinstance(self.u_restrict, function.Function):
             raise TypeError(
-                "Provided solution is a '%s', not a Function" % type(self.u_restrict).__name__
+                "Provided solution is a '%s', not a Function"
+                % type(self.u_restrict).__name__
             )
         if not isinstance(self.udot, function.Function):
             raise TypeError(
@@ -105,7 +123,9 @@ class DAEProblem(object):
 
         # Use the user-provided Jacobian. If none is provided, derive
         # the Jacobian from the residual.
-        self.J = self.shift * ufl_expr.derivative(F, udot) + (J or ufl_expr.derivative(F, u))
+        self.J = self.shift * ufl_expr.derivative(F, udot) + (
+            J or ufl_expr.derivative(F, u)
+        )
 
         # Derive the Jacobian for the G residual
         self.dGdu = ufl_expr.derivative(G, u) if G is not None else None
@@ -122,7 +142,7 @@ class DAEProblem(object):
         for bc in self.bcs:
             yield from bc.dirichlet_bcs()
 
-    @utils.cached_property
+    @cached_property
     def dm(self):
         return self.u_restrict.function_space().dm
 
@@ -254,7 +274,7 @@ class DAESolver(OptionsManager):
 
         self.set_default_parameter("ts_exact_final_time", "stepover")
         # allow a certain number of failures (step will be rejected and retried)
-        #self.set_default_parameter("ts_max_snes_failures", 5)
+        # self.set_default_parameter("ts_max_snes_failures", 5)
 
         self._set_problem_eval_funcs(
             ctx, problem, nullspace, nullspace_T, near_nullspace
@@ -354,11 +374,11 @@ class DAESolver(OptionsManager):
                 # Ensure options database has full set of options (so monitors
                 # work right)
                 for ctx in chain(
-                        (
-                            self.inserted_options(),
-                            dmhooks.add_hooks(dm, self, appctx=self._ctx),
-                        ),
-                        self._transfer_operators,
+                    (
+                        self.inserted_options(),
+                        dmhooks.add_hooks(dm, self, appctx=self._ctx),
+                    ),
+                    self._transfer_operators,
                 ):
                     stack.enter_context(ctx)
                 self.ts.solve(work)
@@ -367,8 +387,7 @@ class DAESolver(OptionsManager):
         check_ts_convergence(self.ts)
 
     def adjoint_solve(self):
-        r"""Solve the adjoint problem.
-        """
+        r"""Solve the adjoint problem."""
         self._set_problem_eval_funcs(
             self._ctx,
             self._problem,
