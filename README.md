@@ -2,7 +2,7 @@
 
 The firedrake-ts library provides an interface to PETSc TS for the scalable solution of DAEs arising from the discretization of time-dependent PDEs.
 
-This is Atomic Industries' fork of [IvanYashchuk/firedrake-ts](https://github.com/IvanYashchuk/firedrake-ts), which has been inactive for several years. We maintain it against current Firedrake releases because [sundrake](https://github.com/Atomic-Industries/sundrake) depends on it.
+This is Atomic Industries' fork of [IvanYashchuk/firedrake-ts](https://github.com/IvanYashchuk/firedrake-ts), which has been inactive for several years.
 
 ## Example
 
@@ -66,9 +66,13 @@ uvx pre-commit install
 
 ### Release
 
-Publishing is automated by GitHub Actions. Bump `version` in `pyproject.toml`, then push a matching `vX.Y.Z` tag on `master`; CI lints, tests, builds, publishes to the Atomic registry and creates a GitHub release. The tag and the `pyproject.toml` version must agree — CI fails the publish job if they do not.
+Bump `version` in `pyproject.toml` and push a matching `vX.Y.Z` tag on `master`. CI lints, tests and creates the GitHub release with the built sdist and wheel attached; it fails the release if the tag and the version disagree. Bugfixes bump the patch version, new features the minor version, and backward incompatible changes the major version.
 
-Bugfixes bump the patch version, new features the minor version, and backward incompatible changes the major version.
+Then upload to the Atomic registry from a machine on the VPN:
+
+```bash
+uv build && uv publish --index=atomic --username="" --password=""
+```
 
 ## Reporting bugs
 

@@ -28,11 +28,7 @@ urls = { homepage = "https://github.com/Atomic-Industries/firedrake-ts" }
 requires-python = ">=3.12"
 
 # Firedrake is deliberately NOT declared as a dependency. It is supplied by the
-# environment -- the firedrakeproject/firedrake-vanilla-default image in CI and
-# in downstream containers. Declaring it would make every downstream `uv sync`
-# (sundrake pulls this package in from a git ref) try to resolve and build
-# Firedrake and PETSc from source. See the README for what the environment must
-# provide.
+# environment -- the firedrakeproject/firedrake-vanilla-default image in CI.
 dependencies = []
 
 [dependency-groups]

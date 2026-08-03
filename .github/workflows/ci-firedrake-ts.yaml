@@ -93,18 +93,27 @@ jobs:
             coverage.md
             htmlcov/
 
+      # No token: CODECOV_TOKEN is not available to this repo, so the old
+      # workflow's reference to it silently resolved to an empty string. This
+      # is a public repo, so Codecov accepts the upload without one.
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
           fail_ci_if_error: false
 
-  publish:
-    name: Package publication
+  # No publish job: pypi.atmc.dev is only reachable over the VPN, and the
+  # org-level Tailscale secrets are not shared with this repo (it is the only
+  # public one of the Atomic Python repos). Uploads to the Atomic registry are
+  # done by hand from a machine on the VPN -- see the README. Everything below
+  # needs no secrets.
+  release:
+    name: Version release
     runs-on: ubuntu-latest
     needs: [lint, test]
     if: github.ref_type == 'tag'
+    permissions:
+      contents: write
     steps:
       - name: Checkout repo
         uses: actions/checkout@v5
@@ -113,7 +122,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
 
       # The version in pyproject.toml is static, so a tag that disagrees with
-      # it would publish under the wrong version. Fail before the upload.
+      # it would release under the wrong version. Fail before anything is cut.
       - name: Check tag matches project version
         run: |
           version="$(uv version --short)"
@@ -123,51 +132,8 @@ jobs:
             exit 1
           fi
 
-      - name: Setup VPN
-        uses: tailscale/github-action@v3
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:github-workflow
-
       - name: Build package
-        run: uv build 2>&1 | tee build.md
-
-      - name: Upload package
-        uses: actions/upload-artifact@v4
-        with:
-          name: firedrake_ts-py3-none-any
-          path: |
-            dist/*.tar.gz
-            dist/*.whl
-
-      - name: Publish package
-        run: |
-          uv publish --index=atomic --username="" --password="" \
-          2>&1 | tee publish.md
-
-      - name: Create summary
-        run: |
-          {
-            echo '```'
-            cat build.md
-            echo '```'
-            echo '```'
-            cat publish.md
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  release:
-    name: Version release
-    runs-on: ubuntu-latest
-    needs: publish
-    if: github.ref_type == 'tag'
-    steps:
-      - name: Download package
-        uses: actions/download-artifact@v4
-        with:
-          name: firedrake_ts-py3-none-any
-          path: dist/
+        run: uv build
 
       - name: Create release
         uses: softprops/action-gh-release@v2
