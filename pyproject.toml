@@ -39,7 +39,9 @@ dependencies = []
 dev = [
     "pytest>=8.3,<9",
     "pytest-cov>=7.0,<8",
-    "ruff>=0.15.11,<1",
+    # Keep in step with the rev in .pre-commit-config.yaml: the hook and CI
+    # must run the same formatter, or they disagree about the same file.
+    "ruff>=0.16.1,<0.17",
 ]
 
 [build-system]
