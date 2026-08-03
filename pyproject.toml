@@ -55,6 +55,32 @@ url = "https://pypi.atmc.dev/"
 publish-url = "https://pypi.atmc.dev/"
 explicit = true
 
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "RUF",  # ruff-specific
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [ "firedrake_ts" ]
+section-order = [ "future", "standard-library", "third-party", "first-party", "local-folder" ]
+
+# `from firedrake import *` is the idiomatic way to write Firedrake models, and
+# every example and model-level test uses it. Star imports defeat pyflakes'
+# name resolution, so allow them where they belong rather than rewriting the
+# examples into something no Firedrake user would recognize.
+[tool.ruff.lint.per-file-ignores]
+"examples/*" = [ "F403", "F405" ]
+"tests/*" = [ "F403", "F405" ]
+
 [tool.pytest.ini_options]
 testpaths = [ "tests" ]
 

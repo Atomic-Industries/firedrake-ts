@@ -3,9 +3,10 @@
 # and
 # https://github.com/firedrakeproject/firedrake-bench/blob/master/cahn_hilliard/firedrake_cahn_hilliard.py
 
-import firedrake_ts
-from firedrake import *
 import numpy as np
+from firedrake import *
+
+import firedrake_ts
 
 # Model parameters
 lmbda = 1.0e-02  # surface parameter
@@ -29,7 +30,7 @@ c_t, mu_t = split(u_t)
 
 # Compute the chemical potential df/dc
 c = variable(c)
-f = 100 * c ** 2 * (1 - c) ** 2
+f = 100 * c**2 * (1 - c) ** 2
 dfdc = diff(f, c)
 
 # Weak statement of the equations
@@ -38,12 +39,12 @@ F1 = mu * v * dx - dfdc * v * dx - lmbda * dot(grad(c), grad(v)) * dx
 F = F0 + F1
 
 rng = np.random.default_rng(11)
-c , mu = u.subfunctions
+c, mu = u.subfunctions
 with c.dat.vec as v:
-    v[:]=0.63 + 0.2*(0.5-rng.random(v.size))
+    v[:] = 0.63 + 0.2 * (0.5 - rng.random(v.size))
 
-    
-pc = "lu" #"fieldsplit"
+
+pc = "lu"  # "fieldsplit"
 ksp = "lgmres"
 inner_ksp = "preonly"
 maxit = 1
@@ -71,7 +72,7 @@ params = {
 
 params["snes_monitor"] = None
 params["ts_monitor"] = None
-#params["ts_view"] = None
+# params["ts_view"] = None
 
 problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 2 * dt))
 solver = firedrake_ts.DAESolver(problem, solver_parameters=params)
@@ -101,7 +102,7 @@ if pc in ["fieldsplit", "ilu"]:
     opts["pc_type"] = "hypre"
     ksp_hats.setFromOptions()
 
-    class SchurInv(object):
+    class SchurInv:
         def mult(self, mat, x, y):
             tmp1 = y.duplicate()
             tmp2 = y.duplicate()

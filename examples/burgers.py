@@ -1,5 +1,6 @@
 # This example is based on https://firedrakeproject.org/demos/burgers.py.html
 from firedrake import *
+
 import firedrake_ts
 
 n = 30

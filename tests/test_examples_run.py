@@ -1,10 +1,9 @@
-import pytest
-from os.path import abspath, basename, dirname, join, splitext
-import os
-import subprocess
 import glob
+import subprocess
 import sys
+from os.path import abspath, basename, dirname, join
 
+import pytest
 
 cwd = abspath(dirname(__file__))
 examples_dir = join(cwd, "..", "examples")

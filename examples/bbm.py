@@ -2,6 +2,7 @@
 # https://github.com/rckirby/Irksome/blob/master/demos/bbm/demo_bbm.py.rst
 
 from firedrake import *
+
 import firedrake_ts
 
 
@@ -27,9 +28,7 @@ v = TestFunction(V)
 c = Constant(0.5)
 center = 30.0
 delta = -c * center
-uexact = (
-    3 * c ** 2 / (1 - c ** 2) * sech(0.5 * (c * x - c * t / (1 - c ** 2) + delta)) ** 2
-)
+uexact = 3 * c**2 / (1 - c**2) * sech(0.5 * (c * x - c * t / (1 - c**2) + delta)) ** 2
 u.interpolate(uexact)
 
 F = (
@@ -40,8 +39,8 @@ F = (
 )
 
 I1 = u * dx
-I2 = (u ** 2 + (u.dx(0)) ** 2) * dx
-I3 = ((u.dx(0)) ** 2 - u ** 3 / 3) * dx
+I2 = (u**2 + (u.dx(0)) ** 2) * dx
+I3 = ((u.dx(0)) ** 2 - u**3 / 3) * dx
 I1s = []
 I2s = []
 I3s = []
@@ -60,7 +59,8 @@ params = {
     "pc_type": "lu",
     "pc_factor_mat_solver_type": "mumps",
     "ts_type": "theta",
-    "ts_theta_theta": 0.5,  # implicit midpoint method | the Gauss–Legendre method of order two
+    # implicit midpoint method | the Gauss-Legendre method of order two
+    "ts_theta_theta": 0.5,
     "ts_exact_final_time": "matchstep",
 }
 
