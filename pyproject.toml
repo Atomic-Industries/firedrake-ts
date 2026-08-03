@@ -1,15 +1,97 @@
-[tool.black]
-include = '\.pyi?$'
-exclude = '''
-/(
-    \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | _build
-  | buck-out
-  | build
-  | dist
-)/
-'''
+[project]
+name = "firedrake-ts"
+version = "0.3.0"
+description = "PETSc TS interface for Firedrake: scalable solution of DAEs arising from time-dependent PDEs"
+readme = "README.md"
+license = "MIT"
+license-files = [ "LICENSE" ]
+authors = [
+    { name = "Ivan Yashchuk" },
+    { name = "Vojta Molda", email = "vojta@atomic.industries" },
+    { name = "Jared Callaham", email = "jared@atomic.industries" },
+]
+maintainers = [
+    { name = "Vojta Molda", email = "vojta@atomic.industries" },
+    { name = "Jared Callaham", email = "jared@atomic.industries" },
+]
+keywords = [ "firedrake", "petsc", "ts", "dae", "finite elements", "simulation" ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering",
+]
+urls = { homepage = "https://github.com/Atomic-Industries/firedrake-ts" }
+requires-python = ">=3.12"
+
+# Firedrake is deliberately NOT declared as a dependency. It is supplied by the
+# environment -- the firedrakeproject/firedrake-vanilla-default image in CI.
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-cov>=7.0,<8",
+    # Keep in step with the rev in .pre-commit-config.yaml: the hook and CI
+    # must run the same formatter, or they disagree about the same file.
+    "ruff>=0.16.1,<0.17",
+]
+
+[build-system]
+requires = [ "hatchling" ]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [ "firedrake_ts" ]
+
+[[tool.uv.index]]
+name = "atomic"
+url = "https://pypi.atmc.dev/"
+publish-url = "https://pypi.atmc.dev/"
+explicit = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "RUF",  # ruff-specific
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [ "firedrake_ts" ]
+section-order = [ "future", "standard-library", "third-party", "first-party", "local-folder" ]
+
+# `from firedrake import *` is the idiomatic way to write Firedrake models, and
+# every example and model-level test uses it. Star imports defeat pyflakes'
+# name resolution, so allow them where they belong rather than rewriting the
+# examples into something no Firedrake user would recognize.
+[tool.ruff.lint.per-file-ignores]
+"examples/*" = [ "F403", "F405" ]
+"tests/*" = [ "F403", "F405" ]
+
+[tool.pytest.ini_options]
+testpaths = [ "tests" ]
+
+[tool.coverage.run]
+branch = true
+source = [ "firedrake_ts" ]
+
+[tool.coverage.report]
+ignore_errors = true
+omit = [
+    "examples/*",
+    "tests/*",
+]
+
+[tool.coverage.html]
+directory = "coverage_html"

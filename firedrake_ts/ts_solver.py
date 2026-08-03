@@ -1,42 +1,42 @@
-import ufl
-from itertools import chain
-from functools import cached_property
 from contextlib import ExitStack
+from functools import cached_property
+from itertools import chain
 
-from firedrake import dmhooks, slate, solving, solving_utils, ufl_expr
-from firedrake import function
-from firedrake.petsc import PETSc
-from petsctools import OptionsManager, flatten_parameters
+import ufl
+from firedrake import dmhooks, function, slate, solving, ufl_expr
 from firedrake.bcs import DirichletBC
+from firedrake.petsc import PETSc
+from petsctools import OptionsManager
 
-from firedrake_ts.solving_utils import check_ts_convergence, _TSContext
+from firedrake_ts.solving_utils import _TSContext, check_ts_convergence
 
 
 def check_pde_args(F, G, J, Jp):
     if not isinstance(F, (ufl.BaseForm, slate.TensorBase)):
         raise TypeError(
-            "Provided residual is a '%s', not a BaseForm or Slate Tensor"
-            % type(F).__name__
+            f"Provided residual is a '{type(F).__name__}', "
+            "not a BaseForm or Slate Tensor"
         )
     if len(F.arguments()) != 1:
         raise ValueError("Provided residual is not a linear form")
     if G is not None and not isinstance(G, (ufl.BaseForm, slate.TensorBase)):
         raise TypeError(
-            f"Provided G residual is a '{type(G).__name__}', not a BaseForm or Slate Tensor"
+            f"Provided G residual is a '{type(G).__name__}', "
+            "not a BaseForm or Slate Tensor"
         )
     if G is not None and len(G.arguments()) != 1:
         raise ValueError("Provided G residual is not a linear form")
     if not isinstance(J, (ufl.BaseForm, slate.TensorBase)):
         raise TypeError(
-            "Provided Jacobian is a '%s', not a BaseForm or Slate Tensor"
-            % type(J).__name__
+            f"Provided Jacobian is a '{type(J).__name__}', "
+            "not a BaseForm or Slate Tensor"
         )
     if len(J.arguments()) != 2:
         raise ValueError("Provided Jacobian is not a bilinear form")
     if Jp is not None and not isinstance(Jp, (ufl.BaseForm, slate.TensorBase)):
         raise TypeError(
-            "Provided preconditioner is a '%s', not a BaseForm or Slate Tensor"
-            % type(Jp).__name__
+            f"Provided preconditioner is a '{type(Jp).__name__}', "
+            "not a BaseForm or Slate Tensor"
         )
     if Jp is not None and len(Jp.arguments()) != 2:
         raise ValueError("Provided preconditioner is not a bilinear form")
@@ -50,11 +50,12 @@ def is_form_consistent(is_linear, bcs):
         == all(not bc.is_linear for bc in bcs if not isinstance(bc, DirichletBC))
     ):
         raise TypeError(
-            "Form style mismatch: some forms are given in 'F == 0' style, but others are given in 'A == b' style."
+            "Form style mismatch: some forms are given in 'F == 0' style, "
+            "but others are given in 'A == b' style."
         )
 
 
-class DAEProblem(object):
+class DAEProblem:
     r"""Nonlinear variational problem in DAE form F(u̇, u, t) = G(u, t)."""
 
     def __init__(
@@ -88,7 +89,8 @@ class DAEProblem(object):
             are given either in 'A == b' style or in 'F == 0' style.
         :param G: G(t, u) term that will be treated explicitly
             when using an IMEX method for solving F(u̇, u, t) = G(u, t).
-            If G is `None` the G(u, t) term in the equation is considered to be equal to zero.
+            If G is `None` the G(u, t) term in the equation is considered to
+            be equal to zero.
         """
         from firedrake import Constant
 
@@ -107,13 +109,13 @@ class DAEProblem(object):
 
         if not isinstance(self.u_restrict, function.Function):
             raise TypeError(
-                "Provided solution is a '%s', not a Function"
-                % type(self.u_restrict).__name__
+                f"Provided solution is a '{type(self.u_restrict).__name__}', "
+                "not a Function"
             )
         if not isinstance(self.udot, function.Function):
             raise TypeError(
-                "Provided time derivative is a '%s', not a Function"
-                % type(self.udot).__name__
+                f"Provided time derivative is a '{type(self.udot).__name__}', "
+                "not a Function"
             )
 
         # current value of time that may be used in weak form
@@ -192,7 +194,8 @@ class DAESolver(OptionsManager):
             {'snes_monitor': None}
         To use the ``pre_jacobian_callback`` or ``pre_function_callback``
         functionality, the user-defined function must accept the current
-        solution and the current time derivative as a petsc4py Vec. Example usage is given below:
+        solution and the current time derivative as a petsc4py Vec. Example
+        usage is given below:
         .. code-block:: python
             def update_diffusivity(current_solution, current_time_derivative):
                 with cursol.dat.vec_wo as v:
@@ -219,7 +222,7 @@ class DAESolver(OptionsManager):
         self.near_nullspace = near_nullspace
         self.nullspace_T = nullspace_T
 
-        super(DAESolver, self).__init__(parameters, options_prefix)
+        super().__init__(parameters, options_prefix)
 
         # Allow anything, interpret "matfree" as matrix_free.
         mat_type = self.parameters.get("mat_type")

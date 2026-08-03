@@ -1,5 +1,7 @@
+from firedrake.petsc import PETSc
+
 from .ts_solver import DAEProblem, DAESolver
 
-from firedrake.petsc import PETSc
+__all__ = ["DAEProblem", "DAESolver"]
 
 PETSc.Sys.popErrorHandler()

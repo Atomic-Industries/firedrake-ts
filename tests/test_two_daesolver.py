@@ -1,5 +1,5 @@
-import pytest
 from firedrake import *
+
 import firedrake_ts
 
 
@@ -32,7 +32,7 @@ def test_two_ts():
     bc2 = DirichletBC(V2, 0.0, "on_boundary")
 
     problem2 = firedrake_ts.DAEProblem(F2, u2, u_t2, (0.0, 1.0), bcs=bc2)
-    solver2 = firedrake_ts.DAESolver(problem2)  # noqa: F841
+    solver2 = firedrake_ts.DAESolver(problem2)
 
     # Now, after defining solver2, solver.solve() shouldn't raise any errors
     solver.solve()

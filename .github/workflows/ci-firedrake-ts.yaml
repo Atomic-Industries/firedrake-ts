@@ -1,0 +1,147 @@
+name: ci-firedrake-ts
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    name: Source format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+
+      # Only the dev group: ruff needs nothing from Firedrake, so this job runs
+      # on a plain runner instead of the multi-gigabyte Firedrake image.
+      - name: Install dev dependencies
+        run: uv sync --only-group dev
+
+      - name: Lint
+        run: uv run --only-group dev ruff check .
+
+      - name: Check source tree format
+        run: uv run --only-group dev ruff format --check .
+
+  test:
+    name: Unit test
+    runs-on: ubuntu-latest
+    container:
+      image: docker://firedrakeproject/firedrake-vanilla-default:2026.4.1
+      options: --user root
+
+    env:
+      # Firedrake and its dependencies are installed into the image's system
+      # Python (PETSc, petsc4py and friends in dist-packages, Firedrake itself
+      # on PYTHONPATH). A --system-site-packages venv built on that interpreter
+      # inherits all of it, which is the same arrangement sundrake's Dockerfile
+      # uses. Pin uv to the system interpreter so it cannot substitute a
+      # downloaded build that would see none of those packages.
+      UV_PROJECT_ENVIRONMENT: /opt/venv-ci
+      UV_PYTHON_PREFERENCE: only-system
+      UV_PYTHON_DOWNLOADS: never
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Firedrake info
+        run: |
+          which python3
+          python3 -c "import sys; print('\n'.join(sys.path))"
+          python3 -c "from firedrake import *"
+
+      - name: Create project environment
+        run: uv venv --system-site-packages --python /usr/bin/python3
+
+      # --inexact: the image ships pytest plugins (mpi-pytest and friends) that
+      # are not in our lockfile, and an exact sync would prune them.
+      - name: Install package and dependencies
+        run: uv sync --inexact --group dev
+
+      - name: Run unit tests with coverage
+        run: |
+          uv run pytest --verbose \
+            --cov=firedrake_ts \
+            --cov-report=markdown \
+            --cov-report=html \
+            --cov-report=xml
+
+      - name: Summarize coverage
+        run: cat coverage.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.xml
+            coverage.md
+            htmlcov/
+
+      # No token: CODECOV_TOKEN is not available to this repo, so the old
+      # workflow's reference to it silently resolved to an empty string. This
+      # is a public repo, so Codecov accepts the upload without one.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  # No publish job: pypi.atmc.dev is only reachable over the VPN, and the
+  # org-level Tailscale secrets are not shared with this repo (it is the only
+  # public one of the Atomic Python repos). Uploads to the Atomic registry are
+  # done by hand from a machine on the VPN -- see the README. Everything below
+  # needs no secrets.
+  release:
+    name: Version release
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+
+      # The version in pyproject.toml is static, so a tag that disagrees with
+      # it would release under the wrong version. Fail before anything is cut.
+      - name: Check tag matches project version
+        run: |
+          version="$(uv version --short)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match" \
+                 "project version ${version} in pyproject.toml"
+            exit 1
+          fi
+
+      - name: Build package
+        run: uv build
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: false
+          draft: false
+          files: |
+            dist/*.tar.gz
+            dist/*.whl

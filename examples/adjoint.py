@@ -2,9 +2,9 @@
 # http://www.dolfin-adjoint.org/en/latest/documentation/tutorial.html
 
 import firedrake as fd
-from firedrake.petsc import PETSc
-from firedrake import dmhooks
 import ufl
+from firedrake.petsc import PETSc
+
 import firedrake_ts
 
 equation = "burgers"  # 'burgers' or 'heat'
@@ -64,8 +64,8 @@ dJdu = fd.assemble(fd.derivative(J, u))
 with dJdu.dat.vec as vec:
     dJdu_vec = vec
 
-fdJdu=dJdu.riesz_representation()
-    
+fdJdu = dJdu.riesz_representation()
+
 print(f"Norm of dJdu before the adjoint solve: {dJdu_vec.norm()=} {fd.norm(fdJdu)=}")
 
 # setCostGradients accepts two PETSc Vecs
@@ -78,7 +78,7 @@ ts.setCostGradients(dJdu_vec, None)
 
 solver.adjoint_solve()
 
-fdJdu=dJdu.riesz_representation()
+fdJdu = dJdu.riesz_representation()
 print(f"Norm of dJdu after the adjoint solve: {dJdu_vec.norm()=} {fd.norm(fdJdu)=}")
 
 

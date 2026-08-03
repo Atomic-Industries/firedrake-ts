@@ -1,18 +1,14 @@
+from functools import cached_property
 from itertools import chain
 
 import numpy
-
-from pyop2 import op2
-from firedrake import function, cofunction, dmhooks
-from firedrake.exceptions import ConvergenceError
-from firedrake.petsc import PETSc
-from firedrake.formmanipulation import ExtractSubBlock
-from functools import cached_property
-from firedrake.logging import warning
+from firedrake import cofunction, dmhooks, function
 from firedrake.assemble import get_assembler
-
-
+from firedrake.exceptions import ConvergenceError
+from firedrake.formmanipulation import ExtractSubBlock
+from firedrake.petsc import PETSc
 from firedrake.solving_utils import _make_reasons, _SNESContext
+from pyop2 import op2
 
 TSReasons = _make_reasons(PETSc.TS.ConvergedReason())
 
@@ -33,7 +29,8 @@ def check_ts_convergence(ts):
     reason = TSReasons[r]
     if r < 0:
         raise ConvergenceError(
-            f"TS solve failed to converge after {ts.getStepNumber()} iterations. Reason: {reason}"
+            f"TS solve failed to converge after {ts.getStepNumber()} "
+            f"iterations. Reason: {reason}"
         )
 
 
@@ -60,8 +57,10 @@ class _TSContext(_SNESContext):
     :arg post_function_callback: User-defined function called immediately
         after residual assembly
     :arg options_prefix: The options prefix of the TS.
-    :arg project_rhs: If True the right-hand-side term is projected using a mass matrix solver.
-    :arg rhs_projection_parameters: Solver parameters of the right-hand-side projection solver.
+    :arg project_rhs: If True the right-hand-side term is projected using a
+        mass matrix solver.
+    :arg rhs_projection_parameters: Solver parameters of the right-hand-side
+        projection solver.
     :arg transfer_manager: Object that can transfer functions between
         levels, typically a :class:`~.TransferManager`
 
@@ -128,22 +127,26 @@ class _TSContext(_SNESContext):
             self._rhs_jacobian_assembled = False
 
     def set_ifunction(self, ts):
-        r"""Set the function to compute F(t,U,U_t) where F() = 0 is the DAE to be solved."""
+        r"""Set the function to compute F(t,U,U_t) where F() = 0 is the DAE to
+        be solved."""
         with self._F.dat.vec_wo as v:
             ts.setIFunction(self.form_function, v)
 
     def set_ijacobian(self, ts):
-        r"""Set the function to compute the matrix dF/dU + a*dF/dU_t where F(t,U,U_t) is the function provided with set_ifunction()"""
+        r"""Set the function to compute the matrix dF/dU + a*dF/dU_t where
+        F(t,U,U_t) is the function provided with set_ifunction()"""
         ts.setIJacobian(self.form_jacobian, J=self._jac.petscmat, P=self._pjac.petscmat)
 
     def set_rhs_function(self, ts):
-        r"""Set the function to compute G(t,u) where F() = G() is the equation to be solved."""
+        r"""Set the function to compute G(t,u) where F() = G() is the equation
+        to be solved."""
         if self.G is not None:
             with self._G_or_projected_G.dat.vec_wo as v:
                 ts.setRHSFunction(self.form_rhs_function, v)
 
     def set_rhs_jacobian(self, ts):
-        r"""Set the function to compute the Jacobian of G, where U_t = G(U,t), as well as the location to store the matrix."""
+        r"""Set the function to compute the Jacobian of G, where U_t = G(U,t),
+        as well as the location to store the matrix."""
         if self.G is not None:
             ts.setRHSJacobian(
                 self.form_rhs_jacobian,
@@ -162,9 +165,10 @@ class _TSContext(_SNESContext):
 
     @PETSc.Log.EventDecorator()
     def split(self, fields):
-        from firedrake import replace, as_vector, split
-        from firedrake_ts.ts_solver import DAEProblem as DAEP
+        from firedrake import as_vector, replace, split
         from firedrake.bcs import DirichletBC, EquationBC
+
+        from firedrake_ts.ts_solver import DAEProblem as DAEP
 
         fields = tuple(tuple(f) for f in fields)
         splits = self._splits.get(tuple(fields))
