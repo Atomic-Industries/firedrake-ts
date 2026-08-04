@@ -1,9 +1,4 @@
-"""ctypes access to a PETSc ``TS`` entry point that petsc4py does not expose.
-
-Only ``TSSetSNES`` is needed, to repair the SNES residual callback after
-Firedrake's RHS projection solver displaces it; see
-:func:`repair_ts_snes_callbacks`.
-"""
+"""ctypes access to a PETSc ``TS`` entry point that petsc4py does not expose"""
 
 import ctypes
 import glob
@@ -62,13 +57,6 @@ def repair_ts_snes_callbacks(ts):
     ``_SNESContext.form_function``. Because that solver is built on the same
     function space, it shares the TS's DM, so the install lands on the TS's SNES
     as well.
-
-    The consequence is severe and silent: ``_SNESContext.form_function``
-    assembles ``problem.F`` against a ``udot`` that the TS never updates, which
-    for a mass-matrix-only ``F`` is identically zero. Every stage solve then
-    "converges" in zero iterations at its initial guess, no explicit
-    contribution ever enters the state, and the solution does not advance at
-    all -- ``u' = -u`` integrates to ``u(1) = 1``.
 
     ``TSSetSNES`` reinstalls ``SNESTSFormFunction`` (and ``SNESTSFormJacobian``,
     when the Jacobian is still PETSc's). It is cheap and is what PETSc itself
