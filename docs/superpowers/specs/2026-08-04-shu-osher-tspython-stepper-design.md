@@ -54,8 +54,16 @@ is no partial reuse.
 
 **Existing convention.** `_TSContext._rhs_projection_solver` hands PETSc `M⁻¹G` in *state*
 space (it solves `derivative(F, udot) · x = G`), not the raw dual residual. `tests/test_imex.py`
-(7 tests) passes on this convention. It is exactly what a Shu–Osher substep needs: `Y + h·L(Y)`
-becomes a plain `axpy` with no solve invented by the stepper.
+passes on this convention. It is exactly what a Shu–Osher substep needs: `Y + h·L(Y)` becomes
+a plain `axpy` with no solve invented by the stepper.
+
+As of PR #6 (`368ec56`) the projection is a bare `PETSc.KSP` — `DEFAULT_KSP_PARAMETERS` minus
+`mat_type`, prefix `rhs_projection_solver_`, overridable via `rhs_projection_parameters`.
+**The bare KSP is load-bearing, not incidental.** A Firedrake `LinearSolver` is a
+`NonlinearVariationalSolver`, so constructing one installs `_SNESContext.form_function` on the
+shared DM's `DMSNES` and displaces `SNESTSFormFunction` on the TS's own SNES — after which
+every stage residual is identically zero and the solution never advances. Anything added to
+this code path must not construct a Firedrake solver on the TS's function space.
 
 **Pre-existing defect (blocker).** `_TSContext.split()` at `solving_utils.py:185` reads
 `problem.u.subfunctions`, but `DAEProblem` defines only `u_restrict`. Any mixed problem with
@@ -64,7 +72,13 @@ reproduced on a mixed space, with and without `G`, singular and nonsingular mass
 own `_SNESContext.split()` (`firedrake/solving_utils.py:379`) uses `problem.u_restrict`;
 `_TSContext.split()` is a stale copy predating the restricted-function-space rename, and
 Firedrake's `NonlinearVariationalProblem` sets both names while `DAEProblem` sets one.
-Occurrences to fix: lines 185, 230, 231, 234, 239.
+Occurrences to fix: `solving_utils.py` lines 185, 229, 230, 233, 238. Re-verified against
+`2d10d46` (post-PR-#6 master) — the merge did not touch it.
+
+**`_petsc_shim.py` no longer exists.** PR #6 retired it: `repair_ts_snes_callbacks` was only
+needed to undo the `LinearSolver`/`DMSNES` collision described above, and the bare KSP never
+causes it. The file must therefore be *reinstated* for the TSAdapt work rather than extended
+(§4).
 
 **Tableau algebra, verified independently.** For the `rk-method-spec.md` §5.1 explicit part
 (`A = [[0],[½,0],[½,½,0],[⅓,⅓,⅓,0]]`, `b = (⅓,⅓,⅓,0)`) at `r = 2`:
@@ -87,8 +101,22 @@ reimplement `TSAdaptChoose_Basic`'s PI controller in Python and hand-read
 that motivates `TSPYTHON`, and fails COOL-193's acceptance criterion as written.
 
 So `step` is ours, mirroring `TSStep_ARKIMEX`. The ctypes surface is confined to four entry
-points — `TSGetAdapt`, `TSAdaptCandidatesClear`, `TSAdaptCandidateAdd`, `TSAdaptChoose` —
-added to the existing `_petsc_shim.py` dlopen/ierr machinery (`3766c20` is in-repo precedent).
+points: `TSGetAdapt`, `TSAdaptCandidatesClear`, `TSAdaptCandidateAdd`, `TSAdaptChoose`.
+
+`_petsc_shim.py` is reinstated for this, and most of it is recoverable from history rather
+than written fresh. `git show 3766c20:firedrake_ts/_petsc_shim.py` already contains:
+
+- `_dlopen_petsc()` — resolves libpetsc's TS symbols despite petsc4py loading it `RTLD_LOCAL`,
+  by preferring the versioned `libpetsc.so*` under `PETSC_DIR`/`PETSC_ARCH` and falling back to
+  re-`dlopen`-ing petsc4py's extension module `RTLD_GLOBAL`. Non-obvious and already debugged.
+- `_load()` and `_check(ierr, what)` — the argtypes/restype and error-checking pattern.
+- **`TSGetAdapt` already declared** (`argtypes = [c_void_p, POINTER(c_void_p)]`), i.e. one of
+  the four, with the opaque-`TSAdapt`-handle problem already solved.
+
+So the genuinely new work is three declarations: `TSAdaptCandidatesClear`,
+`TSAdaptCandidateAdd`, `TSAdaptChoose`. Do **not** revive `repair_ts_snes_callbacks`
+(retired by PR #6) or `set_stage_hook` / `stage_hook_propagates` (the abandoned COOL-189
+approach).
 
 The shim is **not needed before milestone 5**: every earlier milestone runs fixed-step at
 `-ts_adapt_type none`. Deferring it keeps the riskiest unknown out of the critical path to
@@ -183,9 +211,12 @@ monolithic Jacobian *shape* so the caller's fieldsplit over the remaining block 
 applies unchanged. A reduced-IS solve is the obvious later optimisation; correctness first.
 
 **Completion.** `x^{n+1}` uses the same convex-combination row of `[P | q]`, so it is bounded
-by the same induction as the stages. No post-step clamp — see the §3 certificate. This
-deliberately contradicts `rk-method-spec.md` R8 ("a post-step clamp is required regardless of
-tableau") and open item §6.6; §9 records how that gets resolved with evidence.
+by the same induction as the stages. **No post-step clamp** — see the §3 certificate.
+
+This sets aside `rk-method-spec.md` R8 ("a post-step clamp is required regardless of tableau")
+and open item §6.6, on two independent grounds: the certificate above, and the tableau design
+process having separately found R8 incompatible with the SSPRK2 tableau. §9 records how the
+decision is confirmed by measurement either way.
 
 ## 8. Error handling
 
@@ -255,14 +286,15 @@ above `R(A,b)`, both of which §8 already gates.
 
 - Realized order falls toward 1 wherever the limiter is active — it is a first-order
   perturbation. Error control still functions; it measures the limited method.
-- Depends on the IMEX residual fix in `3766c20` (`repair_ts_snes_callbacks`), without which
-  the explicit part never reaches the state.
-- `_TSContext.split()` builds sub-contexts without passing `options_prefix`, `project_rhs`,
-  or `rhs_projection_parameters` (`solving_utils.py:266`). A split sub-context carrying `G`
-  would therefore build a default-parameter projection solver with no prefix. Believed
-  unreachable — the projection is only triggered from `form_rhs_function`, which split
-  contexts do not serve — but it sits on the code path M0 touches, so confirm rather than
-  assume while there.
+- Depends on the IMEX explicit-part fix now in `master` via PR #6 (`368ec56`, bare KSP),
+  without which the explicit part never reaches the state. The earlier `3766c20`
+  (`repair_ts_snes_callbacks`) route to the same fix has been retired; do not reintroduce it.
+- `DAESolver` forwards `project_rhs` and `rhs_projection_parameters` to `_TSContext`
+  (`ts_solver.py:227`, `:254`), but `_TSContext.split()` still constructs sub-contexts without
+  them, or an `options_prefix` (`solving_utils.py:264`). A split sub-context carrying `G` would
+  therefore build a default-parameter projection KSP with no prefix. Believed unreachable — the
+  projection is only triggered from `form_rhs_function`, which split contexts do not serve —
+  but it sits on the exact code path M0 touches, so confirm rather than assume while there.
 - Performance is not a design constraint: per-stage cost is Firedrake assembly plus the
   implicit solve, so Python-level `axpy` orchestration is noise. The identity-row freeze and
   the un-skipped final explicit evaluation are both known, accepted inefficiencies.
