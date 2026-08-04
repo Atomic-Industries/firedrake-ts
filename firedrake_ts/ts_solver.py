@@ -183,13 +183,6 @@ class DAESolver(OptionsManager):
                after residual assembly.
         :kwarg monitor_callback: A user-defined function that will
                be used at every timestep to display the iteration's progress.
-        :kwarg stage_callback: A user-defined function ``f(t, u)`` called on
-               every implicitly-solved Runge-Kutta stage, after that stage's
-               nonlinear solve and before its derivatives are formed. ``u`` is
-               a :class:`~.Function` holding the stage value; modifications to
-               it propagate into the rest of the step. Intended for stage-local
-               post-processing such as a limiter. See the note in
-               :meth:`set_stage_callback` on what modifying a stage means.
         Example usage of the ``solver_parameters`` option: to set the
         nonlinear solver type to just use a linear solver, use
         .. code-block:: python
@@ -224,7 +217,6 @@ class DAESolver(OptionsManager):
         post_j_callback = kwargs.get("post_jacobian_callback")
         post_f_callback = kwargs.get("post_function_callback")
         monitor_callback = kwargs.get("monitor_callback")
-        stage_callback = kwargs.get("stage_callback")
 
         self.nullspace = nullspace
         self.near_nullspace = near_nullspace
@@ -302,13 +294,6 @@ class DAESolver(OptionsManager):
         self._transfer_operators = ()
         self._setup = False
 
-        # PETSc holds a raw function pointer for the stage hook, so the ctypes
-        # trampoline has to outlive this call.
-        self._stage_hook = None
-        self._stage_work = None
-        if stage_callback is not None:
-            self.set_stage_callback(stage_callback)
-
     def _set_problem_eval_funcs(
         self, ctx, problem, nullspace, nullspace_T, near_nullspace
     ):
@@ -348,55 +333,6 @@ class DAESolver(OptionsManager):
         ctx._nullspace = nullspace
         ctx._nullspace_T = nullspace_T
         ctx._near_nullspace = near_nullspace
-
-    def set_stage_callback(self, callback):
-        r"""Run ``callback(t, u)`` on every implicitly-solved Runge-Kutta stage.
-
-        The callback fires after the stage's nonlinear solve and before that
-        stage's derivatives are formed, which is the only point at which a
-        modification to the stage value propagates into the rest of the step.
-        ``u`` is a :class:`~.Function` in the problem's space holding the stage
-        value; write to it in place (``u.dat.data``, ``u.subfunctions``, a
-        limiter, ...) and the modification is copied back into PETSc's stage
-        vector.
-
-        :arg callback: a function of ``(t, u)``. Its return value is ignored.
-        :raises NotImplementedError: if this PETSc does not propagate stage
-            modifications. That is checked by running a probe integration rather
-            than by inspecting versions, because the failure mode is silent.
-
-        .. note::
-           A modified stage no longer satisfies the implicit stage equation, and
-           PETSc recovers that stage's implicit derivative as
-           ``(Y_modified - Z) / (h * a_ii)``. The modification is therefore
-           re-injected into later stages scaled by ``a_ji / a_ii``, which is
-           **not** unity -- so this is not equivalent to modifying a stage of an
-           explicit method, and a convex-combination (SSP) argument made for the
-           explicit operator does not carry over. Only the modification applied
-           to the last stage is carried through unscaled, and only for a tableau
-           whose weights equal its last row.
-        """
-        from firedrake_ts._petsc_shim import set_stage_hook, stage_hook_propagates
-
-        if not stage_hook_propagates():
-            raise NotImplementedError(
-                "This PETSc does not propagate modifications made to a TS stage "
-                "vector, so a stage callback would be a silent no-op. "
-                "TSAdaptSetCheckStage is the hook used here; TSSetPostStage "
-                "fires too late to be usable (it runs after the stage "
-                "derivatives are formed)."
-            )
-
-        self._stage_work = function.Function(self._problem.u_restrict.function_space())
-
-        def hook(_ts, t, Y):
-            with self._stage_work.dat.vec_wo as v:
-                Y.copy(v)
-            callback(t, self._stage_work)
-            with self._stage_work.dat.vec_ro as v:
-                v.copy(Y)
-
-        self._stage_hook = set_stage_hook(self.ts, hook)
 
     def set_transfer_manager(self, manager):
         r"""Set the object that manages transfer between grid levels.
