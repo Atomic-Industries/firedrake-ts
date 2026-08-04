@@ -183,6 +183,13 @@ class DAESolver(OptionsManager):
                after residual assembly.
         :kwarg monitor_callback: A user-defined function that will
                be used at every timestep to display the iteration's progress.
+        :kwarg project_rhs: If True (the default) the right-hand-side term
+               ``G`` is projected through a mass matrix solve. Only meaningful
+               when the problem supplies a ``G``.
+        :kwarg rhs_projection_parameters: Solver parameters for that mass
+               matrix solve, as a dict mapping PETSc options to values.
+               Defaults to a direct solve. These may equivalently be set from
+               the command line under the ``rhs_projection_solver_`` prefix.
         Example usage of the ``solver_parameters`` option: to set the
         nonlinear solver type to just use a linear solver, use
         .. code-block:: python
@@ -217,6 +224,8 @@ class DAESolver(OptionsManager):
         post_j_callback = kwargs.get("post_jacobian_callback")
         post_f_callback = kwargs.get("post_function_callback")
         monitor_callback = kwargs.get("monitor_callback")
+        project_rhs = kwargs.get("project_rhs", True)
+        rhs_projection_parameters = kwargs.get("rhs_projection_parameters")
 
         self.nullspace = nullspace
         self.near_nullspace = near_nullspace
@@ -242,6 +251,8 @@ class DAESolver(OptionsManager):
             post_jacobian_callback=post_j_callback,
             post_function_callback=post_f_callback,
             options_prefix=self.options_prefix,
+            project_rhs=project_rhs,
+            rhs_projection_parameters=rhs_projection_parameters,
         )
 
         # No preconditioner by default for matrix-free

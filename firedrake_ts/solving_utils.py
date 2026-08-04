@@ -479,8 +479,9 @@ class _TSContext(_SNESContext):
 
     @cached_property
     def _rhs_projection_options(self):
-        # Default to a direct solve, which is what a Firedrake LinearSolver used
-        # to give this projection. "mat_type" governs assembly, not the KSP.
+        # Defaults to a direct (LU) solve, which is what a Firedrake
+        # LinearSolver would use to give this projection. "mat_type" governs
+        # assembly, not the KSP.
         parameters = {
             k: v for k, v in DEFAULT_KSP_PARAMETERS.items() if k != "mat_type"
         }
@@ -490,21 +491,19 @@ class _TSContext(_SNESContext):
 
     @cached_property
     def _rhs_projection_solver(self):
-        r"""A ``KSP`` that inverts the mass matrix ``dF/du_t``.
-
-        Deliberately a bare ``KSP`` rather than a Firedrake ``LinearSolver``.
-        A ``LinearSolver`` is a ``NonlinearVariationalSolver``, so building one
-        creates a ``SNES`` and registers ``_SNESContext.form_function`` and
-        ``form_jacobian`` on its DM. ``SNESSetFunction``/``SNESSetJacobian`` are
-        DM-scoped in PETSc, and because the projection is posed on the same
-        function space as the TS's solution it shares the TS's DM -- so those
-        registrations would displace ``SNESTSFormFunction``/``SNESTSFormJacobian``
-        on the TS's own SNES, leaving stage solves to evaluate a null residual
-        and linearise at a stale shift. See PETSc's ``SNESSetDM`` docs: a DM can
-        only be used for one problem at a time. Inverting an already-assembled,
-        constant operator needs no SNES, so a ``KSP`` avoids the collision
-        rather than having to repair it afterwards.
-        """
+        r"""A ``KSP`` that inverts the mass matrix ``dF/du_t``."""
+        # Needs to be a PETSc ``KSP`` rather than a Firedrake ``LinearSolver``.
+        # A ``LinearSolver`` is a ``NonlinearVariationalSolver``, so building one
+        # creates a ``SNES`` and registers ``_SNESContext.form_function`` and
+        # ``form_jacobian`` on its DM. ``SNESSetFunction``/``SNESSetJacobian`` are
+        # DM-scoped in PETSc, and because the projection is posed on the same
+        # function space as the TS's solution it shares the TS's DM -- so those
+        # registrations would displace ``SNESTSFormFunction``/``SNESTSFormJacobian``
+        # on the TS's own SNES, leaving stage solves to evaluate a null residual
+        # and linearise at a stale shift. See PETSc's ``SNESSetDM`` docs: a DM can
+        # only be used for one problem at a time. Inverting an already-assembled,
+        # constant operator needs no SNES, so a ``KSP`` avoids the collision
+        # rather than having to repair it afterwards.
         if self.G is None:
             return None
 
