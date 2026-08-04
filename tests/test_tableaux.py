@@ -255,10 +255,9 @@ def test_arktableau_uses_identity_equality():
     direct equality is ambiguous. Regression here means eq=False was removed,
     breaking both hash() and == with array-valued fields.
     """
-    # Test 1: hash does not raise
+    # Test 1: hash does not raise. Creating a set exercises hashing on all
+    # elements, so this verifies that hash() succeeds for all four tableaux.
     tab = TABLEAUX["imex_euler"]
-    assert hash(tab) is not None  # hash() doesn't raise
-    # A set of all four tableaux must have 4 elements (all distinct)
     assert len({t for t in TABLEAUX.values()}) == 4
 
     # Test 2: two separately-constructed instances with different arrays

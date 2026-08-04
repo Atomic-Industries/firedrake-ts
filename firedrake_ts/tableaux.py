@@ -7,7 +7,7 @@ risk of the Shu-Osher stepper lives.
 References
 ----------
 Shu-Osher form and the absolute monotonicity radius: Kraaijevanger (1991).
-Ketcheson's optimal SSPRK(3,2) in stiffly accurate form: Ketcheson (2008).
+Ketcheson's optimal SSPRK(3,2) in stiffly accurate form.
 """
 
 from dataclasses import dataclass
