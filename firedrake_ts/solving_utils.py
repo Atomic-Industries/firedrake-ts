@@ -6,11 +6,10 @@ from firedrake import cofunction, dmhooks, function
 from firedrake.assemble import get_assembler
 from firedrake.exceptions import ConvergenceError
 from firedrake.formmanipulation import ExtractSubBlock
-from firedrake.petsc import PETSc
+from firedrake.petsc import DEFAULT_KSP_PARAMETERS, PETSc
 from firedrake.solving_utils import _make_reasons, _SNESContext
+from petsctools import OptionsManager
 from pyop2 import op2
-
-from firedrake_ts._petsc_shim import repair_ts_snes_callbacks
 
 TSReasons = _make_reasons(PETSc.TS.ConvergedReason())
 
@@ -378,13 +377,6 @@ class _TSContext(_SNESContext):
 
         ctx._assemble_projected_rhs_residual()
 
-        # The projection solve above is a Firedrake LinearSolver sharing this
-        # TS's DM, and SNESSetFunction is DM-scoped, so building it displaces
-        # SNESTSFormFunction on the TS's own SNES. Left alone, every subsequent
-        # stage solve evaluates a residual that is identically zero and the
-        # solution never advances. See repair_ts_snes_callbacks.
-        repair_ts_snes_callbacks(ts)
-
         # TODO: Add post_rhs_function_callback
 
         # G may not be the same vector as self._projected_G, so copy
@@ -475,25 +467,52 @@ class _TSContext(_SNESContext):
         return function.Function(self.G.arguments()[0].function_space())
 
     @cached_property
+    def _rhs_projection_mass_matrix(self):
+        r"""The mass matrix ``dF/du_t``, assembled once.
+
+        Held on the context so it outlives the ``KSP`` that takes it as an
+        operator.
+        """
+        from firedrake import assemble, ufl_expr
+
+        return assemble(ufl_expr.derivative(self.F, self._xdot), bcs=self.bcs_F)
+
+    @cached_property
+    def _rhs_projection_options(self):
+        # Default to a direct solve, which is what a Firedrake LinearSolver used
+        # to give this projection. "mat_type" governs assembly, not the KSP.
+        parameters = {
+            k: v for k, v in DEFAULT_KSP_PARAMETERS.items() if k != "mat_type"
+        }
+        parameters.update(self.rhs_projection_parameters or {})
+        prefix = (self.options_prefix or "") + "rhs_projection_solver_"
+        return OptionsManager(parameters, prefix)
+
+    @cached_property
     def _rhs_projection_solver(self):
-        if self.G is not None:
-            from firedrake import LinearSolver, assemble, ufl_expr
+        r"""A ``KSP`` that inverts the mass matrix ``dF/du_t``.
 
-            mass_matrix = assemble(
-                ufl_expr.derivative(self.F, self._xdot), bcs=self.bcs_F
-            )
-
-            prefix = self.options_prefix or ""
-            prefix += "rhs_projection_solver"
-
-            _rhs_projection_solver = LinearSolver(
-                mass_matrix,
-                solver_parameters=self.rhs_projection_parameters,
-                options_prefix=prefix,
-            )
-            return _rhs_projection_solver
-        else:
+        Deliberately a bare ``KSP`` rather than a Firedrake ``LinearSolver``.
+        A ``LinearSolver`` is a ``NonlinearVariationalSolver``, so building one
+        creates a ``SNES`` and registers ``_SNESContext.form_function`` and
+        ``form_jacobian`` on its DM. ``SNESSetFunction``/``SNESSetJacobian`` are
+        DM-scoped in PETSc, and because the projection is posed on the same
+        function space as the TS's solution it shares the TS's DM -- so those
+        registrations would displace ``SNESTSFormFunction``/``SNESTSFormJacobian``
+        on the TS's own SNES, leaving stage solves to evaluate a null residual
+        and linearise at a stale shift. See PETSc's ``SNESSetDM`` docs: a DM can
+        only be used for one problem at a time. Inverting an already-assembled,
+        constant operator needs no SNES, so a ``KSP`` avoids the collision
+        rather than having to repair it afterwards.
+        """
+        if self.G is None:
             return None
+
+        mass_matrix = self._rhs_projection_mass_matrix
+        ksp = PETSc.KSP().create(comm=mass_matrix.comm)
+        ksp.setOperators(mass_matrix.petscmat)
+        self._rhs_projection_options.set_from_options(ksp)
+        return ksp
 
     def _assemble_projected_rhs_residual(self):
         """
@@ -504,7 +523,13 @@ class _TSContext(_SNESContext):
             if self.project_rhs:
                 # TODO maybe the riesz_repre is the correct way?
                 # assign(self._projected_G, self._G.riesz_representation())
-                self._rhs_projection_solver.solve(self._projected_G, self._G)
+                ksp = self._rhs_projection_solver
+                with (
+                    self._rhs_projection_options.inserted_options(),
+                    self._G.dat.vec_ro as b,
+                    self._projected_G.dat.vec_wo as x,
+                ):
+                    ksp.solve(b, x)
             # else assembled rhs residual that is saved in self._G is used
 
     @cached_property

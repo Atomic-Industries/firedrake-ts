@@ -47,19 +47,31 @@ def test_imex_advances_solution(tableau):
     assert abs(value - EXACT) < 1e-4, f"{tableau}: u(1) = {value}, expected {EXACT}"
 
 
-def test_imex_snes_actually_solves():
-    """Stage solves must do work; zero SNES iterations means a null residual."""
-    solver, _ = _decay(dt=1e-2)
-    assert solver.ts.getSNESIterations() > 0
+def test_imex_stage_solves_use_the_dae_callbacks():
+    """The TS's SNES must still be evaluating the DAE at the end of the solve.
 
-
-def test_snes_residual_callback_survives_the_solve():
-    """The TS's SNES must still be evaluating the DAE residual at the end."""
+    ``None`` here means the callback is PETSc's own C entry point. A Python
+    callback means the RHS projection displaced it on the shared DM: those are
+    DM-scoped, so any auxiliary solver built on the TS's function space can
+    silently take over the TS's residual and Jacobian.
+    """
     solver, _ = _decay(dt=1e-2)
-    _, callback = solver.snes.getFunction()
-    assert callback is None, (
+
+    assert solver.ts.getSNESIterations() > 0, (
+        "stage solves did no work; a residual that is identically zero means "
+        "SNESTSFormFunction was displaced and the solution never advances"
+    )
+
+    _, residual = solver.snes.getFunction()
+    assert residual is None, (
         "SNESTSFormFunction was displaced by a Python SNES residual; the DAE "
-        f"residual is being evaluated by {callback[0]!r} against a stale udot"
+        f"residual is being evaluated by {residual[0]!r} against a stale udot"
+    )
+
+    jacobian = solver.snes.getJacobian()[2]
+    assert jacobian is None, (
+        "SNESTSFormJacobian was displaced by a Python SNES Jacobian; stage "
+        f"solves are linearising with {jacobian[0]!r} at a stale shift"
     )
 
 
