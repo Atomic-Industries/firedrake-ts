@@ -1,5 +1,7 @@
 """Tableau algebra. No Firedrake, no PETSc -- pure numpy at machine precision."""
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -10,8 +12,8 @@ from firedrake_ts.tableaux import (
     shu_osher,
 )
 
-# Ketcheson's optimal SSPRK(3,2) in stiffly accurate form, the explicit part of
-# rk-method-spec.md 5.1. Four stages, R(A,b) = 2.
+# Ketcheson's optimal SSPRK(3,2) in stiffly accurate form. Four stages with
+# SSP radius R(A,b) = 2. Used as the explicit part of production tableaux.
 SSPRK32_A = np.array(
     [
         [0.0, 0.0, 0.0, 0.0],
@@ -83,8 +85,8 @@ def test_shu_osher_reproduces_the_butcher_map(A, b, r):
 def test_rows_are_nonnegative_partitions_of_unity(A, b, r):
     """Every row, INCLUDING the completion row, must be a convex combination.
 
-    This is what makes the accepted step bounded and retires the post-step
-    clamp of rk-method-spec.md R8.
+    This is what makes the accepted step bounded by a convex combination of
+    previous stages, so no post-step clamping is needed.
     """
     P, q = shu_osher(A, b, r)
     assert P.min() >= -1e-14
@@ -208,7 +210,10 @@ def test_l_stability_r4(name):
 
 
 def test_esdirk_gamma5_matches_the_spec_closed_form():
-    """R(z) = -5(z^2 + 20z + 50) / (2(z-5)^3), rk-method-spec.md 5.1."""
+    """Stability function matches its closed form.
+
+    R(z) = -5(z^2 + 20z + 50) / (2(z-5)^3).
+    """
     tab = TABLEAUX["esdirk_gamma5"]
     for z in [-1.0, -10.0, -100.0]:
         expected = -5 * (z**2 + 20 * z + 50) / (2 * (z - 5) ** 3)
@@ -218,7 +223,7 @@ def test_esdirk_gamma5_matches_the_spec_closed_form():
 
 
 def test_acceptance_report_reproduces_the_spec_table():
-    """rk-method-spec.md 5, esdirk_gamma5 row."""
+    """Acceptance report reproduces published properties of esdirk_gamma5."""
     report = acceptance_report(TABLEAUX["esdirk_gamma5"])
     assert report["r3_explicit"] is True
     assert report["r3_implicit"] is True
@@ -241,3 +246,24 @@ def test_ssp2_444_lsa_radius_and_embedding():
 def test_shakedown_tableaux_have_unit_radius(name):
     tab = TABLEAUX[name]
     assert kraaijevanger_radius(tab.A, tab.b) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_arktableau_uses_identity_equality():
+    """ARKTableau uses identity-based equality and hash, not content equality.
+
+    This is essential for registry lookups: numpy arrays are unhashable and
+    direct equality is ambiguous. Regression here means eq=False was removed,
+    breaking both hash() and == with array-valued fields.
+    """
+    # Test 1: hash does not raise
+    tab = TABLEAUX["imex_euler"]
+    assert hash(tab) is not None  # hash() doesn't raise
+    # A set of all four tableaux must have 4 elements (all distinct)
+    assert len({t for t in TABLEAUX.values()}) == 4
+
+    # Test 2: two separately-constructed instances with different arrays
+    # compare unequal without raising. This is the case that would raise
+    # ValueError ("truth value of array is ambiguous") if eq=True.
+    tab2 = dataclasses.replace(tab, b=np.array([2.0, -1.0]))
+    assert tab != tab2  # Should not raise, should be False
+    assert not (tab == tab2)  # Should not raise

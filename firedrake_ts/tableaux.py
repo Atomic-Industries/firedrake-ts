@@ -6,9 +6,8 @@ risk of the Shu-Osher stepper lives.
 
 References
 ----------
-Shu-Osher form and the absolute monotonicity radius: Kraaijevanger (1991);
-Ketcheson's optimal SSPRK(3,2). The acceptance predicates R1-R9 come from
-``local/fill/rk-method-spec.md``.
+Shu-Osher form and the absolute monotonicity radius: Kraaijevanger (1991).
+Ketcheson's optimal SSPRK(3,2) in stiffly accurate form: Ketcheson (2008).
 """
 
 from dataclasses import dataclass
@@ -109,13 +108,17 @@ def shu_osher(A, b, r):
     return P, q
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ARKTableau:
     """An additive Runge-Kutta pair.
 
     ``A, b, bhat`` are the explicit tableau, its completion weights and its
     embedded weights; ``At, bt`` the implicit tableau and completion; ``c, ct``
     the abscissae; ``d`` the dense-output theta-coefficients.
+
+    Uses identity-based equality to enable hashing for registry lookups, as
+    direct equality on ndarrays is ambiguous. Tableau lookup is by ``name`` via
+    ``TABLEAUX``, and content equality is not needed.
     """
 
     name: str
@@ -145,7 +148,15 @@ def stability_function(At, w, z):
 
 
 def acceptance_report(tab):
-    """Evaluate the R1-R9 predicates of ``local/fill/rk-method-spec.md`` 4."""
+    """Evaluate key properties of an additive Runge-Kutta tableau.
+
+    Returns a dict with keys r3_*, r4_*, r5_*, r6_*, r8_* corresponding to:
+    - r3_*: stiff accuracy (b == A[-1] and bt == At[-1])
+    - r4_*: L-stability (R(infinity) == 0)
+    - r5_*: embedded pair non-defectiveness (sum(bhat) == 1 and bhat . c)
+    - r6_*: SSP radius R(A,b) from Kraaijevanger (1991)
+    - r8_*: positivity of implicit diagonals
+    """
     return {
         "r3_explicit": bool(np.allclose(tab.b, tab.A[-1], atol=1e-14)),
         "r3_implicit": bool(np.allclose(tab.bt, tab.At[-1], atol=1e-14)),
@@ -203,10 +214,10 @@ _SSPRK2 = _t(
     order=2,
 )
 
-# rk-method-spec.md 5.1. Explicit part is Ketcheson's optimal SSPRK(3,2) in
+# Production tableau: Explicit part is Ketcheson's optimal SSPRK(3,2) in
 # stiffly accurate form; implicit part a stiffly accurate, L-stable ESDIRK with
 # uniform diagonal gamma = 1/5, so PETSc passes a single shift and the shifted
-# operator is reusable across all three implicit solves.
+# operator is reusable across all three implicit solves. SSP radius R(A,b) = 2.
 _ESDIRK_GAMMA5 = _t(
     "esdirk_gamma5",
     A=[
@@ -230,10 +241,10 @@ _ESDIRK_GAMMA5 = _t(
     order=2,
 )
 
-# rk-method-spec.md 5.2. Same explicit part; implicit diagonals are distinct
-# (1/6, 1/5, 1/4), so there is no operator reuse across stages. Larger joint
-# region (1.200 vs 1.050) but smaller explicit-axis radius. Kept as the
-# fallback if the uniform-gamma part conditions badly in practice.
+# Production tableau: Same explicit part as esdirk_gamma5; implicit diagonals
+# are distinct (1/6, 1/5, 1/4), so there is no operator reuse across stages.
+# Larger joint region (1.200 vs 1.050) but smaller explicit-axis radius. Kept
+# as fallback if the uniform-gamma variant conditions badly in practice.
 _SSP2_444_LSA = _t(
     "ssp2_444_lsa",
     A=[
