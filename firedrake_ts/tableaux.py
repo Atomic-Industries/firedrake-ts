@@ -11,13 +11,19 @@ Ketcheson's optimal SSPRK(3,2). The acceptance predicates R1-R9 come from
 ``local/fill/rk-method-spec.md``.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
 
 __all__ = [
+    "TABLEAUX",
+    "ARKTableau",
     "ShuOsherError",
+    "acceptance_report",
     "butcher_to_K",
     "kraaijevanger_radius",
     "shu_osher",
+    "stability_function",
 ]
 
 
@@ -101,3 +107,154 @@ def shu_osher(A, b, r):
             f"min(q) = {q.min():.3e}. The SSP bound would not hold."
         )
     return P, q
+
+
+@dataclass(frozen=True)
+class ARKTableau:
+    """An additive Runge-Kutta pair.
+
+    ``A, b, bhat`` are the explicit tableau, its completion weights and its
+    embedded weights; ``At, bt`` the implicit tableau and completion; ``c, ct``
+    the abscissae; ``d`` the dense-output theta-coefficients.
+    """
+
+    name: str
+    A: np.ndarray
+    b: np.ndarray
+    bhat: np.ndarray
+    At: np.ndarray
+    bt: np.ndarray
+    c: np.ndarray
+    ct: np.ndarray
+    d: np.ndarray
+    order: int
+
+
+def stability_function(At, w, z):
+    """``R(z) = 1 + z w^T (I - z At)^-1 e``.
+
+    Use this rather than ``1 + w^T At^-1 e`` for ``R(infinity)``: ``At`` is
+    singular whenever the first stage is explicit, which is the case for every
+    stiffly accurate tableau here.
+    """
+    At = np.asarray(At, dtype=float)
+    n = At.shape[0]
+    e = np.ones(n)
+    rhs = np.linalg.solve(np.eye(n) - z * At, e)
+    return 1.0 + z * (np.asarray(w, dtype=float) @ rhs)
+
+
+def acceptance_report(tab):
+    """Evaluate the R1-R9 predicates of ``local/fill/rk-method-spec.md`` 4."""
+    return {
+        "r3_explicit": bool(np.allclose(tab.b, tab.A[-1], atol=1e-14)),
+        "r3_implicit": bool(np.allclose(tab.bt, tab.At[-1], atol=1e-14)),
+        "r4_r_infinity": stability_function(tab.At, tab.bt, -1e8).real,
+        "r5_bhat_sum": float(tab.bhat.sum()),
+        "r5_bhat_dot_c": float(tab.bhat @ tab.c),
+        "r6_radius": kraaijevanger_radius(tab.A, tab.b),
+        "r8_min_diagonal": float(np.diag(tab.At).min()),
+    }
+
+
+def _t(name, A, b, bhat, At, bt, c, ct, d, order):
+    return ARKTableau(
+        name=name,
+        A=np.array(A, dtype=float),
+        b=np.array(b, dtype=float),
+        bhat=np.array(bhat, dtype=float),
+        At=np.array(At, dtype=float),
+        bt=np.array(bt, dtype=float),
+        c=np.array(c, dtype=float),
+        ct=np.array(ct, dtype=float),
+        d=np.array(d, dtype=float),
+        order=order,
+    )
+
+
+# Shakedown tableau: explicit Euler on G, backward Euler on F. Two stages so the
+# explicit part stays strictly lower triangular while the implicit part is
+# stiffly accurate. Stage 0 is x^n exactly (c_0 = 0, both rows zero).
+_IMEX_EULER = _t(
+    "imex_euler",
+    A=[[0.0, 0.0], [1.0, 0.0]],
+    b=[1.0, 0.0],
+    bhat=[1.0, 0.0],
+    At=[[0.0, 0.0], [0.0, 1.0]],
+    bt=[0.0, 1.0],
+    c=[0.0, 1.0],
+    ct=[0.0, 1.0],
+    d=[1.0, 0.0],
+    order=1,
+)
+
+# Shakedown tableau: Heun / SSPRK(2,2), explicit only. At is identically zero,
+# so no stage requires an implicit solve.
+_SSPRK2 = _t(
+    "ssprk2",
+    A=[[0.0, 0.0], [1.0, 0.0]],
+    b=[0.5, 0.5],
+    bhat=[1.0, 0.0],
+    At=[[0.0, 0.0], [0.0, 0.0]],
+    bt=[0.0, 0.0],
+    c=[0.0, 1.0],
+    ct=[0.0, 1.0],
+    d=[1.0, 0.0],
+    order=2,
+)
+
+# rk-method-spec.md 5.1. Explicit part is Ketcheson's optimal SSPRK(3,2) in
+# stiffly accurate form; implicit part a stiffly accurate, L-stable ESDIRK with
+# uniform diagonal gamma = 1/5, so PETSc passes a single shift and the shifted
+# operator is reusable across all three implicit solves.
+_ESDIRK_GAMMA5 = _t(
+    "esdirk_gamma5",
+    A=[
+        [0.0, 0.0, 0.0, 0.0],
+        [0.5, 0.0, 0.0, 0.0],
+        [0.5, 0.5, 0.0, 0.0],
+        [1 / 3, 1 / 3, 1 / 3, 0.0],
+    ],
+    b=[1 / 3, 1 / 3, 1 / 3, 0.0],
+    bhat=[27 / 125, 36 / 125, 12 / 125, 2 / 5],
+    At=[
+        [0.0, 0.0, 0.0, 0.0],
+        [3 / 10, 1 / 5, 0.0, 0.0],
+        [3 / 10, 1 / 2, 1 / 5, 0.0],
+        [39 / 125, 47 / 125, 14 / 125, 1 / 5],
+    ],
+    bt=[39 / 125, 47 / 125, 14 / 125, 1 / 5],
+    c=[0.0, 0.5, 1.0, 1.0],
+    ct=[0.0, 0.5, 1.0, 1.0],
+    d=[573 / 875, 604 / 875, 148 / 875, -18 / 35],
+    order=2,
+)
+
+# rk-method-spec.md 5.2. Same explicit part; implicit diagonals are distinct
+# (1/6, 1/5, 1/4), so there is no operator reuse across stages. Larger joint
+# region (1.200 vs 1.050) but smaller explicit-axis radius. Kept as the
+# fallback if the uniform-gamma part conditions badly in practice.
+_SSP2_444_LSA = _t(
+    "ssp2_444_lsa",
+    A=[
+        [0.0, 0.0, 0.0, 0.0],
+        [0.5, 0.0, 0.0, 0.0],
+        [0.5, 0.5, 0.0, 0.0],
+        [1 / 3, 1 / 3, 1 / 3, 0.0],
+    ],
+    b=[1 / 3, 1 / 3, 1 / 3, 0.0],
+    bhat=[11 / 24, 5 / 12, 1 / 8, 0.0],
+    At=[
+        [0.0, 0.0, 0.0, 0.0],
+        [1 / 3, 1 / 6, 0.0, 0.0],
+        [1 / 3, 7 / 15, 1 / 5, 0.0],
+        [11 / 32, 5 / 16, 3 / 32, 1 / 4],
+    ],
+    bt=[11 / 32, 5 / 16, 3 / 32, 1 / 4],
+    c=[0.0, 0.5, 1.0, 1.0],
+    ct=[0.0, 0.5, 1.0, 1.0],
+    d=[11 / 16, 5 / 8, 3 / 16, -1 / 2],
+    order=2,
+)
+
+TABLEAUX = {t.name: t for t in (_IMEX_EULER, _SSPRK2, _ESDIRK_GAMMA5, _SSP2_444_LSA)}

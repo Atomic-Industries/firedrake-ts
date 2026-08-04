@@ -162,3 +162,82 @@ def test_module_does_not_import_firedrake():
         f"tableaux.py cannot load without Firedrake/PETSc importable:\n"
         f"{result.stdout}\n{result.stderr}"
     )
+
+
+from firedrake_ts.tableaux import (  # noqa: E402
+    TABLEAUX,
+    acceptance_report,
+    stability_function,
+)
+
+
+def test_registry_has_the_expected_tableaux():
+    assert set(TABLEAUX) == {
+        "imex_euler",
+        "ssprk2",
+        "esdirk_gamma5",
+        "ssp2_444_lsa",
+    }
+
+
+@pytest.mark.parametrize("name", ["imex_euler", "esdirk_gamma5", "ssp2_444_lsa"])
+def test_stiff_accuracy_r3(name):
+    """b == A[s-1,:] and bt == At[s-1,:]. Required for the algebraic variables."""
+    tab = TABLEAUX[name]
+    np.testing.assert_allclose(tab.b, tab.A[-1], atol=1e-14)
+    np.testing.assert_allclose(tab.bt, tab.At[-1], atol=1e-14)
+
+
+@pytest.mark.parametrize("name", ["esdirk_gamma5", "ssp2_444_lsa"])
+def test_l_stability_r4(name):
+    """R(inf) == 0 and sup|R(z)| <= 1 on the left half-plane.
+
+    Note At is singular for these tableaux (explicit first stage), so R(inf)
+    must come from the limit of 1 + z bt^T (I - z At)^-1 e, NOT from
+    1 + bt^T At^-1 e. Probe at z = -1e8; -1e10 is dominated by roundoff.
+    """
+    tab = TABLEAUX[name]
+    assert abs(stability_function(tab.At, tab.bt, -1e8)) < 1e-6
+    assert abs(stability_function(tab.At, tab.bhat, -1e8)) < 1e-5
+    grid = [
+        complex(re, im)
+        for re in np.linspace(-40.0, 0.0, 200)
+        for im in np.linspace(0.0, 40.0, 200)
+    ]
+    assert max(abs(stability_function(tab.At, tab.bt, z)) for z in grid) <= 1.0 + 1e-9
+
+
+def test_esdirk_gamma5_matches_the_spec_closed_form():
+    """R(z) = -5(z^2 + 20z + 50) / (2(z-5)^3), rk-method-spec.md 5.1."""
+    tab = TABLEAUX["esdirk_gamma5"]
+    for z in [-1.0, -10.0, -100.0]:
+        expected = -5 * (z**2 + 20 * z + 50) / (2 * (z - 5) ** 3)
+        assert stability_function(tab.At, tab.bt, z) == pytest.approx(
+            expected, rel=1e-10
+        )
+
+
+def test_acceptance_report_reproduces_the_spec_table():
+    """rk-method-spec.md 5, esdirk_gamma5 row."""
+    report = acceptance_report(TABLEAUX["esdirk_gamma5"])
+    assert report["r3_explicit"] is True
+    assert report["r3_implicit"] is True
+    assert abs(report["r4_r_infinity"]) < 1e-6
+    assert report["r5_bhat_sum"] == pytest.approx(1.0, abs=1e-14)
+    assert report["r5_bhat_dot_c"] == pytest.approx(16 / 25, abs=1e-12)
+    assert report["r6_radius"] == pytest.approx(2.0, abs=1e-9)
+    # Explicit first stage: At[0,0] == 0, the "circle" entry in the spec table.
+    assert report["r8_min_diagonal"] == pytest.approx(0.0, abs=1e-14)
+
+
+def test_ssp2_444_lsa_radius_and_embedding():
+    report = acceptance_report(TABLEAUX["ssp2_444_lsa"])
+    assert report["r6_radius"] == pytest.approx(2.0, abs=1e-9)
+    assert report["r5_bhat_sum"] == pytest.approx(1.0, abs=1e-14)
+    assert report["r5_bhat_dot_c"] == pytest.approx(1 / 3, abs=1e-12)
+
+
+@pytest.mark.parametrize("name", ["imex_euler", "ssprk2"])
+def test_shakedown_tableaux_have_unit_radius(name):
+    tab = TABLEAUX[name]
+    assert kraaijevanger_radius(tab.A, tab.b) == pytest.approx(1.0, abs=1e-9)
