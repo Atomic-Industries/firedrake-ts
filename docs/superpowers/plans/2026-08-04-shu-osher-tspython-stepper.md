@@ -349,15 +349,51 @@ def test_butcher_to_K_shape():
 
 
 def test_module_does_not_import_firedrake():
-    """tableaux.py must stay usable without a Firedrake install."""
+    """tableaux.py must stay usable without Firedrake or PETSc importable.
+
+    Tests the real property in a subprocess with both blocked, rather than
+    scanning the source for a substring.
+    """
+    import pathlib
+    import subprocess
     import sys
+    import textwrap
 
-    import firedrake_ts.tableaux  # noqa: F401
+    # Load the file directly, NOT as firedrake_ts.tableaux: the package
+    # __init__ imports Firedrake, so importing through the package would
+    # always fail regardless of what tableaux.py itself does.
+    target = pathlib.Path(__file__).parent.parent / "firedrake_ts" / "tableaux.py"
+    assert target.exists(), target
 
-    src = open(firedrake_ts.tableaux.__file__).read()
-    assert "firedrake" not in src.lower().replace("firedrake_ts", "")
-    assert "petsc" not in src.lower()
-    del sys
+    program = textwrap.dedent(
+        """
+        import importlib.util
+        import sys
+
+        class Blocker:
+            def find_spec(self, name, path=None, target=None):
+                if name.split(".")[0] in ("firedrake", "petsc4py"):
+                    raise ImportError(f"{name} is blocked for this test")
+                return None
+
+        sys.meta_path.insert(0, Blocker())
+        spec = importlib.util.spec_from_file_location("_isolated", sys.argv[1])
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert mod.kraaijevanger_radius is not None
+        assert mod.shu_osher is not None
+        print("OK")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program, str(target)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"tableaux.py cannot load without Firedrake/PETSc importable:\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1874,16 +1910,18 @@ def test_frozen_component_survives_the_implicit_solve():
     )
     G = -inner(a, va) * dx - inner(b, vb) * dx
 
-    seen = []
+    # Dedicated scratch: w is also ctx._x, which the TS callbacks write into.
+    scratch = Function(W)
+    CLAMP = 0.5
+    drift = []
 
     def clamping_limiter(vec):
-        """Force row 0 to exactly 0.5 and record what came back later."""
-        with w.dat.vec_wo as target:
+        """Force the explicitly-governed row to exactly CLAMP."""
+        with scratch.dat.vec_wo as target:
             vec.copy(target)
-        w.sub(0).assign(0.5)
-        with w.dat.vec_ro as source:
+        scratch.sub(0).assign(CLAMP)
+        with scratch.dat.vec_ro as source:
             source.copy(vec)
-        seen.append(float(w.sub(0).dat.data_ro[0]))
 
     problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, 0.02), G=G)
     solver = firedrake_ts.DAESolver(
@@ -1899,11 +1937,32 @@ def test_frozen_component_survives_the_implicit_solve():
     )
     ctx = solver.ts.getPythonContext()
     ctx.set_stage_limiter(clamping_limiter)
+
+    # Wrap _solve_stage so we can compare Y_i across the implicit solve. This
+    # is diagnostic item 3 of the M4 gate, made into a test.
+    original = ctx._solve_stage
+
+    def checking_solve_stage(ts, tab, h, i):
+        before = ctx._Y[i].getArray(readonly=True).copy()
+        original(ts, tab, h, i)
+        after = ctx._Y[i].getArray(readonly=True)
+        rows = ctx._frozen_rows
+        lo, _ = ctx._Y[i].getOwnershipRange()
+        local = rows - lo
+        drift.append(float(np.abs(after[local] - before[local]).max()))
+
+    ctx._solve_stage = checking_solve_stage
     solver.solve()
 
     assert ctx._frozen_rows is not None, "row 0 was never detected as freezable"
     assert len(ctx._frozen_rows) > 0
-    assert seen, "limiter never fired"
+    assert drift, "no implicit stage solve ran, so the freeze was never exercised"
+    # THE assertion: the limited value must survive the solve bit-for-bit.
+    assert max(drift) == 0.0, (
+        f"frozen rows moved by up to {max(drift):.3e} during the implicit "
+        "solve -- the solve is dragging the limited value back toward the "
+        "unlimited Z_i, which is the defect COOL-193 describes"
+    )
 
 
 def test_nothing_is_frozen_when_every_row_has_an_implicit_operator():
@@ -2227,35 +2286,42 @@ CFL = 0.064
 VELOCITY = 1.0
 
 
-def _zhang_shu(f, f_mean_space):
+def _zhang_shu(V, V0):
     """Scale each cell about its mean so the cell lies in [0, 1].
 
     Zhang-Shu is a scaling limiter: it cannot repair an out-of-range cell
     MEAN, which is exactly why the stage value it acts on must already be a
     convex combination.
+
+    Owns a dedicated scratch Function rather than borrowing the solution.
+    The solution Function is also ``ctx._x``, which the TS callbacks write
+    into; reusing it here would work only by accident of ordering.
+
+    DG dof storage is cell-contiguous, so ``reshape(ncell, per_cell)`` gives
+    one row per cell -- verified against the DG0 interpolant.
     """
+    scratch = Function(V)
+    mean = Function(V0)
 
     def limiter(vec):
-        with f.dat.vec_wo as target:
+        with scratch.dat.vec_wo as target:
             vec.copy(target)
-        mean = project(f, f_mean_space)
-        fa = f.dat.data
+        mean.project(scratch)
+        fa = scratch.dat.data
         ma = mean.dat.data_ro
         ncell = len(ma)
-        per_cell = len(fa) // ncell
-        view = fa.reshape(ncell, per_cell)
+        view = fa.reshape(ncell, len(fa) // ncell)
         for c in range(ncell):
-            m = ma[c]
-            m = min(max(m, 0.0), 1.0)
+            m = min(max(float(ma[c]), 0.0), 1.0)
             lo, hi = view[c].min(), view[c].max()
             theta = 1.0
             if hi > m:
                 theta = min(theta, (1.0 - m) / (hi - m))
             if lo < m:
-                theta = min(theta, (m - 0.0) / (m - lo))
+                theta = min(theta, m / (m - lo))
             theta = max(0.0, min(1.0, theta))
             view[c] = m + theta * (view[c] - m)
-        with f.dat.vec_ro as source:
+        with scratch.dat.vec_ro as source:
             source.copy(vec)
 
     return limiter
@@ -2294,7 +2360,7 @@ def _advect(stepper_parameters, limited):
         problem, solver_parameters=parameters, options_prefix=""
     )
     if limited:
-        solver.set_stage_limiter(_zhang_shu(f, V0))
+        solver.set_stage_limiter(_zhang_shu(V, V0))
     solver.solve()
     data = f.dat.data_ro
     return float(data.min()), float(data.max())
@@ -2328,14 +2394,53 @@ def test_negative_control_butcher_form_does_not_bound():
     )
 
 
-def test_mass_is_conserved():
-    """The defect is boundedness, not conservation; mass must stay exact."""
+def test_limiting_does_not_destroy_mass():
+    """Zhang-Shu scales about the cell mean, so it must be mass-neutral.
+
+    COOL-193 measured mass exact to 2e-16 with the limiter active -- the
+    defect it describes is purely in boundedness. If this regresses, the
+    limiter is not scaling about the mean and the bounds result above would
+    be meaningless even if it passed.
+    """
     mesh = PeriodicUnitIntervalMesh(N)
     V = FunctionSpace(mesh, "DG", 1)
+    V0 = FunctionSpace(mesh, "DG", 0)
+    f = Function(V, name="f")
+    f_t = Function(V)
+    v = TestFunction(V)
     x, = SpatialCoordinate(mesh)
-    f0 = Function(V).interpolate(conditional(And(x > 0.25, x < 0.75), 1.0, 0.0))
-    initial = assemble(f0 * dx)
-    assert initial > 0.0
+    f.interpolate(conditional(And(x > 0.25, x < 0.75), 1.0, 0.0))
+    initial_mass = assemble(f * dx)
+    assert initial_mass > 0.0
+
+    u = Constant(VELOCITY)
+    n = FacetNormal(mesh)
+    un = 0.5 * (u * n[0] + abs(u * n[0]))
+    F = inner(f_t, v) * dx
+    G = (
+        f * u * v.dx(0) * dx
+        - (un("+") * f("+") - un("-") * f("-")) * (v("+") - v("-")) * dS
+    )
+
+    dt = CFL / (N * VELOCITY)
+    problem = firedrake_ts.DAEProblem(F, f, f_t, (0.0, 0.2), G=G)
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters=dict(
+            ARK_SSP,
+            ts_adapt_type="none",
+            ts_time_step=dt,
+            ts_exact_final_time="stepover",
+        ),
+        options_prefix="",
+    )
+    solver.set_stage_limiter(_zhang_shu(V, V0))
+    solver.solve()
+
+    final_mass = assemble(f * dx)
+    assert abs(final_mass - initial_mass) < 1e-12 * abs(initial_mass), (
+        f"mass drifted from {initial_mass} to {final_mass}"
+    )
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
