@@ -182,7 +182,7 @@ class _TSContext(_SNESContext):
         for field in fields:
             F = splitter.split(problem.F, argument_indices=(field,))
             J = splitter.split(problem.J, argument_indices=(field, field))
-            us = problem.u.subfunctions
+            us = problem.u_restrict.subfunctions
             V = F.arguments()[0].function_space()
             # Exposition:
             # We are going to make a new solution Function on the sub
@@ -226,16 +226,16 @@ class _TSContext(_SNESContext):
             # solving for, and some spaces that have just become
             # coefficients in the new form.
             u = as_vector(vec)
-            F = replace(F, {problem.u: u})
-            J = replace(J, {problem.u: u})
+            F = replace(F, {problem.u_restrict: u})
+            J = replace(J, {problem.u_restrict: u})
             if problem.Jp is not None:
                 Jp = splitter.split(problem.Jp, argument_indices=(field, field))
-                Jp = replace(Jp, {problem.u: u})
+                Jp = replace(Jp, {problem.u_restrict: u})
             else:
                 Jp = None
             if problem.G is not None:
                 G = splitter.split(problem.G, argument_indices=(field,))
-                G = replace(G, {problem.u: u})
+                G = replace(G, {problem.u_restrict: u})
             else:
                 G = None
             bcs = []

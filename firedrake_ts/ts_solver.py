@@ -123,10 +123,12 @@ class DAEProblem:
         # timeshift value provided by the solver
         self.shift = Constant(1.0)
 
-        # Use the user-provided Jacobian. If none is provided, derive
-        # the Jacobian from the residual.
-        self.J = self.shift * ufl_expr.derivative(F, udot) + (
-            J or ufl_expr.derivative(F, u)
+        # A supplied J is already the complete Jacobian
+        # sigma*dF/du_t + dF/du, per the docstring above -- re-adding the
+        # shift*dF/du_t term here would double the mass contribution. Only
+        # derive it from the residual when the caller didn't supply one.
+        self.J = J or (
+            self.shift * ufl_expr.derivative(F, udot) + ufl_expr.derivative(F, u)
         )
 
         # Derive the Jacobian for the G residual
