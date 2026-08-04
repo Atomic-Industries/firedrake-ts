@@ -10,6 +10,8 @@ from firedrake.petsc import PETSc
 from firedrake.solving_utils import _make_reasons, _SNESContext
 from pyop2 import op2
 
+from firedrake_ts._petsc_shim import repair_ts_snes_callbacks
+
 TSReasons = _make_reasons(PETSc.TS.ConvergedReason())
 
 
@@ -375,6 +377,13 @@ class _TSContext(_SNESContext):
         # TODO: Add pre_rhs_function_callback
 
         ctx._assemble_projected_rhs_residual()
+
+        # The projection solve above is a Firedrake LinearSolver sharing this
+        # TS's DM, and SNESSetFunction is DM-scoped, so building it displaces
+        # SNESTSFormFunction on the TS's own SNES. Left alone, every subsequent
+        # stage solve evaluates a residual that is identically zero and the
+        # solution never advances. See repair_ts_snes_callbacks.
+        repair_ts_snes_callbacks(ts)
 
         # TODO: Add post_rhs_function_callback
 
