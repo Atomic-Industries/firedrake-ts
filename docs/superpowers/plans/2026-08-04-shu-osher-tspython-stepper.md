@@ -1321,6 +1321,1211 @@ Then rewrite the loop body of `step`:
 
 Note what changed: the predictor now supplies `Y_i` for every stage, the limiter fires **before** anything consumes it, and the purely-explicit branch no longer overwrites `Y_i` from `Z_i` — the Shu–Osher value stands. `_build_offset` is still needed because `_solve_stage` requires `Z_i`.
 
+`_complete` needs a third branch — **and must keep Task 4's stiff-accuracy branch**.
+
+The Shu–Osher pair `(P, q)` is derived from the **explicit** tableau `(A, b)` alone, so
+evaluating its completion row as a formula silently drops the implicit contribution
+`h·Σ b̃_j·Ẏ_j`. Measured on a scalar split Dahlquist problem with `λ_im = −3`, one step of
+`esdirk_gamma5`: the Butcher ARK completion and the last stage value agree to `1.1e-16`
+(that is stiff accuracy), while the Shu–Osher completion row gives `0.7502195325` against
+the correct `0.6702333694` — an **8% error per step, with no exception raised**. On `ssprk2`
+the reverse holds: `Ã ≡ 0`, so Butcher and Shu–Osher agree exactly, but `Y_s = 0.9000` is
+*not* the answer (`0.9050` is), so that tableau genuinely needs the completion row.
+
+So each branch is load-bearing for a different tableau:
+
+```python
+    def _complete(self, tab, x, h):
+        """x^{n+1}.
+
+        Three cases, and the distinction is not cosmetic:
+
+        * Stiffly accurate (b == A[-1] and bt == At[-1]): the completion IS the
+          last stage value, which already carries the implicit contribution.
+          Boundedness still holds, because on the components a limiter acts on
+          Y[-1] was produced by convex-combination row s of [P | q] -- via the
+          stage, not via a separate completion formula.
+        * Purely explicit (At identically zero): no implicit contribution
+          exists to drop, so the Shu-Osher completion row applies directly and
+          is manifestly a convex combination.
+        * Neither: a non-stiffly-accurate tableau WITH an implicit part would
+          need the Butcher implicit completion, which the Shu-Osher form cannot
+          express. Refuse rather than silently drop it.
+        """
+        s = len(tab.b)
+        if np.allclose(tab.b, tab.A[-1], atol=1e-14) and np.allclose(
+            tab.bt, tab.At[-1], atol=1e-14
+        ):
+            self._Y[-1].copy(x)
+            return
+        if not np.any(tab.At):
+            result = self._Z  # reuse as scratch; Z is dead at this point
+            result.set(0.0)
+            if self._q[s] != 0.0:
+                result.axpy(self._q[s], x)
+            for j in range(s):
+                psj = self._P[s, j]
+                if psj == 0.0:
+                    continue
+                result.axpy(psj, self._Y[j])
+                result.axpy(psj * h / self._r, self._L[j])
+            result.copy(x)
+            return
+        raise ValueError(
+            f"tableau {tab.name!r} is neither stiffly accurate nor purely "
+            "explicit. Its completion needs the implicit weights bt, which the "
+            "Shu-Osher form cannot express, so the implicit contribution would "
+            "be silently dropped. Use a stiffly accurate tableau."
+        )
+```
+
+Add a test that the third branch is reachable and raises rather than returning a wrong
+answer — construct an `ARKTableau` that is neither stiffly accurate nor purely explicit
+(e.g. take `esdirk_gamma5` via `dataclasses.replace` with `b` perturbed away from `A[-1]`),
+register nothing, and drive `_complete` directly or through a solve, asserting the
+`ValueError` names the tableau.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `uv run pytest --verbose tests/test_fieldsplit.py`
+Expected: 4 passed.
+
+Then confirm nothing regressed: `uv run pytest --verbose tests/`
+Expected: all previously-passing tests still pass (7 in `test_imex.py` plus the rest).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add firedrake_ts/solving_utils.py tests/test_fieldsplit.py
+git commit -m "Fix split() to use DAEProblem.u_restrict
+
+_TSContext.split() read problem.u, which DAEProblem never defines --
+it sets u_restrict. Any mixed problem with pc_type: fieldsplit died in
+DMCreateFieldDecomposition with an unhandled AttributeError, so
+fieldsplit preconditioning was unavailable on every mixed DAE.
+
+Firedrake's own _SNESContext.split() uses u_restrict; ours was a stale
+copy from before the restricted-function-space rename."
+```
+
+---
+
+### Task 2: Shu–Osher conversion and Kraaijevanger radius
+
+Pure numpy. This is where the mathematical risk of the whole project lives, so it gets tested at machine precision with no PDE machinery.
+
+**Files:**
+- Create: `firedrake_ts/tableaux.py`
+- Test: `tests/test_tableaux.py` (create)
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces:
+  - `shu_osher(A: np.ndarray, b: np.ndarray, r: float) -> tuple[np.ndarray, np.ndarray]` returning `(P, q)`, both sized `(s+1, s+1)` and `(s+1,)`.
+  - `butcher_to_K(A: np.ndarray, b: np.ndarray) -> np.ndarray` returning the `(s+1, s+1)` matrix `K = [[A, 0], [bᵀ, 0]]`.
+  - `kraaijevanger_radius(A: np.ndarray, b: np.ndarray, hi: float = 50.0) -> float`.
+  - `ShuOsherError(ValueError)` raised when `r` exceeds the radius.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/test_tableaux.py`:
+
+```python
+"""Tableau algebra. No Firedrake, no PETSc -- pure numpy at machine precision."""
+
+import numpy as np
+import pytest
+
+from firedrake_ts.tableaux import (
+    ShuOsherError,
+    butcher_to_K,
+    kraaijevanger_radius,
+    shu_osher,
+)
+
+# Ketcheson's optimal SSPRK(3,2) in stiffly accurate form, the explicit part of
+# rk-method-spec.md 5.1. Four stages, R(A,b) = 2.
+SSPRK32_A = np.array(
+    [
+        [0.0, 0.0, 0.0, 0.0],
+        [0.5, 0.0, 0.0, 0.0],
+        [0.5, 0.5, 0.0, 0.0],
+        [1 / 3, 1 / 3, 1 / 3, 0.0],
+    ]
+)
+SSPRK32_B = np.array([1 / 3, 1 / 3, 1 / 3, 0.0])
+
+HEUN_A = np.array([[0.0, 0.0], [1.0, 0.0]])
+HEUN_B = np.array([0.5, 0.5])
+
+
+def _stages_shu_osher(z, P, q, r):
+    """Stage values of the Shu-Osher recursion on y' = z y, y(0) = 1."""
+    n = len(q)
+    Y = np.zeros(n, dtype=complex)
+    for i in range(n):
+        Y[i] = q[i]
+        for j in range(i):
+            Y[i] += P[i, j] * Y[j] * (1.0 + z / r)
+    return Y
+
+
+def _stages_butcher(z, A, b):
+    """The same stage values from the Butcher map."""
+    s = len(b)
+    Y = np.zeros(s + 1, dtype=complex)
+    for i in range(s):
+        Y[i] = 1.0 + z * sum(A[i, j] * Y[j] for j in range(i))
+    Y[s] = 1.0 + z * sum(b[j] * Y[j] for j in range(s))
+    return Y
+
+
+def test_ssprk32_gives_the_textbook_form():
+    """At r = 2 the conversion must reproduce the hand-derived coefficients."""
+    P, q = shu_osher(SSPRK32_A, SSPRK32_B, 2.0)
+    np.testing.assert_allclose(q, [1.0, 0.0, 0.0, 1 / 3, 1 / 3], atol=1e-14)
+    expected_P = np.zeros((5, 5))
+    expected_P[1, 0] = 1.0
+    expected_P[2, 1] = 1.0
+    expected_P[3, 2] = 2 / 3
+    expected_P[4, 2] = 2 / 3
+    np.testing.assert_allclose(P, expected_P, atol=1e-14)
+
+
+def test_heun_gives_the_textbook_form():
+    """u1 = un + h L(un);  u2 = 1/2 un + 1/2 (u1 + h L(u1))."""
+    P, q = shu_osher(HEUN_A, HEUN_B, 1.0)
+    np.testing.assert_allclose(q, [1.0, 0.0, 0.5], atol=1e-14)
+    expected_P = np.zeros((3, 3))
+    expected_P[1, 0] = 1.0
+    expected_P[2, 1] = 0.5
+    np.testing.assert_allclose(P, expected_P, atol=1e-14)
+
+
+@pytest.mark.parametrize(
+    "A,b,r", [(SSPRK32_A, SSPRK32_B, 2.0), (HEUN_A, HEUN_B, 1.0)]
+)
+def test_shu_osher_reproduces_the_butcher_map(A, b, r):
+    """The two representations must agree to machine precision."""
+    P, q = shu_osher(A, b, r)
+    for z in [-0.3, -1.0 + 0.4j, 0.7, -2.5, 1.5 - 2.0j]:
+        np.testing.assert_allclose(
+            _stages_shu_osher(z, P, q, r), _stages_butcher(z, A, b), atol=1e-14
+        )
+
+
+@pytest.mark.parametrize(
+    "A,b,r", [(SSPRK32_A, SSPRK32_B, 2.0), (HEUN_A, HEUN_B, 1.0)]
+)
+def test_rows_are_nonnegative_partitions_of_unity(A, b, r):
+    """Every row, INCLUDING the completion row, must be a convex combination.
+
+    This is what makes the accepted step bounded and retires the post-step
+    clamp of rk-method-spec.md R8.
+    """
+    P, q = shu_osher(A, b, r)
+    assert P.min() >= -1e-14
+    assert q.min() >= -1e-14
+    np.testing.assert_allclose(P.sum(axis=1) + q, 1.0, atol=1e-14)
+
+
+def test_completion_row_equals_last_stage_row_under_stiff_accuracy():
+    """b == A[s-1,:] means the completion IS the last stage."""
+    P, q = shu_osher(SSPRK32_A, SSPRK32_B, 2.0)
+    np.testing.assert_allclose(P[-1], P[-2], atol=1e-14)
+    np.testing.assert_allclose(q[-1], q[-2], atol=1e-14)
+
+
+def test_kraaijevanger_radius():
+    assert kraaijevanger_radius(SSPRK32_A, SSPRK32_B) == pytest.approx(2.0, abs=1e-9)
+    assert kraaijevanger_radius(HEUN_A, HEUN_B) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_radius_is_sharp():
+    """Just above the radius the conversion must be rejected, not silently wrong."""
+    shu_osher(SSPRK32_A, SSPRK32_B, 2.0)  # must not raise
+    with pytest.raises(ShuOsherError, match="2.0"):
+        shu_osher(SSPRK32_A, SSPRK32_B, 2.0001)
+
+
+def test_butcher_to_K_shape():
+    K = butcher_to_K(HEUN_A, HEUN_B)
+    np.testing.assert_allclose(K, [[0, 0, 0], [1, 0, 0], [0.5, 0.5, 0]], atol=1e-14)
+
+
+def test_module_does_not_import_firedrake():
+    """tableaux.py must stay usable without Firedrake or PETSc importable.
+
+    Tests the real property in a subprocess with both blocked, rather than
+    scanning the source for a substring.
+    """
+    import pathlib
+    import subprocess
+    import sys
+    import textwrap
+
+    # Load the file directly, NOT as firedrake_ts.tableaux: the package
+    # __init__ imports Firedrake, so importing through the package would
+    # always fail regardless of what tableaux.py itself does.
+    target = pathlib.Path(__file__).parent.parent / "firedrake_ts" / "tableaux.py"
+    assert target.exists(), target
+
+    program = textwrap.dedent(
+        """
+        import importlib.util
+        import sys
+
+        class Blocker:
+            def find_spec(self, name, path=None, target=None):
+                if name.split(".")[0] in ("firedrake", "petsc4py"):
+                    raise ImportError(f"{name} is blocked for this test")
+                return None
+
+        sys.meta_path.insert(0, Blocker())
+        spec = importlib.util.spec_from_file_location("_isolated", sys.argv[1])
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert mod.kraaijevanger_radius is not None
+        assert mod.shu_osher is not None
+        print("OK")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program, str(target)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"tableaux.py cannot load without Firedrake/PETSc importable:\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest --verbose tests/test_tableaux.py`
+Expected: collection error — `ModuleNotFoundError: No module named 'firedrake_ts.tableaux'`.
+
+- [ ] **Step 3: Write the implementation**
+
+Create `firedrake_ts/tableaux.py`:
+
+```python
+"""Runge-Kutta tableau algebra: Butcher data, Shu-Osher form, SSP radii.
+
+Deliberately free of Firedrake and PETSc imports. Everything here is testable
+at machine precision with no PDE machinery, which is where the mathematical
+risk of the Shu-Osher stepper lives.
+
+References
+----------
+Shu-Osher form and the absolute monotonicity radius: Kraaijevanger (1991);
+Ketcheson's optimal SSPRK(3,2). The acceptance predicates R1-R9 come from
+``local/fill/rk-method-spec.md``.
+"""
+
+import numpy as np
+
+__all__ = [
+    "ShuOsherError",
+    "butcher_to_K",
+    "kraaijevanger_radius",
+    "shu_osher",
+]
+
+
+class ShuOsherError(ValueError):
+    """Raised when a Shu-Osher conversion would produce negative coefficients."""
+
+
+def butcher_to_K(A, b):
+    """Return ``K = [[A, 0], [b^T, 0]]``, the tableau with its completion row.
+
+    Folding the completion into ``K`` is what makes the accepted step subject
+    to the same convex-combination argument as the stages.
+    """
+    A = np.asarray(A, dtype=float)
+    b = np.asarray(b, dtype=float)
+    s = len(b)
+    K = np.zeros((s + 1, s + 1))
+    K[:s, :s] = A
+    K[s, :s] = b
+    return K
+
+
+def _monotone_at(K, r, tol=1e-13):
+    """Is ``I + rK`` invertible with ``M^-1 K >= 0`` and ``M^-1 e >= 0``?"""
+    n = K.shape[0]
+    M = np.eye(n) + r * K
+    if abs(np.linalg.det(M)) < 1e-14:
+        return False
+    Minv = np.linalg.inv(M)
+    return bool(
+        (Minv @ K >= -tol).all() and (Minv @ np.ones(n) >= -tol).all()
+    )
+
+
+def kraaijevanger_radius(A, b, hi=50.0, iterations=200):
+    """The radius of absolute monotonicity ``R(A, b)``, by bisection.
+
+    ``hi`` bounds the search; methods with an unbounded radius return ``hi``.
+    """
+    K = butcher_to_K(A, b)
+    lo = 0.0
+    for _ in range(iterations):
+        mid = 0.5 * (lo + hi)
+        if _monotone_at(K, mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def shu_osher(A, b, r):
+    """Convert a Butcher tableau to canonical Shu-Osher form at radius ``r``.
+
+    Returns ``(P, q)`` with ``P = r M^-1 K`` and ``q = M^-1 e``, where
+    ``M = I + rK``. The stage recursion is then
+
+        Y_i = q_i x^n + sum_{j<i} P_ij (Y_j + (h/r) L(Y_j))
+
+    with the last row giving ``x^{n+1}``. Every row of ``[P | q]`` is a
+    nonnegative partition of unity exactly when ``r <= R(A, b)``.
+
+    Raises
+    ------
+    ShuOsherError
+        If ``r`` exceeds ``R(A, b)``, so some coefficient is negative and the
+        SSP guarantee would silently not hold.
+    """
+    if r <= 0.0:
+        raise ShuOsherError(f"r must be positive, got {r!r}")
+    K = butcher_to_K(A, b)
+    n = K.shape[0]
+    M = np.eye(n) + r * K
+    if abs(np.linalg.det(M)) < 1e-14:
+        raise ShuOsherError(f"I + rK is singular at r = {r!r}")
+    Minv = np.linalg.inv(M)
+    P = r * (Minv @ K)
+    q = Minv @ np.ones(n)
+    if P.min() < -1e-13 or q.min() < -1e-13:
+        radius = kraaijevanger_radius(A, b)
+        raise ShuOsherError(
+            f"r = {r!r} exceeds the radius of absolute monotonicity "
+            f"R(A,b) = {radius:.10g}: min(P) = {P.min():.3e}, "
+            f"min(q) = {q.min():.3e}. The SSP bound would not hold."
+        )
+    return P, q
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `uv run pytest --verbose tests/test_tableaux.py`
+Expected: all pass. Reference values to expect if you debug: `q = (1, 0, 0, ⅓, ⅓)`, `P` non-zeros `P[1,0]=P[2,1]=1`, `P[3,2]=P[4,2]=⅔`, Butcher agreement `4.44e-16`, `R(A,b) = 2.0000000000002`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add firedrake_ts/tableaux.py tests/test_tableaux.py
+git commit -m "Add Shu-Osher conversion and Kraaijevanger radius
+
+Pure numpy, no Firedrake or PETSc import, so the mathematically subtle
+part is testable at machine precision without any PDE machinery.
+
+Verified: SSPRK(3,2) at r=2 gives the textbook q=(1,0,0,1/3,1/3) with P
+carrying 1,1,2/3,2/3; the recursion reproduces the Butcher map to
+4.4e-16; R(A,b)=2 and r=2.0001 is rejected rather than silently
+producing negative coefficients.
+
+Every row of [P|q] is a nonnegative partition of unity, including the
+completion row -- which is why the accepted step needs no post-step
+clamp."
+```
+
+---
+
+### Task 3: Tableau registry and the acceptance report
+
+Turns `rk-method-spec.md` §4's R1–R9 predicates from prose into an executable test.
+
+**Files:**
+- Modify: `firedrake_ts/tableaux.py`
+- Test: `tests/test_tableaux.py`
+
+**Interfaces:**
+- Consumes: `shu_osher`, `kraaijevanger_radius`, `butcher_to_K` from Task 2.
+- Produces:
+  - `ARKTableau` dataclass with fields `name: str`, `A`, `b`, `bhat`, `At`, `bt`, `c`, `ct`, `d` (all `np.ndarray`), `order: int`.
+  - `TABLEAUX: dict[str, ARKTableau]` with keys `"imex_euler"`, `"ssprk2"`, `"esdirk_gamma5"`, `"ssp2_444_lsa"`.
+  - `stability_function(At, w, z) -> complex` computing `1 + z·wᵀ(I − zÃ)⁻¹e`.
+  - `acceptance_report(tab: ARKTableau) -> dict` with keys `r3_explicit`, `r3_implicit`, `r4_r_infinity`, `r5_bhat_sum`, `r5_bhat_dot_c`, `r6_radius`, `r8_min_diagonal`.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/test_tableaux.py`:
+
+```python
+from firedrake_ts.tableaux import (  # noqa: E402
+    TABLEAUX,
+    acceptance_report,
+    stability_function,
+)
+
+
+def test_registry_has_the_expected_tableaux():
+    assert set(TABLEAUX) == {
+        "imex_euler",
+        "ssprk2",
+        "esdirk_gamma5",
+        "ssp2_444_lsa",
+    }
+
+
+@pytest.mark.parametrize("name", ["imex_euler", "esdirk_gamma5", "ssp2_444_lsa"])
+def test_stiff_accuracy_r3(name):
+    """b == A[s-1,:] and bt == At[s-1,:]. Required for the algebraic variables."""
+    tab = TABLEAUX[name]
+    np.testing.assert_allclose(tab.b, tab.A[-1], atol=1e-14)
+    np.testing.assert_allclose(tab.bt, tab.At[-1], atol=1e-14)
+
+
+@pytest.mark.parametrize("name", ["esdirk_gamma5", "ssp2_444_lsa"])
+def test_l_stability_r4(name):
+    """R(inf) == 0 and sup|R(z)| <= 1 on the left half-plane.
+
+    Note At is singular for these tableaux (explicit first stage), so R(inf)
+    must come from the limit of 1 + z bt^T (I - z At)^-1 e, NOT from
+    1 + bt^T At^-1 e. Probe at z = -1e8; -1e10 is dominated by roundoff.
+    """
+    tab = TABLEAUX[name]
+    assert abs(stability_function(tab.At, tab.bt, -1e8)) < 1e-6
+    assert abs(stability_function(tab.At, tab.bhat, -1e8)) < 1e-5
+    grid = [
+        complex(re, im)
+        for re in np.linspace(-40.0, 0.0, 200)
+        for im in np.linspace(0.0, 40.0, 200)
+    ]
+    assert max(abs(stability_function(tab.At, tab.bt, z)) for z in grid) <= 1.0 + 1e-9
+
+
+def test_esdirk_gamma5_matches_the_spec_closed_form():
+    """R(z) = -5(z^2 + 20z + 50) / (2(z-5)^3), rk-method-spec.md 5.1."""
+    tab = TABLEAUX["esdirk_gamma5"]
+    for z in [-1.0, -10.0, -100.0]:
+        expected = -5 * (z**2 + 20 * z + 50) / (2 * (z - 5) ** 3)
+        assert stability_function(tab.At, tab.bt, z) == pytest.approx(
+            expected, rel=1e-10
+        )
+
+
+def test_acceptance_report_reproduces_the_spec_table():
+    """rk-method-spec.md 5, esdirk_gamma5 row."""
+    report = acceptance_report(TABLEAUX["esdirk_gamma5"])
+    assert report["r3_explicit"] is True
+    assert report["r3_implicit"] is True
+    assert abs(report["r4_r_infinity"]) < 1e-6
+    assert report["r5_bhat_sum"] == pytest.approx(1.0, abs=1e-14)
+    assert report["r5_bhat_dot_c"] == pytest.approx(16 / 25, abs=1e-12)
+    assert report["r6_radius"] == pytest.approx(2.0, abs=1e-9)
+    # Explicit first stage: At[0,0] == 0, the "circle" entry in the spec table.
+    assert report["r8_min_diagonal"] == pytest.approx(0.0, abs=1e-14)
+
+
+def test_ssp2_444_lsa_radius_and_embedding():
+    report = acceptance_report(TABLEAUX["ssp2_444_lsa"])
+    assert report["r6_radius"] == pytest.approx(2.0, abs=1e-9)
+    assert report["r5_bhat_sum"] == pytest.approx(1.0, abs=1e-14)
+    assert report["r5_bhat_dot_c"] == pytest.approx(1 / 3, abs=1e-12)
+
+
+@pytest.mark.parametrize("name", ["imex_euler", "ssprk2"])
+def test_shakedown_tableaux_have_unit_radius(name):
+    tab = TABLEAUX[name]
+    assert kraaijevanger_radius(tab.A, tab.b) == pytest.approx(1.0, abs=1e-9)
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest --verbose tests/test_tableaux.py`
+Expected: collection error — `ImportError: cannot import name 'TABLEAUX'`.
+
+- [ ] **Step 3: Write the implementation**
+
+Append to `firedrake_ts/tableaux.py`. Add `dataclass` to the imports and extend `__all__` with `"ARKTableau"`, `"TABLEAUX"`, `"acceptance_report"`, `"stability_function"`.
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ARKTableau:
+    """An additive Runge-Kutta pair.
+
+    ``A, b, bhat`` are the explicit tableau, its completion weights and its
+    embedded weights; ``At, bt`` the implicit tableau and completion; ``c, ct``
+    the abscissae; ``d`` the dense-output theta-coefficients.
+    """
+
+    name: str
+    A: np.ndarray
+    b: np.ndarray
+    bhat: np.ndarray
+    At: np.ndarray
+    bt: np.ndarray
+    c: np.ndarray
+    ct: np.ndarray
+    d: np.ndarray
+    order: int
+
+
+def stability_function(At, w, z):
+    """``R(z) = 1 + z w^T (I - z At)^-1 e``.
+
+    Use this rather than ``1 + w^T At^-1 e`` for ``R(infinity)``: ``At`` is
+    singular whenever the first stage is explicit, which is the case for every
+    stiffly accurate tableau here.
+    """
+    At = np.asarray(At, dtype=float)
+    n = At.shape[0]
+    e = np.ones(n)
+    return 1.0 + z * (np.asarray(w, dtype=float) @ np.linalg.solve(np.eye(n) - z * At, e))
+
+
+def acceptance_report(tab):
+    """Evaluate the R1-R9 predicates of ``local/fill/rk-method-spec.md`` 4."""
+    return {
+        "r3_explicit": bool(np.allclose(tab.b, tab.A[-1], atol=1e-14)),
+        "r3_implicit": bool(np.allclose(tab.bt, tab.At[-1], atol=1e-14)),
+        "r4_r_infinity": stability_function(tab.At, tab.bt, -1e8).real,
+        "r5_bhat_sum": float(tab.bhat.sum()),
+        "r5_bhat_dot_c": float(tab.bhat @ tab.c),
+        "r6_radius": kraaijevanger_radius(tab.A, tab.b),
+        "r8_min_diagonal": float(np.diag(tab.At).min()),
+    }
+
+
+def _t(name, A, b, bhat, At, bt, c, ct, d, order):
+    return ARKTableau(
+        name=name,
+        A=np.array(A, dtype=float),
+        b=np.array(b, dtype=float),
+        bhat=np.array(bhat, dtype=float),
+        At=np.array(At, dtype=float),
+        bt=np.array(bt, dtype=float),
+        c=np.array(c, dtype=float),
+        ct=np.array(ct, dtype=float),
+        d=np.array(d, dtype=float),
+        order=order,
+    )
+
+
+# Shakedown tableau: explicit Euler on G, backward Euler on F. Two stages so the
+# explicit part stays strictly lower triangular while the implicit part is
+# stiffly accurate. Stage 0 is x^n exactly (c_0 = 0, both rows zero).
+_IMEX_EULER = _t(
+    "imex_euler",
+    A=[[0.0, 0.0], [1.0, 0.0]],
+    b=[1.0, 0.0],
+    bhat=[1.0, 0.0],
+    At=[[0.0, 0.0], [0.0, 1.0]],
+    bt=[0.0, 1.0],
+    c=[0.0, 1.0],
+    ct=[0.0, 1.0],
+    d=[1.0, 0.0],
+    order=1,
+)
+
+# Shakedown tableau: Heun / SSPRK(2,2), explicit only. At is identically zero,
+# so no stage requires an implicit solve.
+_SSPRK2 = _t(
+    "ssprk2",
+    A=[[0.0, 0.0], [1.0, 0.0]],
+    b=[0.5, 0.5],
+    bhat=[1.0, 0.0],
+    At=[[0.0, 0.0], [0.0, 0.0]],
+    bt=[0.0, 0.0],
+    c=[0.0, 1.0],
+    ct=[0.0, 1.0],
+    d=[1.0, 0.0],
+    order=2,
+)
+
+# rk-method-spec.md 5.1. Explicit part is Ketcheson's optimal SSPRK(3,2) in
+# stiffly accurate form; implicit part a stiffly accurate, L-stable ESDIRK with
+# uniform diagonal gamma = 1/5, so PETSc passes a single shift and the shifted
+# operator is reusable across all three implicit solves.
+_ESDIRK_GAMMA5 = _t(
+    "esdirk_gamma5",
+    A=[
+        [0.0, 0.0, 0.0, 0.0],
+        [0.5, 0.0, 0.0, 0.0],
+        [0.5, 0.5, 0.0, 0.0],
+        [1 / 3, 1 / 3, 1 / 3, 0.0],
+    ],
+    b=[1 / 3, 1 / 3, 1 / 3, 0.0],
+    bhat=[27 / 125, 36 / 125, 12 / 125, 2 / 5],
+    At=[
+        [0.0, 0.0, 0.0, 0.0],
+        [3 / 10, 1 / 5, 0.0, 0.0],
+        [3 / 10, 1 / 2, 1 / 5, 0.0],
+        [39 / 125, 47 / 125, 14 / 125, 1 / 5],
+    ],
+    bt=[39 / 125, 47 / 125, 14 / 125, 1 / 5],
+    c=[0.0, 0.5, 1.0, 1.0],
+    ct=[0.0, 0.5, 1.0, 1.0],
+    d=[573 / 875, 604 / 875, 148 / 875, -18 / 35],
+    order=2,
+)
+
+# rk-method-spec.md 5.2. Same explicit part; implicit diagonals are distinct
+# (1/6, 1/5, 1/4), so there is no operator reuse across stages. Larger joint
+# region (1.200 vs 1.050) but smaller explicit-axis radius. Kept as the
+# fallback if the uniform-gamma part conditions badly in practice.
+_SSP2_444_LSA = _t(
+    "ssp2_444_lsa",
+    A=[
+        [0.0, 0.0, 0.0, 0.0],
+        [0.5, 0.0, 0.0, 0.0],
+        [0.5, 0.5, 0.0, 0.0],
+        [1 / 3, 1 / 3, 1 / 3, 0.0],
+    ],
+    b=[1 / 3, 1 / 3, 1 / 3, 0.0],
+    bhat=[11 / 24, 5 / 12, 1 / 8, 0.0],
+    At=[
+        [0.0, 0.0, 0.0, 0.0],
+        [1 / 3, 1 / 6, 0.0, 0.0],
+        [1 / 3, 7 / 15, 1 / 5, 0.0],
+        [11 / 32, 5 / 16, 3 / 32, 1 / 4],
+    ],
+    bt=[11 / 32, 5 / 16, 3 / 32, 1 / 4],
+    c=[0.0, 0.5, 1.0, 1.0],
+    ct=[0.0, 0.5, 1.0, 1.0],
+    d=[11 / 16, 5 / 8, 3 / 16, -1 / 2],
+    order=2,
+)
+
+TABLEAUX = {
+    t.name: t
+    for t in (_IMEX_EULER, _SSPRK2, _ESDIRK_GAMMA5, _SSP2_444_LSA)
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `uv run pytest --verbose tests/test_tableaux.py`
+Expected: all pass.
+
+If `test_l_stability_r4` fails for `ssp2_444_lsa` on `bhat`: its `bhat` has a zero last entry, so `R̂(∞)` decays more slowly. The tolerance `1e-5` accounts for that. Do not loosen it further without checking `stability_function(tab.At, tab.bhat, -1e10)` also trends to zero.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add firedrake_ts/tableaux.py tests/test_tableaux.py
+git commit -m "Add ARK tableau registry and rk-method-spec acceptance report
+
+Four tableaux: imex_euler and ssprk2 for shakedown, esdirk_gamma5
+(rk-method-spec.md 5.1) and ssp2_444_lsa (5.2) for production.
+
+acceptance_report evaluates R3-R8 so the spec's acceptance table is an
+executable test rather than prose. Reproduces the published values:
+R(A,b)=2, bhat.c=16/25, R(inf)=0, and the closed-form R(z) to ten
+digits.
+
+stability_function uses 1 + z bt^T (I - z At)^-1 e rather than
+1 + bt^T At^-1 e: At is singular whenever the first stage is explicit,
+which holds for every stiffly accurate tableau here."
+```
+
+---
+
+### Task 4: `ARKSSP` skeleton and IMEX Euler (M2a)
+
+Proves the stage solve — `Z_i`, the shift, the SNES path — with the simplest possible tableau and no Shu–Osher machinery. Butcher form only.
+
+**Files:**
+- Create: `firedrake_ts/ark_ssp.py`
+- Test: `tests/test_ark_ssp.py` (create)
+
+**Interfaces:**
+- Consumes: `TABLEAUX` from Task 3.
+- Produces:
+  - `ARKSSP` class, constructible with no arguments, usable via `-ts_python_type firedrake_ts.ark_ssp.ARKSSP`.
+  - `ARKSSP.setUp(ts)`, `ARKSSP.step(ts)`, `ARKSSP.reset(ts)`, `ARKSSP.setFromOptions(ts)`, `ARKSSP.view(ts, viewer)`.
+  - Options: `-ts_ark_ssp_type <name>` (default `esdirk_gamma5`), `-ts_ark_ssp_radius <float>` (default: `R(A,b)`).
+  - `ARKSSP.formSNESFunction(args)` — **one positional tuple**, `(snes, x, f, ts)`. libpetsc4py calls this as `formSNESFunction(args)`, unlike `formSNESJacobian(*args)`.
+  - `ARKSSP.formSNESJacobian(snes, x, A, B, ts)` — splatted.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/test_ark_ssp.py`:
+
+```python
+"""The ARKSSP TSPYTHON stepper."""
+
+import numpy as np
+import pytest
+from firedrake import *
+
+import firedrake_ts
+
+EXACT = np.exp(-1.0)  # solution of u' = -u at t = 1
+
+PYTHON_STEPPER = "firedrake_ts.ark_ssp.ARKSSP"
+
+
+def _decay(tableau, dt=1e-3, tmax=1.0, extra=None):
+    """Integrate u' = -u to tmax with -u explicit, under ARKSSP."""
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    F = inner(u_t, v) * dx
+    G = -inner(u, v) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, tmax), G=G)
+    parameters = {
+        "ts_type": "python",
+        "ts_python_type": PYTHON_STEPPER,
+        "ts_ark_ssp_type": tableau,
+        "ts_adapt_type": "none",
+        "ts_time_step": dt,
+        "ts_exact_final_time": "stepover",
+    }
+    parameters.update(extra or {})
+    solver = firedrake_ts.DAESolver(
+        problem, solver_parameters=parameters, options_prefix=""
+    )
+    solver.solve()
+    return solver, float(u.dat.data_ro[0])
+
+
+def test_stepper_is_selectable_and_sets_up():
+    """-ts_type python -ts_python_type must resolve and run setUp once."""
+    solver, _ = _decay("imex_euler", dt=0.1)
+    ctx = solver.ts.getPythonContext()
+    assert type(ctx).__name__ == "ARKSSP"
+    assert ctx.setup_calls == 1
+
+
+def test_imex_euler_advances_and_converges():
+    """The explicit part must reach the state, and the answer must be right."""
+    _, value = _decay("imex_euler", dt=1e-3)
+    assert abs(value - 1.0) > 0.1, "solution never left its initial condition"
+    # First order: error ~ C h, so ~1e-3 at h=1e-3. Generous bound.
+    assert abs(value - EXACT) < 5e-3, f"u(1) = {value}, expected {EXACT}"
+
+
+def test_imex_euler_is_first_order():
+    """Halving dt must halve the error."""
+    _, coarse = _decay("imex_euler", dt=2e-3)
+    _, fine = _decay("imex_euler", dt=1e-3)
+    ratio = abs(coarse - EXACT) / abs(fine - EXACT)
+    assert 1.7 < ratio < 2.3, f"observed order ratio {ratio}, expected ~2"
+
+
+def test_stage_solves_do_work():
+    """Zero SNES iterations would mean a null residual."""
+    solver, _ = _decay("imex_euler", dt=1e-2)
+    assert solver.ts.getSNESIterations() > 0
+
+
+def test_matches_the_arkimex_path():
+    """ARKSSP and PETSc's own arkimex must agree beyond method error."""
+    _, ours = _decay("imex_euler", dt=1e-4)
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    problem = firedrake_ts.DAEProblem(
+        inner(u_t, v) * dx, u, u_t, (0.0, 1.0), G=-inner(u, v) * dx
+    )
+    firedrake_ts.DAESolver(
+        problem,
+        solver_parameters={
+            "ts_type": "arkimex",
+            "ts_arkimex_type": "2c",
+            "ts_adapt_type": "none",
+            "ts_time_step": 1e-4,
+            "ts_exact_final_time": "stepover",
+        },
+        options_prefix="",
+    ).solve()
+    assert abs(ours - float(u.dat.data_ro[0])) < 1e-3
+
+
+def test_radius_above_the_ssp_limit_is_rejected():
+    """Silently losing the SSP guarantee is the failure mode we must not have."""
+    from firedrake_ts.tableaux import ShuOsherError
+
+    with pytest.raises(ShuOsherError, match="exceeds the radius"):
+        _decay("ssprk2", dt=0.1, extra={"ts_ark_ssp_radius": 5.0})
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest --verbose tests/test_ark_ssp.py`
+Expected: all fail. The PETSc error will mention it cannot import `firedrake_ts.ark_ssp`.
+
+- [ ] **Step 3: Write the implementation**
+
+Create `firedrake_ts/ark_ssp.py`. This task implements the Butcher path only; Task 5 adds Shu–Osher, Task 8 adds the freeze.
+
+```python
+"""An additive Runge-Kutta stepper as a ``TSPYTHON`` type.
+
+Selected with ``-ts_type python -ts_python_type firedrake_ts.ark_ssp.ARKSSP``.
+
+The explicit part is advanced in canonical Shu-Osher form so that a limiter
+applied to a stage value is mathematically sound: each stage is a convex
+combination of forward-Euler steps taken from previously-limited stage values.
+See ``docs/superpowers/specs/2026-08-04-shu-osher-tspython-stepper-design.md``.
+"""
+
+import numpy as np
+from firedrake.exceptions import ConvergenceError
+from firedrake.petsc import PETSc
+
+from firedrake_ts.tableaux import TABLEAUX, kraaijevanger_radius, shu_osher
+
+__all__ = ["ARKSSP"]
+
+
+class ARKSSP:
+    """Additive RK with the explicit part in Shu-Osher form."""
+
+    def __init__(self):
+        self.tableau_name = "esdirk_gamma5"
+        self.radius = None
+        self.setup_calls = 0
+        self.step_calls = 0
+        self._limiter = None
+        self._tab = None
+        self._P = None
+        self._q = None
+        self._r = None
+        # Work vectors, allocated in setUp.
+        self._Y = None      # stage values
+        self._L = None      # explicit slopes, M^-1 G(Y_j)
+        self._Ydot = None   # implicit stage derivatives
+        self._Z = None      # Butcher stage offset
+        self._rhs = None    # scratch for computeRHSFunction
+        # Set per stage, read by the SNES callbacks.
+        self._stage = None
+        self._shift = None
+        self._stage_time = None
+
+    # -- options and lifecycle ------------------------------------------------
+
+    def setFromOptions(self, ts):
+        opts = PETSc.Options(ts.getOptionsPrefix() or "")
+        self.tableau_name = opts.getString("ts_ark_ssp_type", self.tableau_name)
+        radius = opts.getReal("ts_ark_ssp_radius", 0.0)
+        self.radius = radius if radius > 0.0 else None
+
+    def setUp(self, ts):
+        self.setup_calls += 1
+        try:
+            self._tab = TABLEAUX[self.tableau_name]
+        except KeyError:
+            raise ValueError(
+                f"unknown tableau {self.tableau_name!r}; "
+                f"choose one of {sorted(TABLEAUX)}"
+            ) from None
+        tab = self._tab
+        self._r = (
+            self.radius
+            if self.radius is not None
+            else kraaijevanger_radius(tab.A, tab.b)
+        )
+        # Raises ShuOsherError if the radius is too large, naming both numbers.
+        self._P, self._q = shu_osher(tab.A, tab.b, self._r)
+
+        sol = ts.getSolution()
+        s = len(tab.b)
+        self._Y = [sol.duplicate() for _ in range(s)]
+        self._L = [sol.duplicate() for _ in range(s)]
+        self._Ydot = [sol.duplicate() for _ in range(s)]
+        self._Z = sol.duplicate()
+        self._rhs = sol.duplicate()
+
+    def reset(self, ts):
+        pass
+
+    def view(self, ts, viewer):
+        if viewer is None:
+            return
+        viewer.printfASCII(f"  ARK-SSP stepper, tableau {self.tableau_name}\n")
+        viewer.printfASCII(f"  Shu-Osher radius r = {self._r}\n")
+        viewer.printfASCII(
+            f"  limiter: {'set' if self._limiter is not None else 'none'}\n"
+        )
+
+    def set_stage_limiter(self, limiter):
+        """Register a callable fired on each explicit substage value."""
+        self._limiter = limiter
+
+    # -- the step -------------------------------------------------------------
+
+    def step(self, ts):
+        self.step_calls += 1
+        tab = self._tab
+        t = ts.getTime()
+        h = ts.getTimeStep()
+        x = ts.getSolution()
+        s = len(tab.b)
+
+        for i in range(s):
+            self._build_offset(tab, x, h, i)
+            if tab.At[i, i] > 0.0:
+                self._solve_stage(ts, tab, h, i)
+            else:
+                # Purely explicit stage: the value IS the offset.
+                self._Z.copy(self._Y[i])
+                self._Ydot[i].set(0.0)
+            ts.computeRHSFunction(t + tab.c[i] * h, self._Y[i], self._rhs)
+            self._rhs.copy(self._L[i])
+
+        self._complete(tab, x, h)
+        ts.setTime(t + h)
+
+    def _build_offset(self, tab, x, h, i):
+        """Z_i = x^n + h sum_{j<i} (At_ij Ydot_j + A_ij L_j)."""
+        x.copy(self._Z)
+        for j in range(i):
+            if tab.At[i, j] != 0.0:
+                self._Z.axpy(h * tab.At[i, j], self._Ydot[j])
+            if tab.A[i, j] != 0.0:
+                self._Z.axpy(h * tab.A[i, j], self._L[j])
+
+    def _solve_stage(self, ts, tab, h, i):
+        """Solve F(Ydot_i, Y_i, t_i) = 0 with Ydot_i = (Y_i - Z_i)/(h At_ii)."""
+        self._stage = i
+        self._shift = 1.0 / (h * tab.At[i, i])
+        self._stage_time = ts.getTime() + tab.ct[i] * h
+        snes = ts.getSNES()
+        self._Z.copy(self._Y[i])  # initial guess
+        snes.solve(None, self._Y[i])
+        reason = snes.getConvergedReason()
+        if reason < 0:
+            # petsc4py exposes no PETSc.ERR_* constants, so signal with
+            # Firedrake's own exception. Task 10 replaces this with a step
+            # rejection routed through TSAdapt.
+            raise ConvergenceError(
+                f"stage {i} SNES diverged, reason {reason}"
+            )
+        self._Y[i].copy(self._Ydot[i])
+        self._Ydot[i].axpy(-1.0, self._Z)
+        self._Ydot[i].scale(self._shift)
+
+    def _complete(self, tab, x, h):
+        """x^{n+1}.
+
+        Under stiff accuracy (b == A[s-1,:] and bt == At[s-1,:]) the completion
+        is exactly the last stage, so copying it is not a shortcut but the
+        definition. Fall back to the weighted sum otherwise.
+        """
+        if np.allclose(tab.b, tab.A[-1], atol=1e-14) and np.allclose(
+            tab.bt, tab.At[-1], atol=1e-14
+        ):
+            self._Y[-1].copy(x)
+            return
+        for j, (bj, btj) in enumerate(zip(tab.b, tab.bt)):
+            if btj != 0.0:
+                x.axpy(h * btj, self._Ydot[j])
+            if bj != 0.0:
+                x.axpy(h * bj, self._L[j])
+
+    # -- SNES callbacks -------------------------------------------------------
+
+    def formSNESFunction(self, args):
+        """Stage residual.
+
+        NOTE the signature: libpetsc4py calls this as ``formSNESFunction(args)``
+        with the four-tuple as ONE positional argument, unlike
+        ``formSNESJacobian(*args)``.
+        """
+        _snes, x, f, ts = args
+        xdot = self._Z.duplicate()
+        x.copy(xdot)
+        xdot.axpy(-1.0, self._Z)
+        xdot.scale(self._shift)
+        ts.computeIFunction(self._stage_time, x, xdot, f, True)
+
+    def formSNESJacobian(self, snes, x, A, B, ts):
+        xdot = self._Z.duplicate()
+        x.copy(xdot)
+        xdot.axpy(-1.0, self._Z)
+        xdot.scale(self._shift)
+        ts.computeIJacobian(self._stage_time, x, xdot, self._shift, A, B, True)
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `uv run pytest --verbose tests/test_ark_ssp.py`
+Expected: all pass.
+
+If `test_imex_euler_advances_and_converges` reports a value of exactly 1.0, the explicit part is not reaching the state — check that `computeRHSFunction` results are being copied into `self._L[i]` and that `_build_offset` uses them.
+
+If the SNES reports zero iterations, `formSNESFunction` is not being called; confirm the single-tuple signature.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add firedrake_ts/ark_ssp.py tests/test_ark_ssp.py
+git commit -m "Add ARKSSP TSPYTHON stepper with the IMEX Euler shakedown
+
+Butcher path only: stage offsets Z_i, the 1/(h At_ii) shift, and the SNES
+stage solve, with no Shu-Osher machinery yet. Proves the stage solve in
+isolation before the convex-combination loop lands.
+
+Completion exploits stiff accuracy: when b == A[s-1,:] and
+bt == At[s-1,:] the completion IS the last stage value, so it is copied
+rather than re-summed.
+
+formSNESFunction takes ONE positional tuple -- libpetsc4py calls it as
+formSNESFunction(args) while splatting formSNESJacobian(*args)."
+```
+
+---
+
+### Task 5: Shu–Osher loop on a purely explicit tableau (M2b)
+
+Proves the convex-combination recursion with no implicit part, so a bug here cannot hide behind a stage solve.
+
+**Files:**
+- Modify: `firedrake_ts/ark_ssp.py`
+- Test: `tests/test_ark_ssp.py`
+
+**Interfaces:**
+- Consumes: `ARKSSP` from Task 4.
+- Produces: `ARKSSP._shu_osher_predictor(x, h, i)` populating `self._Y[i]`; `step` uses it for every stage.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/test_ark_ssp.py`:
+
+```python
+def test_ssprk2_is_second_order():
+    """Heun in Shu-Osher form must show design order 2."""
+    _, coarse = _decay("ssprk2", dt=4e-3)
+    _, fine = _decay("ssprk2", dt=2e-3)
+    ratio = abs(coarse - EXACT) / abs(fine - EXACT)
+    assert 3.4 < ratio < 4.6, f"observed order ratio {ratio}, expected ~4"
+
+
+def test_ssprk2_needs_no_implicit_solve():
+    """At is identically zero, so no stage may enter the SNES."""
+    solver, _ = _decay("ssprk2", dt=1e-2)
+    assert solver.ts.getSNESIterations() == 0
+
+
+def test_shu_osher_matches_butcher_on_the_same_problem():
+    """The Shu-Osher path and PETSc's Butcher-form TSRK must agree."""
+    _, ours = _decay("ssprk2", dt=1e-3)
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    problem = firedrake_ts.DAEProblem(
+        inner(u_t, v) * dx, u, u_t, (0.0, 1.0), G=-inner(u, v) * dx
+    )
+    firedrake_ts.DAESolver(
+        problem,
+        solver_parameters={
+            "ts_type": "arkimex",
+            "ts_arkimex_type": "2c",
+            "ts_adapt_type": "none",
+            "ts_time_step": 1e-3,
+            "ts_exact_final_time": "stepover",
+        },
+        options_prefix="",
+    ).solve()
+    assert abs(ours - float(u.dat.data_ro[0])) < 1e-5
+
+
+def test_limiter_fires_once_per_stage():
+    """The limiter must see every explicit substage, not just the last."""
+    calls = []
+
+    def counting_limiter(vec):
+        calls.append(vec.norm())
+
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    problem = firedrake_ts.DAEProblem(
+        inner(u_t, v) * dx, u, u_t, (0.0, 0.05), G=-inner(u, v) * dx
+    )
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters={
+            "ts_type": "python",
+            "ts_python_type": PYTHON_STEPPER,
+            "ts_ark_ssp_type": "ssprk2",
+            "ts_adapt_type": "none",
+            "ts_time_step": 0.01,
+            "ts_exact_final_time": "stepover",
+        },
+        options_prefix="",
+    )
+    solver.ts.getPythonContext().set_stage_limiter(counting_limiter)
+    solver.solve()
+    # 2 stages x 5 steps
+    assert len(calls) == 10, f"limiter fired {len(calls)} times, expected 10"
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest --verbose tests/test_ark_ssp.py`
+Expected: `test_ssprk2_is_second_order` fails (the Butcher path with `At = 0` gives `Y_i = Z_i`, which is *also* correct for this tableau, so this may pass — if so, `test_limiter_fires_once_per_stage` will still fail with 0 calls). At minimum the limiter test must fail before you implement.
+
+- [ ] **Step 3: Replace the stage loop with the Shu–Osher predictor**
+
+In `firedrake_ts/ark_ssp.py`, add the predictor and call it from `step`:
+
+```python
+    def _shu_osher_predictor(self, x, h, i):
+        """Y_i = q_i x^n + sum_{j<i} P_ij (Y_j + (h/r) L_j).
+
+        Every row of ``[P | q]`` is a nonnegative partition of unity, so this
+        is a convex combination of forward-Euler steps taken from stage values
+        the limiter has already seen. That is the whole reason for the stepper.
+        """
+        self._Y[i].set(0.0)
+        if self._q[i] != 0.0:
+            self._Y[i].axpy(self._q[i], x)
+        for j in range(i):
+            pij = self._P[i, j]
+            if pij == 0.0:
+                continue
+            self._Y[i].axpy(pij, self._Y[j])
+            self._Y[i].axpy(pij * h / self._r, self._L[j])
+```
+
+Then rewrite the loop body of `step`:
+
+```python
+        for i in range(s):
+            self._shu_osher_predictor(x, h, i)
+            if self._limiter is not None:
+                self._limiter(self._Y[i])
+            self._build_offset(tab, x, h, i)
+            if tab.At[i, i] > 0.0:
+                self._solve_stage(ts, tab, h, i)
+            ts.computeRHSFunction(t + tab.c[i] * h, self._Y[i], self._rhs)
+            self._rhs.copy(self._L[i])
+```
+
+Note what changed: the predictor now supplies `Y_i` for every stage, the limiter fires **before** anything consumes it, and the purely-explicit branch no longer overwrites `Y_i` from `Z_i` — the Shu–Osher value stands. `_build_offset` is still needed because `_solve_stage` requires `Z_i`.
+
 Also change `_complete` to use the Shu–Osher completion row, which is what makes the accepted step bounded:
 
 ```python

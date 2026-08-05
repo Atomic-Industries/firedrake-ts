@@ -210,8 +210,18 @@ identity rows on the frozen components (the Dirichlet-BC mechanism), which prese
 monolithic Jacobian *shape* so the caller's fieldsplit over the remaining block still
 applies unchanged. A reduced-IS solve is the obvious later optimisation; correctness first.
 
-**Completion.** `x^{n+1}` uses the same convex-combination row of `[P | q]`, so it is bounded
-by the same induction as the stages. **No post-step clamp** — see the §3 certificate.
+**Completion.** `x^{n+1} = Y_s` under stiff accuracy (R3), and it is bounded because `Y_s`'s
+limited components were themselves produced by convex-combination row `s` of `[P | q]` — via
+the stage, not via a separate completion formula. **No post-step clamp** — see the §3
+certificate.
+
+The distinction matters and was measured. `(P, q)` is derived from the **explicit** tableau
+`(A, b)` alone, so *evaluating* the completion row as a formula drops the implicit
+contribution `h·Σ b̃_j·Ẏ_j`. On a scalar split Dahlquist problem with `λ_im = −3`, one step of
+`esdirk_gamma5`: the Butcher completion and `Y_s` agree to `1.1e-16`, while the Shu–Osher
+completion row gives `0.7502195325` against the correct `0.6702333694` — an 8% error, raising
+nothing. The completion row applies directly only when `Ã ≡ 0`; a tableau that is neither
+stiffly accurate nor purely explicit is refused (§8).
 
 This sets aside `rk-method-spec.md` R8 ("a post-step clamp is required regardless of tableau")
 and open item §6.6, on two independent grounds: the certificate above, and the tableau design
@@ -230,6 +240,9 @@ Four loud failures in place of four silent unsoundnesses:
   makes it an error rather than a plausible-looking wrong answer.
 - SNES divergence ⇒ reject the step to the adapt loop; `TS_DIVERGED_STEP_REJECTED` once
   retries are exhausted.
+- a tableau that is neither stiffly accurate nor purely explicit ⇒ raise. Its completion
+  needs the implicit weights `b̃`, which the Shu–Osher form cannot express, so proceeding
+  would silently drop the implicit contribution (§7).
 
 ctypes calls reuse the existing `ierr`-checking pattern and assert `TSAdaptChoose`'s
 `accept` output.
