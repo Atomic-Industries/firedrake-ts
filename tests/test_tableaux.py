@@ -266,3 +266,32 @@ def test_arktableau_uses_identity_equality():
     tab2 = dataclasses.replace(tab, b=np.array([2.0, -1.0]))
     assert tab != tab2  # Should not raise, should be False
     assert not (tab == tab2)  # Should not raise
+
+
+@pytest.mark.parametrize(
+    "name,null_direction",
+    [
+        ("esdirk_gamma5", [1.0, -1.5, 2.25, 0.0]),
+        ("ssp2_444_lsa", [1.0, -2.0, 3.0, 0.0]),
+    ],
+)
+def test_dense_output_coefficients_are_stiff_safe(name, null_direction):
+    """d must satisfy sum(d) = 1, d.c = 0 and d.g = 0, with At.g = 0.
+
+    The third constraint is what keeps dense output bounded on stiff modes.
+    A naive d = (1, 0, 0, 0) has d.g != 0 and makes X(theta) diverge like
+    z*theta*(theta - 1) as z -> -infinity. bt.g = 0 is the corresponding
+    L-stability condition on the implicit completion weights.
+
+    Nothing else in the suite reads d, so without this test a mistyped
+    coefficient would go undetected until dense output is implemented.
+    """
+    tab = TABLEAUX[name]
+    g = np.array(null_direction)
+    # Confirm g really is a right null vector of At, so the constraints below
+    # are checks on the tableau rather than assertions against magic numbers.
+    np.testing.assert_allclose(tab.At @ g, np.zeros_like(g), atol=1e-14)
+    assert tab.d.sum() == pytest.approx(1.0, abs=1e-14)
+    assert tab.d @ tab.c == pytest.approx(0.0, abs=1e-14)
+    assert tab.d @ g == pytest.approx(0.0, abs=1e-14)
+    assert tab.bt @ g == pytest.approx(0.0, abs=1e-14)
