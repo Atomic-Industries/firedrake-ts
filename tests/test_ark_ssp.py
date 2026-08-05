@@ -223,3 +223,135 @@ def test_complete_refuses_when_neither_stiffly_accurate_nor_explicit():
     stepper = ARKSSP()
     with pytest.raises(ValueError, match="bogus_non_sa"):
         stepper._complete(bogus, None, None)
+
+
+ARK_SSP = {"ts_type": "python", "ts_python_type": PYTHON_STEPPER}
+
+
+def test_frozen_component_survives_the_implicit_solve():
+    """A limiter's change to an explicitly-governed row must not be undone.
+
+    This is the defect COOL-193 measured: the implicit stage equation
+    Ydot_i = (Y_i - Z_i)/(h At_ii) has no slot for a modified value, so the
+    solve pulls Y_i back to Z_i and the correction re-enters later stages
+    scaled by At_ji/At_ii.
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    W = V * V
+    w = Function(W)
+    wdot = Function(W)
+    a, b = split(w)
+    adot, bdot = split(wdot)
+    va, vb = TestFunctions(W)
+    w.sub(0).assign(1.0)
+    w.sub(1).assign(1.0)
+
+    # Row 0: mass only -> explicitly governed, freezable.
+    # Row 1: mass + diffusion -> implicit acts, not freezable.
+    F = inner(adot, va) * dx + inner(bdot, vb) * dx + inner(grad(b), grad(vb)) * dx
+    G = -inner(a, va) * dx - inner(b, vb) * dx
+
+    # Dedicated scratch: w is also ctx._x, which the TS callbacks write into.
+    scratch = Function(W)
+    CLAMP = 0.5
+    drift = []
+
+    def clamping_limiter(vec):
+        """Force the explicitly-governed row to exactly CLAMP."""
+        with scratch.dat.vec_wo as target:
+            vec.copy(target)
+        scratch.sub(0).assign(CLAMP)
+        with scratch.dat.vec_ro as source:
+            source.copy(vec)
+
+    problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, 0.02), G=G)
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters=dict(
+            ARK_SSP,
+            ts_ark_ssp_type="esdirk_gamma5",
+            ts_adapt_type="none",
+            ts_time_step=0.01,
+            ts_exact_final_time="stepover",
+        ),
+        options_prefix="",
+    )
+    ctx = solver.ts.getPythonContext()
+    ctx.set_stage_limiter(clamping_limiter)
+
+    # Wrap _solve_stage so we can compare Y_i across the implicit solve. This
+    # is diagnostic item 3 of the M4 gate, made into a test.
+    original = ctx._solve_stage
+
+    def checking_solve_stage(ts, tab, h, i):
+        before = ctx._Y[i].getArray(readonly=True).copy()
+        original(ts, tab, h, i)
+        after = ctx._Y[i].getArray(readonly=True)
+        rows = ctx._frozen_rows
+        lo, _ = ctx._Y[i].getOwnershipRange()
+        local = rows - lo
+        drift.append(float(np.abs(after[local] - before[local]).max()))
+
+    ctx._solve_stage = checking_solve_stage
+    solver.solve()
+
+    assert ctx._frozen_rows is not None, "row 0 was never detected as freezable"
+    assert len(ctx._frozen_rows) > 0
+    assert drift, "no implicit stage solve ran, so the freeze was never exercised"
+    # THE assertion: the limited value must survive the solve bit-for-bit.
+    assert max(drift) == 0.0, (
+        f"frozen rows moved by up to {max(drift):.3e} during the implicit "
+        "solve -- the solve is dragging the limited value back toward the "
+        "unlimited Z_i, which is the defect COOL-193 describes"
+    )
+
+
+def test_nothing_is_frozen_when_every_row_has_an_implicit_operator():
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    F = inner(u_t, v) * dx + inner(grad(u), grad(v)) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 0.02), G=-inner(u, v) * dx)
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters=dict(
+            ARK_SSP,
+            ts_ark_ssp_type="esdirk_gamma5",
+            ts_adapt_type="none",
+            ts_time_step=0.01,
+            ts_exact_final_time="stepover",
+        ),
+        options_prefix="",
+    )
+    solver.solve()
+    assert not solver.ts.getPythonContext()._frozen_rows
+
+
+def test_limiter_on_an_implicit_component_is_rejected():
+    """Limiting a component with an implicit operator is unsound; say so."""
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    F = inner(u_t, v) * dx + inner(grad(u), grad(v)) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 0.02), G=-inner(u, v) * dx)
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters=dict(
+            ARK_SSP,
+            ts_ark_ssp_type="esdirk_gamma5",
+            ts_adapt_type="none",
+            ts_time_step=0.01,
+            ts_exact_final_time="stepover",
+        ),
+        options_prefix="",
+    )
+    solver.ts.getPythonContext().set_stage_limiter(lambda vec: None)
+    with pytest.raises(ValueError, match="implicit operator"):
+        solver.solve()

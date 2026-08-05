@@ -286,3 +286,102 @@ def test_two_algebraic_fields_drive_the_concatenated_zero_rows():
     assert float(w.sub(0).dat.data_ro[0]) == pytest.approx(exact_y, abs=1e-3)
     assert float(w.sub(1).dat.data_ro[0]) == pytest.approx(exact_y, abs=1e-3)
     assert float(w.sub(2).dat.data_ro[0]) == pytest.approx(-exact_y, abs=1e-3)
+
+
+ARK_SSP_G5 = {
+    "ts_type": "python",
+    "ts_python_type": "firedrake_ts.ark_ssp.ARKSSP",
+    "ts_ark_ssp_type": "esdirk_gamma5",
+}
+
+
+@pytest.mark.parametrize("stepper", [ARKIMEX, ARK_SSP_G5], ids=["arkimex", "arkssp"])
+def test_rung1_dual_path(stepper):
+    """Index 1, singular mass, exact solution. Both steppers must agree."""
+    y, z = _rung1(stepper)
+    assert y == pytest.approx(np.exp(-1.0), abs=1e-3)
+    assert z == pytest.approx(-np.exp(-1.0), abs=1e-3)
+
+
+def _rung2(stepper, dt=1e-3, tmax=1.0):
+    """Index 2, the multiplier case: ydot = z - y, 0 = y - g(t), G = -y.
+
+    g(t) = exp(-t), so z = gdot + g = 0 exactly and y = exp(-t). Returns
+    (y, z, constraint_defect). The defect is what R3 stiff accuracy buys:
+    near 1e-16 with b == A[s-1,:], near 1e-3 without.
+    """
+    mesh = UnitIntervalMesh(1)
+    R = FunctionSpace(mesh, "DG", 0)  # NOT "R": see the note below
+    W = R * R
+    w = Function(W)
+    wdot = Function(W)
+    y, z = split(w)
+    ydot, _zdot = split(wdot)
+    vy, vz = TestFunctions(W)
+    time = Constant(0.0)
+    w.sub(0).assign(1.0)
+    w.sub(1).assign(0.0)
+
+    F = inner(ydot - z, vy) * dx + inner(y - exp(-time), vz) * dx
+    G = -inner(y, vy) * dx
+
+    problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, tmax), time=time, G=G)
+    parameters = dict(RUNG_PARAMS, ts_time_step=dt, **stepper)
+    firedrake_ts.DAESolver(
+        problem, solver_parameters=parameters, options_prefix=""
+    ).solve()
+    y_val = float(w.sub(0).dat.data_ro[0])
+    return y_val, float(w.sub(1).dat.data_ro[0]), abs(y_val - np.exp(-tmax))
+
+
+@pytest.mark.parametrize("stepper", [ARKIMEX, ARK_SSP_G5], ids=["arkimex", "arkssp"])
+def test_rung2_constraint_defect_is_at_machine_precision(stepper):
+    """Stiff accuracy makes the completion the last stage, so y satisfies
+    the constraint exactly rather than to O(h^p)."""
+    _, _, defect = _rung2(stepper, dt=1e-2)
+    assert defect < 1e-10, f"constraint defect {defect:.3e}, expected ~1e-16"
+
+
+def _rung3(stepper, dt=2e-3, tmax=0.1, n=8):
+    """PDE scale: heat equation on V x R with a mean-value multiplier.
+
+    u_t = laplacian(u) + lambda, with int u dx pinned. Real mixed space, real
+    singular mass, index 2, fieldsplit-able -- and no momentum balance.
+    """
+    mesh = UnitIntervalMesh(n)
+    V = FunctionSpace(mesh, "P", 1)
+    # A mean-value multiplier would need an "R"-space (here "DG", 0) block,
+    # but a mixed space containing R cannot be assembled monolithically at
+    # all -- see the note above. lam is field-valued instead, in V * V.
+    W = V * V
+    w = Function(W)
+    wdot = Function(W)
+    u, lam = split(w)
+    udot, _lamdot = split(wdot)
+    vu, vlam = TestFunctions(W)
+    (x,) = SpatialCoordinate(mesh)
+    w.sub(0).interpolate(1.0 + 0.5 * sin(2 * pi * x))
+
+    target = Function(V).interpolate(1.0 + 0.5 * sin(2 * pi * x))
+    F = (
+        inner(udot, vu) * dx
+        + inner(grad(u), grad(vu)) * dx
+        - inner(lam, vu) * dx
+        + inner(u - target, vlam) * dx
+    )
+    G = -0.1 * inner(u, vu) * dx  # an explicit reaction term
+
+    problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, tmax), G=G)
+    parameters = dict(RUNG_PARAMS, ts_time_step=dt, **stepper)
+    firedrake_ts.DAESolver(
+        problem, solver_parameters=parameters, options_prefix=""
+    ).solve()
+    return w
+
+
+@pytest.mark.parametrize("stepper", [ARKIMEX, ARK_SSP_G5], ids=["arkimex", "arkssp"])
+def test_rung3_pde_with_multiplier_runs(stepper):
+    w = _rung3(stepper)
+    assert np.all(np.isfinite(w.sub(0).dat.data_ro))
+    assert np.all(np.isfinite(w.sub(1).dat.data_ro))
+    assert norm(w.sub(0)) > 0.0

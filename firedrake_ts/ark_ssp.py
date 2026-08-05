@@ -17,9 +17,11 @@ populates those counters, and petsc4py binds no setter for them. As a result
 """
 
 import numpy as np
+from firedrake import dmhooks
 from firedrake.exceptions import ConvergenceError
 from firedrake.petsc import PETSc
 
+from firedrake_ts.solving_utils import explicitly_governed_fields, resolve_fields
 from firedrake_ts.tableaux import TABLEAUX, kraaijevanger_radius, shu_osher
 
 __all__ = ["ARKSSP"]
@@ -43,6 +45,7 @@ class ARKSSP:
         # entirely.
         self._error = None
         self._limiter = None
+        self._frozen_rows = None
         self._tab = None
         self._P = None
         self._q = None
@@ -96,6 +99,28 @@ class ARKSSP:
             self._Ydot = [sol.duplicate() for _ in range(s)]
             self._Z = sol.duplicate()
             self._rhs = sol.duplicate()
+
+            self._frozen_rows = self._find_frozen_rows(ts)
+            # The soundness hazard only exists where an implicit stage
+            # actually runs (tab.At[i, i] > 0.0, matching step()'s own
+            # guard on _solve_stage): a purely-explicit tableau such as
+            # ssprk2 never solves a stage, so there is nothing for the
+            # limiter's change to be undone by, regardless of whether any
+            # component was found freezable.
+            has_implicit_stage = np.any(np.diagonal(tab.At) > 0.0)
+            if (
+                self._limiter is not None
+                and self._frozen_rows is None
+                and has_implicit_stage
+            ):
+                raise ValueError(
+                    "a stage limiter is registered, but no component of this "
+                    "problem is free of an implicit operator: every row of "
+                    "dF/du is structurally nonzero. Limiting a component "
+                    "that has an implicit operator is not sound -- the "
+                    "stage solve would undo the correction. Move the "
+                    "operator into G, or drop the limiter."
+                )
         except Exception as exc:
             self._error = exc
             raise
@@ -115,6 +140,42 @@ class ARKSSP:
     def set_stage_limiter(self, limiter):
         """Register a callable fired on each explicit substage value."""
         self._limiter = limiter
+
+    def _find_frozen_rows(self, ts):
+        """Global row indices of components with no implicit operator.
+
+        Those rows' stage equation reduces to Y_i = Z_i, so their value comes
+        entirely from the explicit Shu-Osher recursion. Pinning them during
+        the implicit solve is what stops the solve from undoing the limiter.
+        """
+        ctx = dmhooks.get_appctx(ts.getDM())
+        problem = ctx._problem
+        V = problem.u_restrict.function_space()
+        if len(V) <= 1:
+            return None
+        detected = explicitly_governed_fields(
+            problem.F, problem.u_restrict, ctx._xdot, len(V)
+        )
+        fields = resolve_fields(
+            "ts_explicitly_governed_fields", ts.getOptionsPrefix(), detected
+        )
+        if not fields:
+            return None
+        ises = problem.J.arguments()[0].function_space()._ises
+        rows = np.concatenate([ises[i].getIndices() for i in fields])
+        return rows.astype(PETSc.IntType)
+
+    def _apply_freeze_residual(self, x, f):
+        """Replace frozen rows of the residual with ``x - Y_i``."""
+        if self._frozen_rows is None:
+            return
+        target = self._Y[self._stage]
+        xa = x.getArray(readonly=True)
+        ya = target.getArray(readonly=True)
+        fa = f.getArray()
+        lo, _ = x.getOwnershipRange()
+        local = self._frozen_rows - lo
+        fa[local] = xa[local] - ya[local]
 
     # -- the step -------------------------------------------------------------
 
@@ -179,6 +240,22 @@ class ARKSSP:
         self._shift = 1.0 / (h * tab.At[i, i])
         self._stage_time = ts.getTime() + tab.ct[i] * h
         snes = ts.getSNES()
+        # _apply_freeze_residual reads self._Y[self._stage] itself as the
+        # frozen target -- it is the same vector SNES iterates on, so the
+        # residual it builds is self-referentially zero on those rows.
+        # That only pins the *right* value if the vector already holds it
+        # before the solve starts: with a zero residual and an identity
+        # Jacobian row, Newton's own step contributes exactly zero there
+        # every iteration, so whatever the frozen rows hold going in is
+        # what comes out. Snapshot them before the warm-start overwrite
+        # below replaces the whole vector with the previous stage's value
+        # (or x^n), which would otherwise silently discard the predictor's
+        # -- and any limiter's -- value on exactly the rows the freeze
+        # exists to protect.
+        if self._frozen_rows is not None:
+            lo, _ = self._Y[i].getOwnershipRange()
+            local = self._frozen_rows - lo
+            frozen_values = self._Y[i].getArray(readonly=True)[local].copy()
         # Initial guess: the previous stage value, or x^n for the first
         # implicit stage -- matching PETSc's own ARKIMEX. Guessing Z_i itself
         # would make Ydot_i identically zero already for any tableau whose
@@ -189,6 +266,8 @@ class ARKSSP:
             self._Y[i - 1].copy(self._Y[i])
         else:
             ts.getSolution().copy(self._Y[i])
+        if self._frozen_rows is not None:
+            self._Y[i].getArray()[local] = frozen_values
         snes.solve(None, self._Y[i])
         reason = snes.getConvergedReason()
         if reason < 0:
@@ -253,15 +332,20 @@ class ARKSSP:
         ``formSNESJacobian(*args)``.
         """
         _snes, x, f, ts = args
-        xdot = self._Z.duplicate()
+        xdot = self._rhs
         x.copy(xdot)
         xdot.axpy(-1.0, self._Z)
         xdot.scale(self._shift)
         ts.computeIFunction(self._stage_time, x, xdot, f, True)
+        self._apply_freeze_residual(x, f)
 
     def formSNESJacobian(self, snes, x, A, B, ts):
-        xdot = self._Z.duplicate()
+        xdot = self._rhs
         x.copy(xdot)
         xdot.axpy(-1.0, self._Z)
         xdot.scale(self._shift)
         ts.computeIJacobian(self._stage_time, x, xdot, self._shift, A, B, True)
+        if self._frozen_rows is not None:
+            A.zeroRows(self._frozen_rows, diag=1.0)
+            if B is not None and B.handle != A.handle:
+                B.zeroRows(self._frozen_rows, diag=1.0)
