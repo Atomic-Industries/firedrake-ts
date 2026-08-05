@@ -2,6 +2,7 @@ from functools import cached_property
 from itertools import chain
 
 import numpy
+import ufl
 from firedrake import cofunction, dmhooks, function
 from firedrake.assemble import get_assembler
 from firedrake.exceptions import ConvergenceError
@@ -10,8 +11,97 @@ from firedrake.petsc import DEFAULT_KSP_PARAMETERS, PETSc
 from firedrake.solving_utils import _make_reasons, _SNESContext
 from petsctools import OptionsManager
 from pyop2 import op2
+from ufl.algorithms import expand_derivatives
 
 TSReasons = _make_reasons(PETSc.TS.ConvergedReason())
+
+
+def is_zero_form(form):
+    """Is ``form`` structurally zero?
+
+    ``derivative()`` applied to a form with no dependence on the coefficient
+    returns a ``Form`` carrying one symbolically-zero integral, so ``empty()``
+    is False until ``expand_derivatives`` has folded it away. Skipping the
+    expansion makes every predicate below report "non-zero" for everything.
+
+    Structural, not numerical: a coefficient that happens to vanish at t = 0
+    must not be mistaken for an absent operator.
+    """
+    if form is None or isinstance(form, ufl.ZeroBaseForm):
+        return True
+    expanded = expand_derivatives(form)
+    if isinstance(expanded, ufl.ZeroBaseForm):
+        return True
+    return bool(expanded.empty())
+
+
+def nonzero_rows(form, nfields):
+    """Which test-function components of ``form`` carry any integral."""
+    splitter = ExtractSubBlock()
+    return tuple(
+        i
+        for i in range(nfields)
+        if not is_zero_form(splitter.split(form, argument_indices=(i,)))
+    )
+
+
+def _classify_rows(F, u, udot, nfields):
+    """Per row: (has time derivative, has implicit operator)."""
+    from firedrake import ufl_expr
+
+    splitter = ExtractSubBlock()
+    classified = {}
+    for i in range(nfields):
+        row = splitter.split(F, argument_indices=(i,))
+        if is_zero_form(row):
+            continue
+        classified[i] = (
+            not is_zero_form(ufl_expr.derivative(row, udot)),
+            not is_zero_form(ufl_expr.derivative(row, u)),
+        )
+    return classified
+
+
+def differential_fields(F, u, udot, nfields):
+    """Components whose residual row contains a time derivative."""
+    rows = _classify_rows(F, u, udot, nfields)
+    return tuple(i for i, (has_dot, _) in rows.items() if has_dot)
+
+
+def algebraic_fields(F, u, udot, nfields):
+    """Components whose residual row has no time derivative.
+
+    The mass matrix ``dF/du_t`` is structurally zero on these rows, so the
+    right-hand-side projection is undefined there. ``G`` must vanish on them.
+    """
+    rows = _classify_rows(F, u, udot, nfields)
+    return tuple(i for i, (has_dot, _) in rows.items() if not has_dot)
+
+
+def explicitly_governed_fields(F, u, udot, nfields):
+    """Components with no implicit operator acting on them.
+
+    ``dF/du`` is structurally zero on these rows, so the implicit stage
+    equation reduces to ``Y_i = Z_i``: the stage value is fully determined by
+    the explicit recursion and can be limited soundly. This is exactly the
+    condition under which a limiter preserves monotonicity.
+    """
+    rows = _classify_rows(F, u, udot, nfields)
+    return tuple(i for i, (_, has_implicit) in rows.items() if not has_implicit)
+
+
+def resolve_fields(option, prefix, detected):
+    """``detected``, unless the options database overrides it.
+
+    Structural default plus runtime override, following PETSc's own idiom --
+    ``-pc_fieldsplit_detect_saddle_point`` detects the algebraic block from
+    zero diagonals but does not force the choice. Set e.g.
+    ``-ts_algebraic_fields 1,3`` to declare the partition instead.
+    """
+    value = PETSc.Options(prefix or "").getString(option, "")
+    if not value:
+        return tuple(detected)
+    return tuple(int(part) for part in value.replace(" ", "").split(",") if part)
 
 
 def check_ts_convergence(ts):
