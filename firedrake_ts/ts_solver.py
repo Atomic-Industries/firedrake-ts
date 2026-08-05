@@ -365,6 +365,14 @@ class DAESolver(OptionsManager):
            If bounds are provided the ``snes_type`` must be set to
            ``vinewtonssls`` or ``vinewtonrsls``.
         """
+        # Checked eagerly, in plain Python, rather than left to fire the
+        # first time the RHS callback runs: a Python exception raised
+        # inside a TS callback reaches ``self.ts.solve()`` as a generic
+        # ``PETSc.Error`` (see the recovery comment below), not as itself,
+        # for any TS type but the ``TSPYTHON`` stepper that stashes its own.
+        # ``arkimex`` is a builtin type, so that recovery does not apply,
+        # and this check needs to raise before the callback boundary.
+        self._ctx._check_G_vanishes_on_algebraic_rows()
 
         self._set_problem_eval_funcs(
             self._ctx,

@@ -571,15 +571,62 @@ class _TSContext(_SNESContext):
         return function.Function(self.G.arguments()[0].function_space())
 
     @cached_property
+    def _nfields(self):
+        V = self._problem.u_restrict.function_space()
+        return len(V) if len(V) > 1 else 1
+
+    @cached_property
+    def _algebraic_fields(self):
+        """Components with no time derivative, so no invertible mass block."""
+        if self._nfields == 1:
+            return ()
+        detected = algebraic_fields(
+            self._problem.F,
+            self._problem.u_restrict,
+            self._xdot,
+            self._nfields,
+        )
+        return resolve_fields("ts_algebraic_fields", self.options_prefix, detected)
+
+    def _check_G_vanishes_on_algebraic_rows(self):
+        if self.G is None or not self._algebraic_fields:
+            return
+        offending = set(nonzero_rows(self.G, self._nfields)) & set(
+            self._algebraic_fields
+        )
+        if offending:
+            raise ValueError(
+                f"G is nonzero on algebraic component(s) {sorted(offending)}, "
+                f"whose rows of dF/du_t are structurally zero. The mass "
+                f"projection M^-1 G is undefined there. Move those terms into "
+                f"the implicit residual F, or give those components a time "
+                f"derivative."
+            )
+
+    @cached_property
     def _rhs_projection_mass_matrix(self):
         r"""The mass matrix ``dF/du_t``, assembled once.
+
+        On algebraic components this block is structurally zero, so a plain
+        solve would hit a zero pivot. Those rows are given a unit diagonal
+        instead: ``G`` is guaranteed zero there (checked separately), so the
+        projected result is zero on them either way, and the operator becomes
+        invertible.
 
         Held on the context so it outlives the ``KSP`` that takes it as an
         operator.
         """
         from firedrake import assemble, ufl_expr
 
-        return assemble(ufl_expr.derivative(self.F, self._xdot), bcs=self.bcs_F)
+        self._check_G_vanishes_on_algebraic_rows()
+        mass = assemble(ufl_expr.derivative(self.F, self._xdot), bcs=self.bcs_F)
+        if self._algebraic_fields:
+            ises = self._problem.J.arguments()[0].function_space()._ises
+            rows = numpy.concatenate(
+                [ises[i].getIndices() for i in self._algebraic_fields]
+            )
+            mass.petscmat.zeroRows(rows.astype(PETSc.IntType), diag=1.0)
+        return mass
 
     @cached_property
     def _rhs_projection_options(self):

@@ -1,8 +1,10 @@
 """Structural predicates and singular-mass support."""
 
+import numpy as np
 import pytest
 from firedrake import *
 
+import firedrake_ts
 from firedrake_ts.solving_utils import (
     algebraic_fields,
     explicitly_governed_fields,
@@ -145,3 +147,89 @@ def test_is_zero_form_needs_expanded_derivatives():
     mass = inner(udot, v) * dx
     assert is_zero_form(ufl_expr.derivative(mass, u))
     assert not is_zero_form(ufl_expr.derivative(mass, udot))
+
+
+RUNG_PARAMS = {
+    "ts_adapt_type": "none",
+    "ts_exact_final_time": "stepover",
+}
+
+
+def _rung1(stepper, dt=1e-3, tmax=1.0):
+    """Index 1, one-cell DG0: ydot = z, 0 = z + y, z explicit. Exact y = e^-t.
+
+    M = diag(1, 0) is genuinely singular and G vanishes on the algebraic row.
+    No spatial discretisation error, so observed order is the tableau's alone.
+    """
+    mesh = UnitIntervalMesh(1)
+    R = FunctionSpace(mesh, "DG", 0)  # NOT "R": see the note in the brief
+    W = R * R
+    w = Function(W)
+    wdot = Function(W)
+    y, z = split(w)
+    ydot, _zdot = split(wdot)
+    vy, vz = TestFunctions(W)
+    w.sub(0).assign(1.0)
+    w.sub(1).assign(-1.0)
+
+    F = inner(ydot, vy) * dx + inner(z + y, vz) * dx
+    G = inner(z, vy) * dx
+
+    problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, tmax), G=G)
+    parameters = dict(RUNG_PARAMS, ts_time_step=dt, **stepper)
+    firedrake_ts.DAESolver(
+        problem, solver_parameters=parameters, options_prefix=""
+    ).solve()
+    return float(w.sub(0).dat.data_ro[0]), float(w.sub(1).dat.data_ro[0])
+
+
+ARKIMEX = {"ts_type": "arkimex", "ts_arkimex_type": "2c"}
+
+
+def test_rung1_singular_mass_runs_under_arkimex():
+    """A singular mass matrix must not break the RHS projection."""
+    y, z = _rung1(ARKIMEX)
+    assert y == pytest.approx(np.exp(-1.0), abs=1e-3)
+    assert z == pytest.approx(-np.exp(-1.0), abs=1e-3)
+
+
+def test_G_nonzero_on_an_algebraic_row_is_rejected():
+    """The projection is undefined there; fail loudly, not silently."""
+    mesh = UnitIntervalMesh(1)
+    R = FunctionSpace(mesh, "DG", 0)  # NOT "R": see the note in the brief
+    W = R * R
+    w = Function(W)
+    wdot = Function(W)
+    y, z = split(w)
+    ydot, _zdot = split(wdot)
+    vy, vz = TestFunctions(W)
+    F = inner(ydot, vy) * dx + inner(z + y, vz) * dx
+    G = inner(y, vz) * dx  # nonzero on the ALGEBRAIC row
+
+    problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, 0.1), G=G)
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters=dict(RUNG_PARAMS, ts_time_step=0.05, **ARKIMEX),
+        options_prefix="",
+    )
+    with pytest.raises(ValueError, match="algebraic"):
+        solver.solve()
+
+
+def test_nonsingular_projection_is_unchanged():
+    """The existing non-mixed path must be byte-identical."""
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    problem = firedrake_ts.DAEProblem(
+        inner(u_t, v) * dx, u, u_t, (0.0, 1.0), G=-inner(u, v) * dx
+    )
+    firedrake_ts.DAESolver(
+        problem,
+        solver_parameters=dict(RUNG_PARAMS, ts_time_step=1e-3, **ARKIMEX),
+        options_prefix="",
+    ).solve()
+    assert float(u.dat.data_ro[0]) == pytest.approx(np.exp(-1.0), abs=1e-4)
