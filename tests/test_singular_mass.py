@@ -233,3 +233,56 @@ def test_nonsingular_projection_is_unchanged():
         options_prefix="",
     ).solve()
     assert float(u.dat.data_ro[0]) == pytest.approx(np.exp(-1.0), abs=1e-4)
+
+
+def test_project_rhs_false_is_rejected_when_G_is_supplied():
+    """An unprojected G is a raw dual vector, wrong by a factor of the mass
+    matrix once a TS treats it as a state-space derivative -- no supported
+    TS type wants that, so it is rejected outright rather than left as a
+    live (and silently wrong) option.
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    problem = firedrake_ts.DAEProblem(
+        inner(u_t, v) * dx, u, u_t, (0.0, 1.0), G=-inner(u, v) * dx
+    )
+    with pytest.raises(ValueError, match="mass matrix"):
+        firedrake_ts.DAESolver(problem, project_rhs=False, options_prefix="")
+
+
+def test_two_algebraic_fields_drive_the_concatenated_zero_rows():
+    """Every case above has exactly one algebraic field, so
+    ``numpy.concatenate([ises[i].getIndices() for i in self._algebraic_fields])``
+    is never driven with more than one element. Here y' = -y is
+    differential; z1 = y and z2 = -y are algebraic constraints on two
+    separate rows, so the mass matrix is singular on TWO rows, and
+    ``zeroRows`` must be called with a genuinely concatenated index set.
+    """
+    mesh = UnitIntervalMesh(1)
+    R = FunctionSpace(mesh, "DG", 0)
+    W = R * R * R
+    w = Function(W)
+    wdot = Function(W)
+    y, z1, z2 = split(w)
+    ydot, _z1dot, _z2dot = split(wdot)
+    vy, vz1, vz2 = TestFunctions(W)
+    w.sub(0).assign(1.0)
+    w.sub(1).assign(1.0)
+    w.sub(2).assign(-1.0)
+
+    F = inner(ydot, vy) * dx + inner(z1 - y, vz1) * dx + inner(z2 + y, vz2) * dx
+    G = inner(-y, vy) * dx
+
+    problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, 1.0), G=G)
+    parameters = dict(RUNG_PARAMS, ts_time_step=1e-3, **ARKIMEX)
+    firedrake_ts.DAESolver(
+        problem, solver_parameters=parameters, options_prefix=""
+    ).solve()
+
+    exact_y = np.exp(-1.0)
+    assert float(w.sub(0).dat.data_ro[0]) == pytest.approx(exact_y, abs=1e-3)
+    assert float(w.sub(1).dat.data_ro[0]) == pytest.approx(exact_y, abs=1e-3)
+    assert float(w.sub(2).dat.data_ro[0]) == pytest.approx(-exact_y, abs=1e-3)

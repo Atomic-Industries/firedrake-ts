@@ -187,7 +187,11 @@ class DAESolver(OptionsManager):
                be used at every timestep to display the iteration's progress.
         :kwarg project_rhs: If True (the default) the right-hand-side term
                ``G`` is projected through a mass matrix solve. Only meaningful
-               when the problem supplies a ``G``.
+               when the problem supplies a ``G``; not supported as False in
+               that case, since an unprojected ``G`` is a raw dual vector
+               while a TS's ``RHSFunction`` is a state-space derivative, so
+               the result would be silently wrong by a factor of the mass
+               matrix.
         :kwarg rhs_projection_parameters: Solver parameters for that mass
                matrix solve, as a dict mapping PETSc options to values.
                Defaults to a direct solve. These may equivalently be set from

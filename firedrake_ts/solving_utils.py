@@ -163,7 +163,11 @@ class _TSContext(_SNESContext):
         after residual assembly
     :arg options_prefix: The options prefix of the TS.
     :arg project_rhs: If True the right-hand-side term is projected using a
-        mass matrix solver.
+        mass matrix solver. Not supported as False when ``G`` is supplied:
+        an unprojected ``G`` is a raw dual vector, but a TS treats
+        ``RHSFunction`` as a state-space derivative, so the result would be
+        silently wrong by a factor of the mass matrix. Meaningful only
+        (and inert) when ``G`` is ``None``.
     :arg rhs_projection_parameters: Solver parameters of the right-hand-side
         projection solver.
     :arg transfer_manager: Object that can transfer functions between
@@ -220,6 +224,14 @@ class _TSContext(_SNESContext):
         self.bcs_dGdu = tuple(bc.extract_form("J") for bc in problem.bcs)
 
         if self.G is not None:
+            if not project_rhs:
+                raise ValueError(
+                    "project_rhs=False hands PETSc the raw dual G, but a TS "
+                    "treats RHSFunction as a state-space derivative, so the "
+                    "result is wrong by a factor of the mass matrix (measured "
+                    "u(1) = 0.884765 against 0.367879 exact on u' = -u). No "
+                    "supported TS type wants an unprojected G."
+                )
             self._assemble_rhs_residual = get_assembler(
                 self.G,
                 bcs=self.bcs_G,
@@ -621,6 +633,10 @@ class _TSContext(_SNESContext):
         self._check_G_vanishes_on_algebraic_rows()
         mass = assemble(ufl_expr.derivative(self.F, self._xdot), bcs=self.bcs_F)
         if self._algebraic_fields:
+            # Taken from J's test space, matching form_rhs_jacobian's
+            # existing idiom, not from F directly: correct because J is
+            # derived from F when not user-supplied, but this assumes a
+            # user-supplied J shares F's test-function space.
             ises = self._problem.J.arguments()[0].function_space()._ises
             rows = numpy.concatenate(
                 [ises[i].getIndices() for i in self._algebraic_fields]
