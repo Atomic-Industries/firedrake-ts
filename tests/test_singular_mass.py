@@ -1,5 +1,6 @@
 """Structural predicates and singular-mass support."""
 
+import pytest
 from firedrake import *
 
 from firedrake_ts.solving_utils import (
@@ -85,6 +86,28 @@ def test_nonzero_rows_locates_G():
     _F, _w, _wdot, (f, _p, T), (vf, vp, _vT) = _three_field()
     assert nonzero_rows(inner(f, vf) * dx, 3) == (0,)
     assert nonzero_rows(inner(T, vp) * dx, 3) == (1,)
+
+
+def test_absent_residual_row_raises():
+    """A component with no equation at all is an error, not an algebraic row.
+
+    If this were silently folded into ``algebraic_fields`` it would be
+    indistinguishable downstream from a genuine algebraic row -- including
+    to code that gives algebraic rows a unit diagonal to make a projection
+    invertible. That repair does not apply to a row that plain does not
+    exist, and the failure would resurface later, further from the cause,
+    as a zero pivot with no clue why.
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    W = V * V
+    w = Function(W)
+    wdot = Function(W)
+    adot, _bdot = split(wdot)
+    va, _vb = TestFunctions(W)
+    F = inner(adot, va) * dx  # component 1's test function never appears
+    with pytest.raises(ValueError, match=r"\[1\]"):
+        algebraic_fields(F, w, wdot, 2)
 
 
 def test_resolve_fields_prefers_an_explicit_override():

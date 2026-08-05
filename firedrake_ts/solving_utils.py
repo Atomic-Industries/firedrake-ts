@@ -3,7 +3,7 @@ from itertools import chain
 
 import numpy
 import ufl
-from firedrake import cofunction, dmhooks, function
+from firedrake import cofunction, dmhooks, function, ufl_expr
 from firedrake.assemble import get_assembler
 from firedrake.exceptions import ConvergenceError
 from firedrake.formmanipulation import ExtractSubBlock
@@ -46,20 +46,34 @@ def nonzero_rows(form, nfields):
 
 
 def _classify_rows(F, u, udot, nfields):
-    """Per row: (has time derivative, has implicit operator)."""
-    from firedrake import ufl_expr
+    """Per row: (has time derivative, has implicit operator).
 
+    A component whose test function never appears in ``F`` at all has no
+    equation of its own -- the DAE is underdetermined for that component --
+    so it is a hard error rather than a silent omission from every
+    predicate. Left silent, an absent row would look identical to an
+    algebraic row to every caller downstream, including code that gives
+    algebraic rows a unit diagonal to make a projection invertible: that
+    repair would not apply here, and the projection would hit a zero pivot
+    with no clue why.
+    """
     splitter = ExtractSubBlock()
-    classified = {}
-    for i in range(nfields):
-        row = splitter.split(F, argument_indices=(i,))
-        if is_zero_form(row):
-            continue
-        classified[i] = (
+    rows = {i: splitter.split(F, argument_indices=(i,)) for i in range(nfields)}
+    missing = [i for i, row in rows.items() if is_zero_form(row)]
+    if missing:
+        raise ValueError(
+            f"component(s) {missing} have no residual row: their test "
+            f"functions do not appear in F at all, so the problem is "
+            f"underdetermined. Every component of a mixed space being "
+            f"solved for needs an equation."
+        )
+    return {
+        i: (
             not is_zero_form(ufl_expr.derivative(row, udot)),
             not is_zero_form(ufl_expr.derivative(row, u)),
         )
-    return classified
+        for i, row in rows.items()
+    }
 
 
 def differential_fields(F, u, udot, nfields):
