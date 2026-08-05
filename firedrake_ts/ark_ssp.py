@@ -131,13 +131,12 @@ class ARKSSP:
             s = len(tab.b)
 
             for i in range(s):
+                self._shu_osher_predictor(x, h, i)
+                if self._limiter is not None:
+                    self._limiter(self._Y[i])
                 self._build_offset(tab, x, h, i)
                 if tab.At[i, i] > 0.0:
                     self._solve_stage(ts, tab, h, i)
-                else:
-                    # Purely explicit stage: the value IS the offset.
-                    self._Z.copy(self._Y[i])
-                    self._Ydot[i].set(0.0)
                 ts.computeRHSFunction(t + tab.c[i] * h, self._Y[i], self._rhs)
                 self._rhs.copy(self._L[i])
 
@@ -146,6 +145,24 @@ class ARKSSP:
         except Exception as exc:
             self._error = exc
             raise
+
+    def _shu_osher_predictor(self, x, h, i):
+        """Y_i = q_i x^n + sum_{j<i} P_ij (Y_j + (h/r) L_j).
+
+        Every row of ``[P | q]`` is a nonnegative partition of unity, so this
+        is a convex combination of forward-Euler steps taken from stage values
+        the limiter has already seen. That is the whole reason for the
+        stepper.
+        """
+        self._Y[i].set(0.0)
+        if self._q[i] != 0.0:
+            self._Y[i].axpy(self._q[i], x)
+        for j in range(i):
+            pij = self._P[i, j]
+            if pij == 0.0:
+                continue
+            self._Y[i].axpy(pij, self._Y[j])
+            self._Y[i].axpy(pij * h / self._r, self._L[j])
 
     def _build_offset(self, tab, x, h, i):
         """Z_i = x^n + h sum_{j<i} (At_ij Ydot_j + A_ij L_j)."""
@@ -186,20 +203,45 @@ class ARKSSP:
     def _complete(self, tab, x, h):
         """x^{n+1}.
 
-        Under stiff accuracy (b == A[s-1,:] and bt == At[s-1,:]) the completion
-        is exactly the last stage, so copying it is not a shortcut but the
-        definition. Fall back to the weighted sum otherwise.
+        Three cases, and the distinction is not cosmetic:
+
+        * Stiffly accurate (b == A[-1] and bt == At[-1]): the completion IS the
+          last stage value, which already carries the implicit contribution.
+          Boundedness still holds, because on the components a limiter acts on
+          Y[-1] was produced by convex-combination row s of [P | q] -- via the
+          stage, not via a separate completion formula.
+        * Purely explicit (At identically zero): no implicit contribution
+          exists to drop, so the Shu-Osher completion row applies directly and
+          is manifestly a convex combination.
+        * Neither: a non-stiffly-accurate tableau WITH an implicit part would
+          need the Butcher implicit completion, which the Shu-Osher form cannot
+          express. Refuse rather than silently drop it.
         """
+        s = len(tab.b)
         if np.allclose(tab.b, tab.A[-1], atol=1e-14) and np.allclose(
             tab.bt, tab.At[-1], atol=1e-14
         ):
             self._Y[-1].copy(x)
             return
-        for j, (bj, btj) in enumerate(zip(tab.b, tab.bt, strict=True)):
-            if btj != 0.0:
-                x.axpy(h * btj, self._Ydot[j])
-            if bj != 0.0:
-                x.axpy(h * bj, self._L[j])
+        if not np.any(tab.At):
+            result = self._Z  # reuse as scratch; Z is dead at this point
+            result.set(0.0)
+            if self._q[s] != 0.0:
+                result.axpy(self._q[s], x)
+            for j in range(s):
+                psj = self._P[s, j]
+                if psj == 0.0:
+                    continue
+                result.axpy(psj, self._Y[j])
+                result.axpy(psj * h / self._r, self._L[j])
+            result.copy(x)
+            return
+        raise ValueError(
+            f"tableau {tab.name!r} is neither stiffly accurate nor purely "
+            "explicit. Its completion needs the implicit weights bt, which the "
+            "Shu-Osher form cannot express, so the implicit contribution would "
+            "be silently dropped. Use a stiffly accurate tableau."
+        )
 
     # -- SNES callbacks -------------------------------------------------------
 

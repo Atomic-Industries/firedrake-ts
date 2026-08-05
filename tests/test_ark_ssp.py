@@ -124,3 +124,102 @@ def test_shu_osher_error_is_unwrapped_with_the_actionable_numbers():
     message = str(excinfo.value)
     assert "r = 5.0" in message
     assert "R(A,b)" in message
+
+
+def test_ssprk2_is_second_order():
+    """Heun in Shu-Osher form must show design order 2."""
+    _, coarse = _decay("ssprk2", dt=4e-3)
+    _, fine = _decay("ssprk2", dt=2e-3)
+    ratio = abs(coarse - EXACT) / abs(fine - EXACT)
+    assert 3.4 < ratio < 4.6, f"observed order ratio {ratio}, expected ~4"
+
+
+def test_ssprk2_needs_no_implicit_solve():
+    """At is identically zero, so no stage may enter the SNES."""
+    solver, _ = _decay("ssprk2", dt=1e-2)
+    assert solver.ts.getSNESIterations() == 0
+
+
+def test_shu_osher_matches_butcher_on_the_same_problem():
+    """The Shu-Osher path and PETSc's Butcher-form TSRK must agree."""
+    _, ours = _decay("ssprk2", dt=1e-3)
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    problem = firedrake_ts.DAEProblem(
+        inner(u_t, v) * dx, u, u_t, (0.0, 1.0), G=-inner(u, v) * dx
+    )
+    firedrake_ts.DAESolver(
+        problem,
+        solver_parameters={
+            "ts_type": "arkimex",
+            "ts_arkimex_type": "2c",
+            "ts_adapt_type": "none",
+            "ts_time_step": 1e-3,
+            "ts_exact_final_time": "stepover",
+        },
+        options_prefix="",
+    ).solve()
+    assert abs(ours - float(u.dat.data_ro[0])) < 1e-5
+
+
+def test_limiter_fires_once_per_stage():
+    """The limiter must see every explicit substage, not just the last."""
+    calls = []
+
+    def counting_limiter(vec):
+        calls.append(vec.norm())
+
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    problem = firedrake_ts.DAEProblem(
+        inner(u_t, v) * dx, u, u_t, (0.0, 0.05), G=-inner(u, v) * dx
+    )
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters={
+            "ts_type": "python",
+            "ts_python_type": PYTHON_STEPPER,
+            "ts_ark_ssp_type": "ssprk2",
+            "ts_adapt_type": "none",
+            "ts_time_step": 0.01,
+            "ts_exact_final_time": "stepover",
+        },
+        options_prefix="",
+    )
+    solver.ts.getPythonContext().set_stage_limiter(counting_limiter)
+    solver.solve()
+    # 2 stages x 5 steps
+    assert len(calls) == 10, f"limiter fired {len(calls)} times, expected 10"
+
+
+def test_complete_refuses_when_neither_stiffly_accurate_nor_explicit():
+    """A tableau needing the implicit completion weights bt, but that is not
+    stiffly accurate, must raise rather than silently drop them.
+
+    esdirk_gamma5 is stiffly accurate on both its explicit and implicit
+    parts. Perturbing b away from A[-1] breaks that without touching At, so
+    the tableau is neither stiffly accurate nor purely explicit -- exactly
+    the case the Shu-Osher completion row cannot express.
+    """
+    import dataclasses
+
+    from firedrake_ts.ark_ssp import ARKSSP
+    from firedrake_ts.tableaux import TABLEAUX
+
+    tab = TABLEAUX["esdirk_gamma5"]
+    bogus_b = tab.b.copy()
+    bogus_b[0] += 0.05
+    bogus_b[1] -= 0.05
+    bogus = dataclasses.replace(tab, name="bogus_non_sa", b=bogus_b)
+
+    stepper = ARKSSP()
+    with pytest.raises(ValueError, match="bogus_non_sa"):
+        stepper._complete(bogus, None, None)
