@@ -1147,14 +1147,14 @@ class ARKSSP:
         x.copy(xdot)
         xdot.axpy(-1.0, self._Z)
         xdot.scale(self._shift)
-        ts.computeIFunction(self._stage_time, x, xdot, f, False)
+        ts.computeIFunction(self._stage_time, x, xdot, f, True)
 
     def formSNESJacobian(self, snes, x, A, B, ts):
         xdot = self._Z.duplicate()
         x.copy(xdot)
         xdot.axpy(-1.0, self._Z)
         xdot.scale(self._shift)
-        ts.computeIJacobian(self._stage_time, x, xdot, self._shift, A, B, False)
+        ts.computeIJacobian(self._stage_time, x, xdot, self._shift, A, B, True)
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -2198,7 +2198,7 @@ Now wire it into the callbacks:
         x.copy(xdot)
         xdot.axpy(-1.0, self._Z)
         xdot.scale(self._shift)
-        ts.computeIFunction(self._stage_time, x, xdot, f, False)
+        ts.computeIFunction(self._stage_time, x, xdot, f, True)
         self._apply_freeze_residual(x, f)
 
     def formSNESJacobian(self, snes, x, A, B, ts):
@@ -2206,7 +2206,7 @@ Now wire it into the callbacks:
         x.copy(xdot)
         xdot.axpy(-1.0, self._Z)
         xdot.scale(self._shift)
-        ts.computeIJacobian(self._stage_time, x, xdot, self._shift, A, B, False)
+        ts.computeIJacobian(self._stage_time, x, xdot, self._shift, A, B, True)
         if self._frozen_rows is not None:
             A.zeroRows(self._frozen_rows, diag=1.0)
             if B is not None and B.handle != A.handle:
@@ -2214,6 +2214,14 @@ Now wire it into the callbacks:
 ```
 
 Note `self._rhs` is reused as `xdot` scratch here; it is only live between `computeRHSFunction` and the copy into `_L[i]`, which never overlaps a stage solve. If that ever changes, allocate a dedicated vector.
+
+**The trailing `True` on both `compute*` calls is load-bearing — do not change it to `False`.**
+It is PETSc's `imex` flag. `True` means the stage residual is the implicit function alone.
+`False` makes `TSComputeIFunction` additionally subtract the RHS function, which double-counts
+the explicit part — once in `Z_i`, once in the residual — and the advance cancels out. Measured
+on the completed Task 4 stepper: flipping these to `False` fails four tests, the first reporting
+`solution never left its initial condition`. If you see that symptom, check this flag before
+suspecting the freeze logic.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
