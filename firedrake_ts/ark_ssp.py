@@ -33,6 +33,15 @@ class ARKSSP:
         self.radius = None
         self.setup_calls = 0
         self.step_calls = 0
+        # The exception raised by the most recent setUp/step call, if any.
+        # DAESolver.solve reads this to recover the original exception:
+        # PETSc's own error handler prints diagnostics as the error unwinds
+        # through the C call stack, and under captured stdout/stderr (e.g.
+        # pytest's default capture) that print clears the thread's pending
+        # exception before it can be attached to the PETSc.Error PETSc4py
+        # eventually raises. Stashing it here sidesteps that C boundary
+        # entirely.
+        self._error = None
         self._limiter = None
         self._tab = None
         self._P = None
@@ -58,30 +67,38 @@ class ARKSSP:
         self.radius = radius if radius > 0.0 else None
 
     def setUp(self, ts):
-        self.setup_calls += 1
+        # Clear any stale error before this call -- a failure from a
+        # previous setUp/step must never be re-raised against this one.
+        self._error = None
         try:
-            self._tab = TABLEAUX[self.tableau_name]
-        except KeyError:
-            raise ValueError(
-                f"unknown tableau {self.tableau_name!r}; "
-                f"choose one of {sorted(TABLEAUX)}"
-            ) from None
-        tab = self._tab
-        self._r = (
-            self.radius
-            if self.radius is not None
-            else kraaijevanger_radius(tab.A, tab.b)
-        )
-        # Raises ShuOsherError if the radius is too large, naming both numbers.
-        self._P, self._q = shu_osher(tab.A, tab.b, self._r)
+            self.setup_calls += 1
+            try:
+                self._tab = TABLEAUX[self.tableau_name]
+            except KeyError:
+                raise ValueError(
+                    f"unknown tableau {self.tableau_name!r}; "
+                    f"choose one of {sorted(TABLEAUX)}"
+                ) from None
+            tab = self._tab
+            self._r = (
+                self.radius
+                if self.radius is not None
+                else kraaijevanger_radius(tab.A, tab.b)
+            )
+            # Raises ShuOsherError if the radius is too large, naming both
+            # numbers.
+            self._P, self._q = shu_osher(tab.A, tab.b, self._r)
 
-        sol = ts.getSolution()
-        s = len(tab.b)
-        self._Y = [sol.duplicate() for _ in range(s)]
-        self._L = [sol.duplicate() for _ in range(s)]
-        self._Ydot = [sol.duplicate() for _ in range(s)]
-        self._Z = sol.duplicate()
-        self._rhs = sol.duplicate()
+            sol = ts.getSolution()
+            s = len(tab.b)
+            self._Y = [sol.duplicate() for _ in range(s)]
+            self._L = [sol.duplicate() for _ in range(s)]
+            self._Ydot = [sol.duplicate() for _ in range(s)]
+            self._Z = sol.duplicate()
+            self._rhs = sol.duplicate()
+        except Exception as exc:
+            self._error = exc
+            raise
 
     def reset(self, ts):
         pass
@@ -102,26 +119,33 @@ class ARKSSP:
     # -- the step -------------------------------------------------------------
 
     def step(self, ts):
-        self.step_calls += 1
-        tab = self._tab
-        t = ts.getTime()
-        h = ts.getTimeStep()
-        x = ts.getSolution()
-        s = len(tab.b)
+        # Clear any stale error before this call -- a failure from a
+        # previous setUp/step must never be re-raised against this one.
+        self._error = None
+        try:
+            self.step_calls += 1
+            tab = self._tab
+            t = ts.getTime()
+            h = ts.getTimeStep()
+            x = ts.getSolution()
+            s = len(tab.b)
 
-        for i in range(s):
-            self._build_offset(tab, x, h, i)
-            if tab.At[i, i] > 0.0:
-                self._solve_stage(ts, tab, h, i)
-            else:
-                # Purely explicit stage: the value IS the offset.
-                self._Z.copy(self._Y[i])
-                self._Ydot[i].set(0.0)
-            ts.computeRHSFunction(t + tab.c[i] * h, self._Y[i], self._rhs)
-            self._rhs.copy(self._L[i])
+            for i in range(s):
+                self._build_offset(tab, x, h, i)
+                if tab.At[i, i] > 0.0:
+                    self._solve_stage(ts, tab, h, i)
+                else:
+                    # Purely explicit stage: the value IS the offset.
+                    self._Z.copy(self._Y[i])
+                    self._Ydot[i].set(0.0)
+                ts.computeRHSFunction(t + tab.c[i] * h, self._Y[i], self._rhs)
+                self._rhs.copy(self._L[i])
 
-        self._complete(tab, x, h)
-        ts.setTime(t + h)
+            self._complete(tab, x, h)
+            ts.setTime(t + h)
+        except Exception as exc:
+            self._error = exc
+            raise
 
     def _build_offset(self, tab, x, h, i):
         """Z_i = x^n + h sum_{j<i} (At_ij Ydot_j + A_ij L_j)."""

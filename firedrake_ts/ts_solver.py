@@ -397,38 +397,39 @@ class DAESolver(OptionsManager):
                     self._transfer_operators,
                 ):
                     stack.enter_context(ctx)
-                # Swap in PETSc's "python" error handler for the duration of
-                # the solve. The default ("traceback") handler prints its
-                # diagnostics to stderr as the error unwinds through PETSc's
-                # C call stack; under captured output (pytest's default
-                # fd/sys/tee-sys capture -- anything but -s) that print
-                # reliably wipes the thread's pending-exception state before
-                # CHKERR/SETERR fetches it via PyErr_GetRaisedException() to
-                # attach as __cause__ below, so the unwrap silently never
-                # fires. Verified empirically: __cause__ survives only under
-                # -s. The "python" handler records the same frame/message
-                # information on PETSc.Error._traceback instead of printing
-                # it, so nothing is lost, and it never touches the pending
-                # exception.
-                PETSc.Sys.pushErrorHandler("python")
                 try:
-                    try:
-                        self.ts.solve(work)
-                    except PETSc.Error as exc:
-                        # A TSPYTHON step() that raises propagates through
-                        # libpetsc4py as PETSc.Error (code 101,
-                        # PETSC_ERR_PYTHON) with the original exception
-                        # attached as __cause__. Unwrap it so callers see
-                        # e.g. ShuOsherError with its actionable message, not
-                        # an opaque PETSc error code.
-                        if exc.__cause__ is not None:
-                            raise exc.__cause__ from exc
-                        raise
-                finally:
-                    PETSc.Sys.popErrorHandler()
+                    self.ts.solve(work)
+                except PETSc.Error as exc:
+                    # A Python exception raised inside a TSPYTHON callback
+                    # cannot be recovered from exc.__cause__: PETSc's default
+                    # error handler prints as the error unwinds through C,
+                    # and under captured output that print clears the
+                    # thread's pending exception before it can be attached.
+                    # So the stepper records its own exception and we
+                    # re-raise that, which keeps PETSc's printed C-stack
+                    # diagnostics intact.
+                    original = self._python_stepper_error()
+                    if original is not None:
+                        raise original from exc
+                    raise
             work.copy(u)
         self._setup = True
         check_ts_convergence(self.ts)
+
+    def _python_stepper_error(self):
+        """The exception a TSPYTHON stepper recorded, if any.
+
+        Only ``TSPYTHON``-type steppers stash their own exceptions (see
+        ``ARKSSP._error``); anything else -- including a non-Python TS, or
+        a Python context that doesn't record errors -- yields ``None``.
+        """
+        if self.ts.getType() != PETSc.TS.Type.PYTHON:
+            return None
+        try:
+            context = self.ts.getPythonContext()
+        except PETSc.Error:
+            return None
+        return getattr(context, "_error", None)
 
     def adjoint_solve(self):
         r"""Solve the adjoint problem."""
