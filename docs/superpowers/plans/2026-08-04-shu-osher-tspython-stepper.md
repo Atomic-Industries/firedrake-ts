@@ -1706,6 +1706,18 @@ Makes `_TSContext` handle a singular mass matrix. Tested through **`arkimex`**, 
 
 Append to `tests/test_singular_mass.py`:
 
+> **Why one-cell `DG0` and not `FunctionSpace(mesh, "R", 0)`.** `R`-space was the obvious
+> choice for "no spatial discretisation error", and it does not work. Measured at
+> `6219dd5`: an `R`-space mass matrix assembles as PETSc type `python`, which LU cannot
+> factor, so even a plain non-singular non-mixed `R`-space DAE with a `G` fails under
+> `arkimex` with `error code 101` — nothing to do with this task's changes. Mixed spaces
+> containing `R` are worse: `assemble(..., mat_type="aij")` raises outright
+> (`Monolithic matrix assembly not supported for systems with R-space blocks`), and
+> `zeroRows` needs AIJ. `DG0` on a one-cell mesh gives the same property — one dof per
+> field, spatially-constant solutions represented exactly, so observed order is the
+> tableau's alone — and assembles as `seqaij`. Verified: `seqaij`, predicates return
+> `algebraic=(1,)` / `explicit=(0,)`, and `zeroRows` on the algebraic block succeeds.
+
 ```python
 RUNG_PARAMS = {
     "ts_adapt_type": "none",
@@ -1714,13 +1726,13 @@ RUNG_PARAMS = {
 
 
 def _rung1(stepper, dt=1e-3, tmax=1.0):
-    """Index 1, R-space: ydot = z, 0 = z + y, z explicit. Exact y = e^-t.
+    """Index 1, one-cell DG0: ydot = z, 0 = z + y, z explicit. Exact y = e^-t.
 
     M = diag(1, 0) is genuinely singular and G vanishes on the algebraic row.
     No spatial discretisation error, so observed order is the tableau's alone.
     """
     mesh = UnitIntervalMesh(1)
-    R = FunctionSpace(mesh, "R", 0)
+    R = FunctionSpace(mesh, "DG", 0)  # NOT "R": see the note below
     W = R * R
     w = Function(W)
     wdot = Function(W)
@@ -1754,7 +1766,7 @@ def test_rung1_singular_mass_runs_under_arkimex():
 def test_G_nonzero_on_an_algebraic_row_is_rejected():
     """The projection is undefined there; fail loudly, not silently."""
     mesh = UnitIntervalMesh(1)
-    R = FunctionSpace(mesh, "R", 0)
+    R = FunctionSpace(mesh, "DG", 0)  # NOT "R": see the note below
     W = R * R
     w = Function(W)
     wdot = Function(W)
@@ -1895,7 +1907,7 @@ G nonzero on an algebraic row is now a clear ValueError naming the
 components, rather than a KSP divergence.
 
 Verified through arkimex alone, with no new stepper involved, on an
-index-1 R-space DAE with M = diag(1, 0) and an exact solution."
+index-1 one-cell DG0 DAE with M = diag(1, 0) and an exact solution."
 ```
 
 ---
@@ -2059,6 +2071,15 @@ def test_limiter_on_an_implicit_component_is_rejected():
 
 And append the dual-path rung tests to `tests/test_singular_mass.py`:
 
+> **Why a field-valued multiplier and not a mean-value one.** A mean-value constraint needs
+> a single global dof, i.e. an `R`-space block, and a mixed space containing `R` cannot be
+> assembled monolithically at all (see the note in the previous task), while `zeroRows`
+> requires AIJ. A pointwise constraint `u = target(x)` with `lam` in the same space keeps
+> everything the rung is for: a real mixed space, a genuinely singular mass matrix (`lam`
+> has no time derivative), index 2, fieldsplit-able, PDE scale, and no momentum balance.
+> Verified on `P1 x P1`: `seqaij`, `algebraic=(1,)`, `explicit=()` — the latter correctly
+> empty because row 0 carries diffusion, so it is differential but not explicitly governed.
+
 ```python
 ARK_SSP_G5 = {
     "ts_type": "python",
@@ -2083,7 +2104,7 @@ def _rung2(stepper, dt=1e-3, tmax=1.0):
     near 1e-16 with b == A[s-1,:], near 1e-3 without.
     """
     mesh = UnitIntervalMesh(1)
-    R = FunctionSpace(mesh, "R", 0)
+    R = FunctionSpace(mesh, "DG", 0)  # NOT "R": see the note below
     W = R * R
     w = Function(W)
     wdot = Function(W)
@@ -2122,8 +2143,8 @@ def _rung3(stepper, dt=2e-3, tmax=0.1, n=8):
     """
     mesh = UnitIntervalMesh(n)
     V = FunctionSpace(mesh, "P", 1)
-    R = FunctionSpace(mesh, "R", 0)
-    W = V * R
+    R = FunctionSpace(mesh, "DG", 0)  # NOT "R": see the note below
+    W = V * V  # lam is field-valued; see the note below
     w = Function(W)
     wdot = Function(W)
     u, lam = split(w)
@@ -2132,12 +2153,12 @@ def _rung3(stepper, dt=2e-3, tmax=0.1, n=8):
     x, = SpatialCoordinate(mesh)
     w.sub(0).interpolate(1.0 + 0.5 * sin(2 * pi * x))
 
-    mass_target = Constant(1.0)
+    target = Function(V).interpolate(1.0 + 0.5 * sin(2 * pi * x))
     F = (
         inner(udot, vu) * dx
         + inner(grad(u), grad(vu)) * dx
         - inner(lam, vu) * dx
-        + inner(u - mass_target, vlam) * dx
+        + inner(u - target, vlam) * dx
     )
     G = -0.1 * inner(u, vu) * dx  # an explicit reaction term
 
@@ -2290,7 +2311,7 @@ block still applies unchanged.
 Registering a limiter when no component is freezable is now a clear
 error instead of a silently unsound answer.
 
-Singular-mass rungs 1-3 (index-1 R-space, index-2 multiplier, PDE with a
+Singular-mass rungs 1-3 (index-1 one-cell DG0, index-2 multiplier, PDE with a
 mean-value multiplier) run against both arkimex and ARKSSP, so a
 failure localises to the stepper rather than the projection."
 ```
