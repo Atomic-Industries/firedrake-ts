@@ -140,6 +140,60 @@ def test_ssprk2_needs_no_implicit_solve():
     assert solver.ts.getSNESIterations() == 0
 
 
+def _pure_implicit_decay(dt, tmax=1.0):
+    """Integrate u' = -u with -u INSIDE F (implicit), G = None.
+
+    This is the class of problem ARKSSP exists to serve: a nontrivial
+    implicit operator, with esdirk_gamma5's explicit first stage
+    (At[0, 0] == 0) actually exercised against a real dF/du. ``matchstep``
+    rather than ``stepover`` so the comparison against ``exp(-1)`` is not
+    confounded by stepover's overshoot past t = 1.
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    F = inner(u_t, v) * dx + inner(u, v) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, tmax))
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters={
+            "ts_type": "python",
+            "ts_python_type": PYTHON_STEPPER,
+            "ts_ark_ssp_type": "esdirk_gamma5",
+            "ts_adapt_type": "none",
+            "ts_time_step": dt,
+            "ts_exact_final_time": "matchstep",
+        },
+        options_prefix="",
+    )
+    solver.solve()
+    return float(u.dat.data_ro[0])
+
+
+def test_esdirk_gamma5_converges_on_a_purely_implicit_problem():
+    """The stepper must converge, at design order, with the operator
+    entirely inside F and no G at all.
+
+    esdirk_gamma5's first stage is explicit (At[0, 0] == 0), so Y_0 = y_n
+    and Ydot_0 must be evaluated from F(t^n, y_n, 0) rather than assumed
+    zero: read with nonzero weight in _build_offset's At[1, 0], in
+    evaluatestep's bt[0], and in interpolate's d[0]. Left unevaluated
+    (Ydot_0 == 0, the value sol.duplicate() happens to leave it at), the
+    measured error is FLAT in dt -- it converges to the wrong limit, not
+    to exp(-1) -- rather than shrinking like h^2.
+    """
+    errors = [
+        abs(_pure_implicit_decay(dt) - EXACT) for dt in (0.1, 0.05, 0.025, 0.0125)
+    ]
+    assert all(e > 0.0 for e in errors)
+    ratios = [errors[i] / errors[i + 1] for i in range(len(errors) - 1)]
+    for ratio in ratios:
+        assert 3.4 < ratio < 4.6, f"observed order ratios {ratios}, expected ~4"
+
+
 def test_shu_osher_matches_butcher_on_the_same_problem():
     """The Shu-Osher path and PETSc's Butcher-form TSRK must agree."""
     _, ours = _decay("ssprk2", dt=1e-3)

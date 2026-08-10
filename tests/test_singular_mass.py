@@ -397,12 +397,28 @@ def _rung3(stepper, dt=2e-3, tmax=0.1, n=8):
     firedrake_ts.DAESolver(
         problem, solver_parameters=parameters, options_prefix=""
     ).solve()
-    return w
+    return w, target
 
 
 @pytest.mark.parametrize("stepper", [ARKIMEX, ARK_SSP_G5], ids=["arkimex", "arkssp"])
 def test_rung3_pde_with_multiplier_runs(stepper):
-    w = _rung3(stepper)
+    """The PDE-scale rung: real accuracy, not just liveness.
+
+    The constraint row (``u - target = 0``) pins ``u`` to ``target(x)``
+    exactly at every stage -- it is algebraic, solved by the nonlinear
+    solver's own tolerance, not subject to any O(h^p) truncation error.
+    So ``u`` must match ``target`` to close to machine precision, not
+    merely be finite and nonzero. Measured: max|u - target| ~ 1.3e-14
+    (arkimex), ~2.2e-16 (arkssp); 1e-8 leaves ample margin against SNES's
+    own default tolerances without demanding an exact discretisation
+    result the test does not otherwise control.
+    """
+    w, target = _rung3(stepper)
     assert np.all(np.isfinite(w.sub(0).dat.data_ro))
     assert np.all(np.isfinite(w.sub(1).dat.data_ro))
     assert norm(w.sub(0)) > 0.0
+    defect = np.max(np.abs(w.sub(0).dat.data_ro - target.dat.data_ro))
+    assert defect < 1e-8, (
+        f"u drifted from the pinned target by {defect:.3e} -- the "
+        "algebraic constraint should hold to near machine precision"
+    )

@@ -17,9 +17,10 @@ populates those counters, and petsc4py binds no setter for them. As a result
 """
 
 import numpy as np
-from firedrake import dmhooks
+from firedrake import dmhooks, ufl_expr
 from firedrake.exceptions import ConvergenceError
-from firedrake.petsc import PETSc
+from firedrake.petsc import DEFAULT_KSP_PARAMETERS, PETSc
+from petsctools import OptionsManager
 
 from firedrake_ts._petsc_shim import (
     ts_adapt_candidate_add,
@@ -27,7 +28,11 @@ from firedrake_ts._petsc_shim import (
     ts_adapt_choose,
     ts_get_adapt,
 )
-from firedrake_ts.solving_utils import explicitly_governed_fields, resolve_fields
+from firedrake_ts.solving_utils import (
+    explicitly_governed_fields,
+    is_zero_form,
+    resolve_fields,
+)
 from firedrake_ts.tableaux import TABLEAUX, kraaijevanger_radius, shu_osher
 
 __all__ = ["ARKSSP"]
@@ -62,6 +67,13 @@ class ARKSSP:
         self._Ydot = None  # implicit stage derivatives
         self._Z = None  # Butcher stage offset
         self._rhs = None  # scratch for computeRHSFunction
+        self._zero_xdot = None  # a permanent zero Xdot, for F(t, y_n, 0)
+        # Stage-0 mass solve for an explicit first stage: set in setUp,
+        # used once per step() by _prepare_stage0_ydot. None/False when
+        # not needed (implicit first stage, or a structurally trivial F).
+        self._stage0_needs_mass_solve = False
+        self._mass_ksp = None
+        self._mass_options = None
         # Recorded at the top of each step() attempt, for evaluatestep --
         # the value the solution held at the START of the step. step()
         # overwrites ts.getSolution() with each attempt's order-p candidate
@@ -114,9 +126,12 @@ class ARKSSP:
             self._Z = sol.duplicate()
             self._rhs = sol.duplicate()
             self._last_x = sol.duplicate()
+            self._zero_xdot = sol.duplicate()
+            self._zero_xdot.set(0.0)
 
             self._frozen_rows = self._find_frozen_rows(ts)
             self._check_limiter_soundness()
+            self._setup_stage0_mass_solve(ts)
         except Exception as exc:
             self._error = exc
             raise
@@ -232,6 +247,97 @@ class ARKSSP:
         local = self._frozen_rows - lo
         fa[local] = xa[local] - ya[local]
 
+    def _setup_stage0_mass_solve(self, ts):
+        """Whether an explicit first stage needs a mass solve for ``Ẏ_0``.
+
+        For an explicit first stage (``tab.At[0, 0] == 0``), ``Y_0 = y^n``
+        and the implicit residual must still be satisfied there:
+        ``F(t^n, y^n, Ẏ_0) = 0``. Linearising at ``Ẏ_0 = 0`` with the mass
+        matrix ``M = dF/du̇`` gives ``Ẏ_0 = -M^-1 F(t^n, y^n, 0)`` -- see
+        ``_prepare_stage0_ydot``, which evaluates that every ``step()``.
+
+        No solve is needed -- and none is built -- when ``dF/du`` is
+        structurally zero everywhere: then ``F`` does not depend on the
+        state at all, and ``Ẏ_0 = 0`` exactly, matching what a freshly
+        duplicated (zero) vector already gives ``self._Ydot[0]``. This is
+        NOT skipped merely because a limiter or the freeze is active --
+        those constrain what a limiter may do to a stage *value*, which is
+        orthogonal to whether an explicit first stage's derivative needs
+        solving for at all.
+
+        Builds a bare ``PETSc.KSP`` on the assembled mass matrix, following
+        ``_TSContext._rhs_projection_solver``'s idiom in
+        ``solving_utils.py`` (see that method's comment): a Firedrake
+        ``LinearSolver``/``NonlinearVariationalSolver`` would register a
+        ``SNES`` on the TS's own DM, since this problem lives on the same
+        function space as the TS's solution, and that would silently
+        displace ``SNESTSFormFunction``/``SNESTSFormJacobian`` on the TS's
+        real SNES. A ``KSP`` inverting an already-assembled, constant
+        operator needs no ``SNES`` and so cannot collide.
+
+        The mass matrix itself is reused from
+        ``ctx._rhs_projection_mass_matrix`` rather than reassembled here --
+        it is exactly the same ``dF/du̇`` (with the same algebraic-row
+        diag=1 treatment), whether it is used to project ``G`` or to
+        solve for ``Ẏ_0``, and ``_TSContext`` caches it once already. That
+        property is safe to call even when ``G`` is ``None`` (it is not
+        gated on ``G`` -- only ``_rhs_projection_solver`` is, which is why
+        this method builds its own ``KSP`` instead of reusing that one).
+        """
+        tab = self._tab
+        if tab.At[0, 0] > 0.0:
+            self._stage0_needs_mass_solve = False
+            self._mass_ksp = None
+            return
+        ctx = dmhooks.get_appctx(ts.getDM())
+        problem = ctx._problem
+        self._stage0_needs_mass_solve = not is_zero_form(
+            ufl_expr.derivative(problem.F, problem.u_restrict)
+        )
+        if not self._stage0_needs_mass_solve:
+            self._mass_ksp = None
+            return
+        mass = ctx._rhs_projection_mass_matrix
+        ksp = PETSc.KSP().create(comm=mass.comm)
+        ksp.setOperators(mass.petscmat)
+        parameters = {
+            k: v for k, v in DEFAULT_KSP_PARAMETERS.items() if k != "mat_type"
+        }
+        prefix = (ts.getOptionsPrefix() or "") + "ark_ssp_stage0_mass_solver_"
+        self._mass_options = OptionsManager(parameters, prefix)
+        self._mass_options.set_from_options(ksp)
+        self._mass_ksp = ksp
+
+    def _prepare_stage0_ydot(self, ts, t, x):
+        """Populate ``Ẏ_0`` once per ``step()``, before the retry loop.
+
+        ``Ẏ_0 = -M^-1 F(t^n, y^n, 0)`` depends only on ``(t^n, y^n)``,
+        i.e. on ``(t, x)`` as passed in here -- neither of which changes
+        across retries of the same step inside ``step()``'s reject loop
+        (only ``h`` does). So this runs exactly once per ``step()`` call,
+        not once per attempt inside ``_take_stages``, and it must be
+        called with THIS step's ``t^n``/``y^n``: ``step()`` calls it right
+        after recording ``self._last_x``, before entering the retry loop.
+        """
+        if self._tab.At[0, 0] > 0.0:
+            return  # _solve_stage populates _Ydot[0] normally, in _take_stages.
+        if not self._stage0_needs_mass_solve:
+            self._Ydot[0].set(0.0)
+            return
+        ts.computeIFunction(t, x, self._zero_xdot, self._rhs, True)
+        with self._mass_options.inserted_options():
+            self._mass_ksp.solve(self._rhs, self._Ydot[0])
+        self._Ydot[0].scale(-1.0)
+        if self._freeze_active():
+            # Same reasoning as _solve_stage's identical block at the end of
+            # a real stage solve: a frozen row's implicit function is the
+            # mass term alone, so M Ẏ = 0 there and the correct derivative
+            # is exactly zero, not whatever -M^-1 F(t, y, 0) gives on a row
+            # a limiter has no business perturbing further.
+            lo, _ = self._Ydot[0].getOwnershipRange()
+            local = self._frozen_rows - lo
+            self._Ydot[0].getArray()[local] = 0.0
+
     # -- the step -------------------------------------------------------------
 
     def step(self, ts):
@@ -248,6 +354,10 @@ class ARKSSP:
 
             self._last_h = h
             x.copy(self._last_x)
+            # Once per step(), not once per retry: see _prepare_stage0_ydot's
+            # docstring -- it depends only on (t^n, y^n), fixed for every
+            # attempt below, but t^n does change between step() calls.
+            self._prepare_stage0_ydot(ts, t, self._last_x)
 
             # petsc4py binds setMaxStepRejections but NOT a getter, so read
             # the option directly. Two traps, both verified against the
