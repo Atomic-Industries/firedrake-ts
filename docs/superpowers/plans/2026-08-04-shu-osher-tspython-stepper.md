@@ -2374,6 +2374,30 @@ CFL = 0.064
 VELOCITY = 1.0
 
 
+> **Two things here are load-bearing, and getting either wrong silently manufactures a
+> passing test.**
+>
+> **The element must place its dofs at the cell vertices.** Firedrake's default
+> `FunctionSpace(mesh, "DG", 1)` puts them at the interior Gauss–Legendre points
+> (in-cell fractions `0.2113`/`0.7887`). Zhang & Shu's Theorem 2.2 requires the point
+> values at a quadrature rule *including the two cell ends* — their Remark 2.7: "any
+> quadrature rule will work as long as it includes the two cell ends" — because the
+> identity the proof rests on, `mean = Σ ŵ_α f̂_α`, needs the traces as explicit terms.
+> A linear function held inside `[0,1]` at `±1/√3` reaches `mean ± (√3/2)|Δ|` at the
+> endpoints, so traces hit `−0.366`/`+1.366` with every dof perfectly in range; those
+> traces enter the upwind flux and carry the cell mean out of `[0,1]`. Measured: limiting
+> the default element's dofs violates the mean bound at step 2 at *every* CFL from `0.5`
+> down to `0.032`, an `O(Δt)` defect that shrinks but never vanishes. `variant="equispaced"`
+> puts the dofs at fractions `0`/`1` — the vertices, which for `k=1` *are* the 2-point
+> Gauss–Lobatto points — and then a plain nodal limiter is exactly the theorem's limiter,
+> in any dimension.
+>
+> **The mean must not be clamped.** Writing `m = min(max(mean, 0, 1))` forces every cell
+> into `[0,1]` regardless of what the stepper did, so the bounds test passes while the
+> means underneath are out of range. That is a post-step clamp in per-stage clothing —
+> precisely what this design claims to be unnecessary. Scale about the *true* mean; if it
+> is out of range the limiter cannot help, and the test should say so.
+
 def _zhang_shu(V, V0):
     """Scale each cell about its mean so the cell lies in [0, 1].
 
@@ -2400,7 +2424,7 @@ def _zhang_shu(V, V0):
         ncell = len(ma)
         view = fa.reshape(ncell, len(fa) // ncell)
         for c in range(ncell):
-            m = min(max(float(ma[c]), 0.0), 1.0)
+            m = float(ma[c])  # NOT clamped -- see the note above
             lo, hi = view[c].min(), view[c].max()
             theta = 1.0
             if hi > m:
@@ -2418,7 +2442,8 @@ def _zhang_shu(V, V0):
 def _advect(stepper_parameters, limited):
     """DG1 upwind advection of a square wave on a periodic interval."""
     mesh = PeriodicUnitIntervalMesh(N)
-    V = FunctionSpace(mesh, "DG", 1)
+    # variant="equispaced" is REQUIRED, not cosmetic: see the note above.
+    V = FunctionSpace(mesh, "DG", 1, variant="equispaced")
     V0 = FunctionSpace(mesh, "DG", 0)
     f = Function(V, name="f")
     f_t = Function(V)
@@ -2491,7 +2516,8 @@ def test_limiting_does_not_destroy_mass():
     be meaningless even if it passed.
     """
     mesh = PeriodicUnitIntervalMesh(N)
-    V = FunctionSpace(mesh, "DG", 1)
+    # variant="equispaced" is REQUIRED, not cosmetic: see the note above.
+    V = FunctionSpace(mesh, "DG", 1, variant="equispaced")
     V0 = FunctionSpace(mesh, "DG", 0)
     f = Function(V, name="f")
     f_t = Function(V)
