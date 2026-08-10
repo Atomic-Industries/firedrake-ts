@@ -372,6 +372,12 @@ class ARKSSP:
                 U.axpy(h * impl, self._Ydot[i])
             if expl != 0.0:
                 U.axpy(h * expl, self._L[i])
+        # Unlike evaluatestep's, this return value is inert: petsc4py's
+        # TSInterpolate_Python (libpetsc4py.pyx) calls interpolate(...) and
+        # discards whatever it returns -- there is no flag out-param and no
+        # truthiness check, in contrast to TSEvaluateStep_Python's `done`.
+        # Kept only for symmetry with evaluatestep, not because anything
+        # reads it.
         return True
 
     def _shu_osher_predictor(self, x, h, i):
