@@ -107,10 +107,23 @@ def test_kraaijevanger_radius():
 
 
 def test_radius_is_sharp():
-    """Just above the radius the conversion must be rejected, not silently wrong."""
+    """Just above the radius the conversion must be rejected, not silently wrong.
+
+    ``pytest.raises(match=r"2\\.0")`` alone is not discriminating here: it is
+    already satisfied by the "2.0" *inside* "r = 2.0001", the offending r
+    value, regardless of whether R(A,b) is reported correctly at all. The
+    actual radius is 2.0000000000002, which the error message formats with
+    ``:.10g`` as bare "2" (trailing zeros stripped) -- so checking for both
+    numbers separately, with the radius's real (non-".0"-suffixed) form,
+    is what actually exercises the message rather than being satisfied by
+    the r value alone.
+    """
     shu_osher(SSPRK32_A, SSPRK32_B, 2.0)  # must not raise
-    with pytest.raises(ShuOsherError, match=r"2\.0"):
+    with pytest.raises(ShuOsherError) as excinfo:
         shu_osher(SSPRK32_A, SSPRK32_B, 2.0001)
+    message = str(excinfo.value)
+    assert "r = 2.0001" in message
+    assert "R(A,b) = 2" in message
 
 
 def test_butcher_to_K_shape():

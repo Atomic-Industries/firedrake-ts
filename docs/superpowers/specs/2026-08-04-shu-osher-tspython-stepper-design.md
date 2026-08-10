@@ -148,8 +148,16 @@ computation. A unit test pins the derived `(P, q)` against the hand-derived text
 
 **`ark_ssp.py`** — `ARKSSP` implementing `setUp`, `step`, `evaluatestep`, `interpolate`,
 `rollback`, `reset`, `setFromOptions`, `view`, plus `set_stage_limiter(fn)`. The limiter is
-an opaque callable taking the stage-value `Function` and mutating it in place; it receives
-no tableau, index, or time.
+an opaque callable taking the stage-value PETSc `Vec` and mutating it in place; it receives
+no tableau, index, or time. (As shipped, the limiter takes a `Vec`, not a `Function` — every
+test wraps it into a scratch `Function` itself where it needs one.
+`DAESolver.set_stage_limiter`'s docstring documents this correctly; this was this spec's
+error, corrected here.)
+
+Note: `rollback` is listed above and in §3's dispatch table as a component `ARKSSP`
+implements, but the shipped class defines no `rollback` method. `libpetsc4py`'s
+`TSRollBack_Python` returns `UNSUPPORTED` in that case — a clean PETSc error, not a
+hazard — so this is a documented-vs-shipped gap rather than a defect to fix.
 
 **Reaching the instance.** PETSc constructs `ARKSSP` itself from the `-ts_python_type`
 string, so the caller has no reference to it. `DAESolver.set_stage_limiter(fn)` therefore

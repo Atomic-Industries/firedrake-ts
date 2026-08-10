@@ -69,13 +69,19 @@ def test_supplied_jacobian_is_not_doubled():
 
     ``DAEProblem.__init__`` documents ``J`` as the *complete* Jacobian
     ``sigma*dF/du_t + dF/du`` (see its ``:param J:`` docstring). A prior bug
-    re-added ``shift*dF/du_t`` unconditionally even when ``J`` was supplied,
-    so a caller-provided ``J = 3*M + K`` was silently assembled as
-    ``6*M + K`` instead. ``_TSContext.split()`` always supplies a ``J`` for
-    its per-field sub-problems, so this doubled the mass block of every
-    fieldsplit sub-block Jacobian -- with no exception and no visible
-    failure, just a preconditioner built from the wrong matrix. Regressing
-    this fix would reintroduce that silent doubling.
+    re-added ``shift*dF/du_t`` unconditionally even when ``J`` was supplied.
+    Note this does NOT produce a doubled ``6*M + K`` from a supplied
+    ``J = 3*M + K``: the stray term the old code added was
+    ``supplied.shift * M``, where ``supplied.shift`` is a *fresh*, unassigned
+    ``Constant(1.0)`` on the second ``DAEProblem`` below -- a different
+    ``Constant`` from ``reference.shift`` (set to 3.0 to bake ``3*M + K``
+    into ``reference.J`` in the first place). Reverting the fix on this
+    exact test reproduces ``4*M + K``, not ``6*M + K``. ``_TSContext.split()``
+    always supplies a ``J`` for its per-field sub-problems, so this
+    corrupted the mass block of every fieldsplit sub-block Jacobian -- with
+    no exception and no visible failure, just a preconditioner built from
+    the wrong matrix. Regressing this fix would reintroduce that silent
+    corruption.
     """
     mesh = UnitIntervalMesh(8)
     V = FunctionSpace(mesh, "P", 1)
@@ -98,8 +104,9 @@ def test_supplied_jacobian_is_not_doubled():
     supplied = firedrake_ts.DAEProblem(F, u, udot, (0.0, 1.0), J=reference.J)
 
     expected = assemble(3.0 * mass + stiffness).petscmat
-    doubled = assemble(6.0 * mass + stiffness).petscmat
     actual = assemble(supplied.J).petscmat
 
+    # THE assertion: a supplied J must survive unmodified. Discriminating on
+    # its own -- the pre-fix code gave 4*M + K here, not 3*M + K -- so no
+    # second assertion against an (inaccurate) doubled value is needed.
     assert (actual - expected).norm() < 1e-10
-    assert (actual - doubled).norm() > 0.1

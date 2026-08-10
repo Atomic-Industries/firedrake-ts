@@ -148,7 +148,21 @@ class ARKSSP:
         )
 
     def set_stage_limiter(self, limiter):
-        """Register a callable fired on each explicit substage value."""
+        """Register a callable fired on each explicit substage value.
+
+        Known limitation: the soundness guard below is all-or-nothing at
+        problem level, not per component. It refuses a limiter outright
+        when NO component is freezable, but once at least one component
+        IS freezable (``self._frozen_rows`` is not ``None``), it raises
+        nothing further -- even if the limiter's callable also modifies a
+        DIFFERENT, non-frozen component that has an implicit operator
+        acting on it. That component's implicit stage solve silently
+        reverts the limiter's change on exactly that row, reproducing the
+        original COOL-193 defect this whole stepper exists to fix, with no
+        error and no warning. Enforcing this per component would need to
+        know, for an arbitrary callable, which sub-block(s) of the stage
+        vector it actually touches -- real design work, out of scope here.
+        """
         self._limiter = limiter
         # setUp runs this same check once the tableau and frozen rows are
         # known; re-run it here too, since a caller may register a limiter
@@ -216,6 +230,11 @@ class ARKSSP:
         )
         if not fields:
             return None
+        # Taken from J's test space, matching _TSContext._rhs_projection_
+        # mass_matrix's identical idiom in solving_utils.py (see that
+        # method's comment): correct because J is derived from F when not
+        # user-supplied, but this assumes a user-supplied J shares F's
+        # test-function space.
         ises = problem.J.arguments()[0].function_space()._ises
         rows = np.concatenate([ises[i].getIndices() for i in fields])
         return rows.astype(PETSc.IntType)
@@ -389,11 +408,18 @@ class ARKSSP:
             # rejected it, so ts_max_snes_failures (DAESolver sets it to -1,
             # i.e. unlimited, at ts_solver.py:271) has no effect here -- the
             # reject loop's own cap is what actually bounds retries.
+            # Named cause of the most recent rejection, for the exhaustion
+            # message below -- there are two independent rejection sources
+            # sharing this loop (SNES divergence, and TSAdaptChoose declining
+            # a completed candidate), and once retries run out the caller
+            # needs to know which one kept firing, not just that "some"
+            # rejection happened `attempts` times.
+            last_reject_cause = None
             for _ in range(attempts):
                 self._last_h = h
                 try:
                     self._take_stages(ts, tab, self._last_x, h, s)
-                except ConvergenceError:
+                except ConvergenceError as exc:
                     # A stage's SNES diverged (_solve_stage). Reject this
                     # attempt to the adapt loop and retry with a smaller h,
                     # mirroring PETSc's own TSAdaptCheckStage (tsadapt.c
@@ -407,11 +433,8 @@ class ARKSSP:
                     # ran), so there is nothing to hand TSAdaptChoose; unlike
                     # a normal rejection this path chooses next_h itself
                     # rather than asking the adapt loop's error-based
-                    # controller for one. The enclosing `for`'s own range
-                    # already bounds how many times this can happen -- once
-                    # it's exhausted, falling out of the loop below reaches
-                    # the same DIVERGED_STEP_REJECTED this raise would
-                    # otherwise have skipped past.
+                    # controller for one.
+                    last_reject_cause = str(exc)
                     scale_solve_failed = opts.getReal(
                         "ts_adapt_scale_solve_failed", 0.25
                     )
@@ -457,10 +480,40 @@ class ARKSSP:
                 # point, and would otherwise read back the just-rejected
                 # candidate. self._last_x itself is untouched, so the retried
                 # _take_stages still predicts from the correct x^n.
+                last_reject_cause = (
+                    f"the adapt controller declined the completed step "
+                    f"(h {h:.6g} -> {next_h:.6g})"
+                )
                 self._last_x.copy(x)
                 h = next_h
                 ts.setTimeStep(h)
+            # Retries exhausted. Setting the converged reason alone is NOT
+            # enough to reach check_ts_convergence's clean ConvergenceError:
+            # PETSc's own TSStep() (ts.c) checks `ts->reason < 0` itself,
+            # right after (*ts->ops->step)(ts) returns, and -- because
+            # TSSetErrorIfStepFails defaults to true -- immediately does its
+            # own SETERRQ(PETSC_ERR_NOT_CONVERGED, "TSStep has failed due to
+            # %s", ...) in C, before returning to TSSolve(), before
+            # DAESolver.solve() ever gets to call check_ts_convergence.
+            # That SETERRQ happens outside this method's Python frame (it
+            # runs after TSStep_Python's call to step(ts) has already
+            # returned success), so it is never caught by step()'s own
+            # try/except above and self._error is never populated -- the
+            # caller then sees a raw, unwrapped PETSc.Error(91) instead of
+            # this stepper's usual clean exception. Raising here, instead of
+            # just setting the reason and returning, is what actually routes
+            # through the recorded-error path: this exception is caught by
+            # step()'s own enclosing try/except (self._error = exc; raise),
+            # surfaces to libpetsc4py as PETSC_ERR_PYTHON, and
+            # DAESolver.solve() unwraps that back to this ConvergenceError --
+            # the same mechanism test_shu_osher_error_is_unwrapped_with_the_
+            # actionable_numbers already exercises for a setUp()-time error.
             ts.setConvergedReason(PETSc.TS.ConvergedReason.DIVERGED_STEP_REJECTED)
+            raise ConvergenceError(
+                f"step rejected {attempts} time(s) in a row "
+                f"(ts_max_step_rejections); TS_DIVERGED_STEP_REJECTED. "
+                f"Last rejection: {last_reject_cause}."
+            )
         except Exception as exc:
             self._error = exc
             raise
@@ -710,6 +763,15 @@ class ARKSSP:
         xdot.scale(self._shift)
         ts.computeIJacobian(self._stage_time, x, xdot, self._shift, A, B, True)
         if self._freeze_active():
+            # zeroRows clears the row but leaves the column alone -- correct
+            # here, since other (non-frozen) rows must still see the pinned
+            # unknown's coefficient; zeroing the column too would silently
+            # change the equations those rows solve. But it does break
+            # symmetry even where the caller's un-frozen operator was
+            # symmetric, and there is no check for that: a caller running
+            # -ksp_type cg against a problem that was symmetric before this
+            # freeze applied gets an asymmetric operator with no error, just
+            # a solver that may stagnate or converge to the wrong answer.
             A.zeroRows(self._frozen_rows, diag=1.0)
             if B is not None and B.handle != A.handle:
                 B.zeroRows(self._frozen_rows, diag=1.0)

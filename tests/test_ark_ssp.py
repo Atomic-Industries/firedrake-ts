@@ -194,6 +194,102 @@ def test_esdirk_gamma5_converges_on_a_purely_implicit_problem():
         assert 3.4 < ratio < 4.6, f"observed order ratios {ratios}, expected ~4"
 
 
+def _flaky_stage_solver(ctx, n_failures):
+    """Wrap ``ctx._solve_stage`` to raise on its first ``n_failures`` calls.
+
+    A reusable technique for exercising the SNES-divergence reject path
+    without a pathological nonlinear problem (which tends to blow up
+    numerically rather than diverge cleanly, testing the wrong failure
+    mode). ``ConvergenceError`` is exactly what a real diverged SNES
+    solve raises from ``_solve_stage``, so this reproduces the same
+    exception the real path does, at a call site the test controls.
+    """
+    original = ctx._solve_stage
+    calls = [0]
+
+    def flaky(ts, tab, h, i):
+        calls[0] += 1
+        if calls[0] <= n_failures:
+            raise ConvergenceError("induced stage divergence")
+        return original(ts, tab, h, i)
+
+    return flaky, calls, original
+
+
+def _diverging_problem(max_step_rejections, dt=0.5):
+    """A trivial implicit problem, set up only to have its stage solver
+    replaced -- the equation itself never needs to be hard to solve.
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    F = inner(u_t, v) * dx + inner(u, v) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, dt))
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters=dict(
+            ARK_SSP,
+            ts_ark_ssp_type="esdirk_gamma5",
+            ts_adapt_type="none",
+            ts_time_step=dt,
+            ts_exact_final_time="matchstep",
+            ts_max_step_rejections=max_step_rejections,
+        ),
+        options_prefix="",
+    )
+    return solver
+
+
+def test_snes_divergence_is_retried_with_a_smaller_step():
+    """A transient stage-SNES divergence must shrink h and retry to
+    completion, not abort the solve.
+
+    Mirrors PETSc's TSAdaptCheckStage: h *= ts_adapt_scale_solve_failed
+    (default 0.25) on each induced failure.
+    """
+    solver = _diverging_problem(max_step_rejections=5)
+    ctx = solver.ts.getPythonContext()
+    flaky, calls, original = _flaky_stage_solver(ctx, n_failures=2)
+    ctx._solve_stage = flaky
+    dt0 = solver.ts.getTimeStep()
+    try:
+        solver.solve()
+    finally:
+        ctx._solve_stage = original
+    assert calls[0] > 2, "the flaky wrapper's later, non-raising calls never ran"
+    assert solver.ts.getTimeStep() < dt0, (
+        f"h was never shrunk by the retry: {dt0} -> {solver.ts.getTimeStep()}"
+    )
+
+
+def test_snes_divergence_exhausts_retries_and_raises_convergence_error():
+    """A persistent stage-SNES divergence must exhaust ts_max_step_rejections
+    and raise a clean ConvergenceError naming the cause -- not surface a raw
+    petsc4py.PETSc.Error, which is what PETSc's own TSStep() (ts.c) raises in
+    C, via TS_DIVERGED_STEP_REJECTED + errorifstepfailed, if step() merely
+    sets the converged reason and returns instead of raising itself.
+    """
+    solver = _diverging_problem(max_step_rejections=2)
+    ctx = solver.ts.getPythonContext()
+
+    def always_diverges(ts, tab, h, i):
+        raise ConvergenceError("induced persistent stage divergence")
+
+    original = ctx._solve_stage
+    ctx._solve_stage = always_diverges
+    try:
+        with pytest.raises(ConvergenceError, match="rejected") as excinfo:
+            solver.solve()
+    finally:
+        ctx._solve_stage = original
+    assert "induced persistent stage divergence" in str(excinfo.value), (
+        "the exhaustion error must name the cause of the last rejection"
+    )
+
+
 def test_shu_osher_matches_butcher_on_the_same_problem():
     """The Shu-Osher path and PETSc's Butcher-form TSRK must agree."""
     _, ours = _decay("ssprk2", dt=1e-3)
@@ -435,3 +531,43 @@ def test_limiter_on_an_implicit_component_is_rejected():
     solver.ts.getPythonContext().set_stage_limiter(lambda vec: None)
     with pytest.raises(ValueError, match="implicit operator"):
         solver.solve()
+
+
+def test_limiter_registered_after_setup_is_still_rejected():
+    """The soundness guard must re-fire for a limiter registered late.
+
+    set_stage_limiter re-runs _check_limiter_soundness itself (guarded on
+    self._tab already being set) specifically so a limiter registered
+    AFTER setUp has already run cannot silently bypass the check that
+    fires from setUp's own call to it. Every other limiter-rejection test
+    registers the limiter BEFORE the first solve() -- i.e. before setUp
+    has run at all -- so none of them exercises this second call site;
+    without a dedicated test, that guard could be deleted with nothing
+    failing.
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    F = inner(u_t, v) * dx + inner(grad(u), grad(v)) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 0.02), G=-inner(u, v) * dx)
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters=dict(
+            ARK_SSP,
+            ts_ark_ssp_type="esdirk_gamma5",
+            ts_adapt_type="none",
+            ts_time_step=0.01,
+            ts_exact_final_time="stepover",
+        ),
+        options_prefix="",
+    )
+    # No limiter yet: setUp must complete cleanly.
+    solver.solve()
+    ctx = solver.ts.getPythonContext()
+    assert ctx._tab is not None, "setUp never ran; the post-setUp guard never fires"
+    assert ctx._frozen_rows is None, "a freezable row was found; expected none here"
+    with pytest.raises(ValueError, match="implicit operator"):
+        ctx.set_stage_limiter(lambda vec: None)
