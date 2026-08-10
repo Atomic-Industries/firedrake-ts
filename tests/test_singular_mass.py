@@ -334,12 +334,33 @@ def _rung2(stepper, dt=1e-3, tmax=1.0):
     return y_val, float(w.sub(1).dat.data_ro[0]), abs(y_val - np.exp(-tmax))
 
 
-@pytest.mark.parametrize("stepper", [ARKIMEX, ARK_SSP_G5], ids=["arkimex", "arkssp"])
-def test_rung2_constraint_defect_is_at_machine_precision(stepper):
-    """Stiff accuracy makes the completion the last stage, so y satisfies
-    the constraint exactly rather than to O(h^p)."""
-    _, _, defect = _rung2(stepper, dt=1e-2)
-    assert defect < 1e-10, f"constraint defect {defect:.3e}, expected ~1e-16"
+def test_stiff_accuracy_is_what_buys_the_constraint_defect():
+    """R3 -- b == A[s-1,:] and bt == At[s-1,:] -- makes the completion the
+    last stage value, so the constraint holds to machine precision instead
+    of to O(h^p).
+
+    Asserted as a CONTRAST, not as a uniform bound, because no tableau
+    PETSc ships satisfies R3: its b = NULL default collapses the explicit b
+    onto the implicit bt, so the explicit forcing never collapses to the
+    last stage. Demanding machine precision from a built-in would be asking
+    for something the tableau cannot deliver. The gap between the two is the
+    measurable value of R3, and the reason this project registers its own
+    tableau rather than using a shipped one.
+
+    Measured at dt = 1e-2: esdirk_gamma5 at machine precision, PETSc's 2c
+    at 7.7e-06 -- about ten orders of magnitude apart.
+    """
+    _, _, stiffly_accurate = _rung2(ARK_SSP_G5, dt=1e-2)
+    _, _, shipped = _rung2(ARKIMEX, dt=1e-2)
+    assert stiffly_accurate < 1e-10, (
+        f"stiffly accurate tableau gave defect {stiffly_accurate:.3e}, "
+        "expected machine precision -- R3 is not being exploited"
+    )
+    assert shipped > 1e3 * stiffly_accurate, (
+        f"the shipped non-stiffly-accurate tableau gave defect {shipped:.3e} "
+        f"against {stiffly_accurate:.3e} -- the contrast R3 is supposed to "
+        "produce has vanished, so this test no longer demonstrates anything"
+    )
 
 
 def _rung3(stepper, dt=2e-3, tmax=0.1, n=8):
