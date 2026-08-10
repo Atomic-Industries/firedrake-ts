@@ -2353,27 +2353,6 @@ failure localises to the stepper rather than the projection."
 
 Create `tests/test_bounds.py`:
 
-```python
-"""The boundedness result that motivates COOL-193.
-
-DG1 square-wave advection with a Zhang-Shu scaling limiter on every explicit
-substage must hold 0 <= f <= 1 to machine precision. The reference
-Butcher-form implementation gives -0.0099 / +1.0100, so the negative control
-below must FAIL to bound -- otherwise this problem is not challenging and the
-test proves nothing.
-"""
-
-import numpy as np
-import pytest
-from firedrake import *
-
-import firedrake_ts
-
-N = 40
-CFL = 0.064
-VELOCITY = 1.0
-
-
 > **Two things here are load-bearing, and getting either wrong silently manufactures a
 > passing test.**
 >
@@ -2397,6 +2376,27 @@ VELOCITY = 1.0
 > means underneath are out of range. That is a post-step clamp in per-stage clothing —
 > precisely what this design claims to be unnecessary. Scale about the *true* mean; if it
 > is out of range the limiter cannot help, and the test should say so.
+
+```python
+"""The boundedness result that motivates COOL-193.
+
+DG1 square-wave advection with a Zhang-Shu scaling limiter on every explicit
+substage must hold 0 <= f <= 1 to machine precision. The reference
+Butcher-form implementation gives -0.0099 / +1.0100, so the negative control
+below must FAIL to bound -- otherwise this problem is not challenging and the
+test proves nothing.
+"""
+
+import numpy as np
+import pytest
+from firedrake import *
+
+import firedrake_ts
+
+N = 40
+CFL = 0.064
+VELOCITY = 1.0
+
 
 def _zhang_shu(V, V0):
     """Scale each cell about its mean so the cell lies in [0, 1].
