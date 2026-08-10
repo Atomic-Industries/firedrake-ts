@@ -46,6 +46,41 @@ def test_stepper_is_selectable_and_sets_up():
     assert ctx.setup_calls == 1
 
 
+def test_setup_rerun_destroys_the_stale_stage0_mass_ksp():
+    """setUp may run more than once against the same stepper instance (a TS
+    may be re-set-up, e.g. after an option change); the previous stage-0
+    mass ``KSP`` -- built fresh each call by _setup_stage0_mass_solve -- must
+    be destroyed rather than leaked.
+
+    A destroyed ``PETSc.KSP``'s handle reads back as 0; calling any method
+    on it beyond that would itself be unsafe (a destroyed PETSc object's
+    methods are not guaranteed to fail cleanly), so this checks the handle
+    only, not further behaviour of the stale object.
+    """
+    from firedrake import dmhooks
+
+    solver, _ = _decay("esdirk_gamma5", dt=0.1)
+    ctx = solver.ts.getPythonContext()
+    old_ksp = ctx._mass_ksp
+    assert old_ksp is not None
+    assert old_ksp.handle != 0
+
+    # setUp reads dmhooks.get_appctx(ts.getDM()) (via _setup_stage0_mass_solve
+    # -> _find_frozen_rows), which only resolves inside the same add_hooks
+    # context DAESolver itself opens around every real setUp()/solve() --
+    # see ts_solver.py's __init__ and solve(). Without it this raises
+    # AttributeError on a None appctx rather than exercising the KSP-reuse
+    # path this test targets.
+    dm = solver.ts.getDM()
+    with dmhooks.add_hooks(dm, solver, appctx=solver._ctx):
+        ctx.setUp(solver.ts)
+
+    assert old_ksp.handle == 0, "the previous stage-0 mass KSP was leaked"
+    assert ctx._mass_ksp is not None
+    assert ctx._mass_ksp.handle != 0
+    assert ctx._mass_ksp is not old_ksp
+
+
 def test_imex_euler_advances_and_converges():
     """The explicit part must reach the state, and the answer must be right."""
     _, value = _decay("imex_euler", dt=1e-3)
@@ -194,6 +229,129 @@ def test_esdirk_gamma5_converges_on_a_purely_implicit_problem():
         assert 3.4 < ratio < 4.6, f"observed order ratios {ratios}, expected ~4"
 
 
+def _constant_source(dt, tmax=1.0):
+    """Integrate u' = 1 (u(0) = 0) with the source written INSIDE F, G = None.
+
+    dF/du is structurally zero everywhere here (F has no dependence on u at
+    all), but F(t, y, 0) = -1 != 0 -- the state-independent Constant(1.0)
+    term makes it so. A guard that skips the stage-0 mass solve whenever
+    dF/du is zero (mistaking that for "F does not depend on the state, so
+    Ydot_0 = 0 exactly") gets this wrong: Ydot_0 is stuck at 0, and the step
+    is flat in dt at u(1) = bt[0] = 39/125 = 0.312 instead of converging to
+    the exact answer, 1.0.
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(0.0)
+    F = inner(u_t, v) * dx - inner(Constant(1.0), v) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, tmax))
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters={
+            "ts_type": "python",
+            "ts_python_type": PYTHON_STEPPER,
+            "ts_ark_ssp_type": "esdirk_gamma5",
+            "ts_adapt_type": "none",
+            "ts_time_step": dt,
+            "ts_exact_final_time": "matchstep",
+        },
+        options_prefix="",
+    )
+    solver.solve()
+    return float(u.dat.data_ro[0])
+
+
+def test_esdirk_gamma5_converges_on_a_constant_source():
+    """A constant-in-time source in F, with G = None, must not reproduce
+    the Ydot_0-never-computed defect.
+
+    Regression test for a guard that conflated "dF/du is structurally
+    zero" with "Ydot_0 = 0 exactly": those are NOT the same condition.
+    dF/du == 0 says nothing about F(t, y, 0), and a state-independent
+    source term (Constant(1.0) here) makes F(t, y, 0) nonzero while
+    dF/du stays zero. See test_esdirk_gamma5_converges_on_a_purely_implicit_
+    problem for the general (state-dependent) case this guard already
+    covered.
+
+    u' = 1 is checked against near-machine-precision closeness to 1.0,
+    NOT an order-2 ratio: any consistent (order >= 1) Runge-Kutta method
+    reproduces a constant-coefficient ODE exactly (its local truncation
+    error involves derivatives of u beyond the first, all zero for a
+    linear exact solution), so halving dt does not systematically shrink
+    an already-zero truncation error -- the residual left is solver-
+    tolerance noise, not the O(h^2) shrinking
+    test_esdirk_gamma5_converges_on_a_nonpolynomial_source below checks.
+    Before the fix, by contrast, the error is flat at 0.312, not
+    noise-small: that gap is exactly what distinguishes "fixed" from
+    "broken" here.
+    """
+    for dt in (0.1, 0.05, 0.025, 0.0125):
+        value = _constant_source(dt)
+        assert abs(value - 1.0) < 1e-8, (
+            f"u(1) = {value} at dt={dt}, expected ~1.0 to near machine "
+            "precision (u' = const is exact for any consistent RK method)"
+        )
+
+
+def _nonpolynomial_source(dt, tmax=1.0):
+    """Integrate u' = exp(-t) (u(0) = 0) with the source INSIDE F, G = None.
+
+    Same defect class as _constant_source (dF/du structurally zero,
+    F(t, y, 0) != 0), but with a source that is NOT a polynomial in t --
+    unlike u' = 1, no finite-order quadrature reproduces exp(-t) exactly, so
+    a real, measurable O(h^2) local truncation error survives and halving
+    dt should quarter it, giving actual evidence of design-order
+    convergence rather than the exact-to-round-off answer _constant_source
+    gets for a strictly polynomial right-hand side.
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(0.0)
+    time = Constant(0.0)
+    F = inner(u_t, v) * dx - inner(exp(-time), v) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, tmax), time=time)
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters={
+            "ts_type": "python",
+            "ts_python_type": PYTHON_STEPPER,
+            "ts_ark_ssp_type": "esdirk_gamma5",
+            "ts_adapt_type": "none",
+            "ts_time_step": dt,
+            "ts_exact_final_time": "matchstep",
+        },
+        options_prefix="",
+    )
+    solver.solve()
+    return float(u.dat.data_ro[0])
+
+
+def test_esdirk_gamma5_converges_on_a_nonpolynomial_source():
+    """A non-polynomial, purely time-dependent source in F, with G = None,
+    must converge to the exact answer at design order.
+
+    Same guard defect as test_esdirk_gamma5_converges_on_a_constant_source,
+    but exp(-t) in place of Constant(1.0) leaves a real O(h^2) truncation
+    error to measure, so this is the test that actually exercises "halving
+    dt quarters the error" for this defect class -- exact solution
+    u(t) = 1 - exp(-t), u(1) = 1 - exp(-1).
+    """
+    exact = 1.0 - np.exp(-1.0)
+    errors = [
+        abs(_nonpolynomial_source(dt) - exact) for dt in (0.1, 0.05, 0.025, 0.0125)
+    ]
+    assert all(e > 0.0 for e in errors)
+    ratios = [errors[i] / errors[i + 1] for i in range(len(errors) - 1)]
+    for ratio in ratios:
+        assert 3.4 < ratio < 4.6, f"observed order ratios {ratios}, expected ~4"
+
+
 def _flaky_stage_solver(ctx, n_failures):
     """Wrap ``ctx._solve_stage`` to raise on its first ``n_failures`` calls.
 
@@ -216,7 +374,7 @@ def _flaky_stage_solver(ctx, n_failures):
     return flaky, calls, original
 
 
-def _diverging_problem(max_step_rejections, dt=0.5):
+def _diverging_problem(max_step_rejections, dt=0.5, extra=None):
     """A trivial implicit problem, set up only to have its stage solver
     replaced -- the equation itself never needs to be hard to solve.
     """
@@ -228,16 +386,18 @@ def _diverging_problem(max_step_rejections, dt=0.5):
     u.assign(1.0)
     F = inner(u_t, v) * dx + inner(u, v) * dx
     problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, dt))
+    parameters = dict(
+        ARK_SSP,
+        ts_ark_ssp_type="esdirk_gamma5",
+        ts_adapt_type="none",
+        ts_time_step=dt,
+        ts_exact_final_time="matchstep",
+        ts_max_step_rejections=max_step_rejections,
+    )
+    parameters.update(extra or {})
     solver = firedrake_ts.DAESolver(
         problem,
-        solver_parameters=dict(
-            ARK_SSP,
-            ts_ark_ssp_type="esdirk_gamma5",
-            ts_adapt_type="none",
-            ts_time_step=dt,
-            ts_exact_final_time="matchstep",
-            ts_max_step_rejections=max_step_rejections,
-        ),
+        solver_parameters=parameters,
         options_prefix="",
     )
     return solver
@@ -288,6 +448,37 @@ def test_snes_divergence_exhausts_retries_and_raises_convergence_error():
     assert "induced persistent stage divergence" in str(excinfo.value), (
         "the exhaustion error must name the cause of the last rejection"
     )
+
+
+def test_snes_divergence_with_unlimited_rejections_stops_at_a_step_floor():
+    """A persistently diverging stage, with ts_max_step_rejections unlimited
+    (-1), must raise a clean ConvergenceError once h shrinks below
+    ts_adapt_dt_min -- not grind h all the way to 0.0, which would make
+    _solve_stage's self._shift = 1 / (h * tab.At[i, i]) infinite and fail in
+    a way that has nothing to do with the original divergence.
+
+    ts_adapt_dt_min is set well above PETSc's own default floor (1e-20)
+    purely so the loop hits it in a handful of *0.25 shrinks rather than
+    ~60, keeping the test fast; the mechanism being tested -- stop at the
+    floor rather than underflow to zero -- does not depend on which floor.
+    """
+    solver = _diverging_problem(max_step_rejections=-1, extra={"ts_adapt_dt_min": 1e-3})
+    ctx = solver.ts.getPythonContext()
+
+    def always_diverges(ts, tab, h, i):
+        raise ConvergenceError("induced persistent stage divergence")
+
+    original = ctx._solve_stage
+    ctx._solve_stage = always_diverges
+    try:
+        with pytest.raises(ConvergenceError, match="ts_adapt_dt_min") as excinfo:
+            solver.solve()
+    finally:
+        ctx._solve_stage = original
+    assert "induced persistent stage divergence" in str(excinfo.value), (
+        "the floor error must still name the original cause"
+    )
+    assert solver.ts.getTimeStep() > 0.0, "h must not have underflowed to 0.0"
 
 
 def test_shu_osher_matches_butcher_on_the_same_problem():

@@ -17,7 +17,7 @@ populates those counters, and petsc4py binds no setter for them. As a result
 """
 
 import numpy as np
-from firedrake import dmhooks, ufl_expr
+from firedrake import dmhooks
 from firedrake.exceptions import ConvergenceError
 from firedrake.petsc import DEFAULT_KSP_PARAMETERS, PETSc
 from petsctools import OptionsManager
@@ -28,11 +28,7 @@ from firedrake_ts._petsc_shim import (
     ts_adapt_choose,
     ts_get_adapt,
 )
-from firedrake_ts.solving_utils import (
-    explicitly_governed_fields,
-    is_zero_form,
-    resolve_fields,
-)
+from firedrake_ts.solving_utils import explicitly_governed_fields, resolve_fields
 from firedrake_ts.tableaux import TABLEAUX, kraaijevanger_radius, shu_osher
 
 __all__ = ["ARKSSP"]
@@ -67,9 +63,11 @@ class ARKSSP:
         self._Z = None  # Butcher stage offset
         self._rhs = None  # scratch for computeRHSFunction
         self._zero_xdot = None  # a permanent zero Xdot, for F(t, y_n, 0)
-        # Stage-0 mass solve for an explicit first stage: set in setUp,
-        # used once per step() by _prepare_stage0_ydot. None/False when
-        # not needed (implicit first stage, or a structurally trivial F).
+        # Stage-0 mass solve for an explicit first stage: built in setUp,
+        # used once per step() by _prepare_stage0_ydot. True/non-None only
+        # when the first stage is actually explicit (tab.At[0, 0] == 0);
+        # an implicit first stage needs neither, since _solve_stage
+        # populates Ydot[0] itself in _take_stages.
         self._stage0_needs_mass_solve = False
         self._mass_ksp = None
         self._mass_options = None
@@ -274,12 +272,23 @@ class ARKSSP:
         matrix ``M = dF/du̇`` gives ``Ẏ_0 = -M^-1 F(t^n, y^n, 0)`` -- see
         ``_prepare_stage0_ydot``, which evaluates that every ``step()``.
 
-        No solve is needed -- and none is built -- when ``dF/du`` is
-        structurally zero everywhere: then ``F`` does not depend on the
-        state at all, and ``Ẏ_0 = 0`` exactly, matching what a freshly
-        duplicated (zero) vector already gives ``self._Ydot[0]``. This is
-        NOT skipped merely because a limiter or the freeze is active --
-        those constrain what a limiter may do to a stage *value*, which is
+        Built unconditionally whenever the first stage is explicit --
+        NOT gated on whether ``dF/du`` is structurally zero. A previous
+        version skipped the solve there on the reasoning that a state-
+        independent ``F`` gives ``Ẏ_0 = 0`` "exactly"; that reasoning is
+        false. ``dF/du == 0`` says nothing about ``F(t^n, y^n, 0)`` itself
+        -- a purely time-dependent or constant forcing term (e.g.
+        ``F = inner(u_t, v)*dx - inner(Constant(1.0), v)*dx``, i.e.
+        ``u̇ = 1``) has zero ``dF/du`` but nonzero ``F(t, y, 0)``, and
+        skipping the solve there silently reproduces the exact defect this
+        stage-0 handling exists to fix: ``Ẏ_0`` stuck at zero, giving a
+        step that is flat in ``dt`` rather than converging. For a genuinely
+        mass-only ``F`` (no source term at all), ``F(t^n, y^n, 0)`` really
+        is zero, so this solve just returns zero at the cost of one extra
+        ``IFunction`` evaluation and one mass solve per step -- cheap
+        insurance against silently dropping a source term. This is NOT
+        skipped merely because a limiter or the freeze is active -- those
+        constrain what a limiter may do to a stage *value*, which is
         orthogonal to whether an explicit first stage's derivative needs
         solving for at all.
 
@@ -301,20 +310,22 @@ class ARKSSP:
         property is safe to call even when ``G`` is ``None`` (it is not
         gated on ``G`` -- only ``_rhs_projection_solver`` is, which is why
         this method builds its own ``KSP`` instead of reusing that one).
+
+        ``setUp`` may run more than once against the same stepper instance
+        (a TS may be re-set-up after options change); destroy the previous
+        ``KSP`` first rather than leaking it -- ``PETSc.KSP`` objects hold
+        onto PETSc-side resources that Python's own garbage collector does
+        not reliably reclaim promptly.
         """
+        if self._mass_ksp is not None:
+            self._mass_ksp.destroy()
+            self._mass_ksp = None
         tab = self._tab
         if tab.At[0, 0] > 0.0:
             self._stage0_needs_mass_solve = False
-            self._mass_ksp = None
             return
+        self._stage0_needs_mass_solve = True
         ctx = dmhooks.get_appctx(ts.getDM())
-        problem = ctx._problem
-        self._stage0_needs_mass_solve = not is_zero_form(
-            ufl_expr.derivative(problem.F, problem.u_restrict)
-        )
-        if not self._stage0_needs_mass_solve:
-            self._mass_ksp = None
-            return
         mass = ctx._rhs_projection_mass_matrix
         ksp = PETSc.KSP().create(comm=mass.comm)
         ksp.setOperators(mass.petscmat)
@@ -339,9 +350,9 @@ class ARKSSP:
         """
         if self._tab.At[0, 0] > 0.0:
             return  # _solve_stage populates _Ydot[0] normally, in _take_stages.
-        if not self._stage0_needs_mass_solve:
-            self._Ydot[0].set(0.0)
-            return
+        # _setup_stage0_mass_solve builds this KSP unconditionally whenever
+        # the first stage is explicit -- see that method's docstring for
+        # why skipping it based on dF/du alone is unsound.
         ts.computeIFunction(t, x, self._zero_xdot, self._rhs, True)
         with self._mass_options.inserted_options():
             self._mass_ksp.solve(self._rhs, self._Ydot[0])
@@ -447,6 +458,29 @@ class ARKSSP:
                     # does not silently fall outside that guarantee.
                     self._last_x.copy(x)
                     h *= scale_solve_failed
+                    # With ts_max_step_rejections unlimited (attempts ==
+                    # 1 << 30) and a persistently diverging stage, this
+                    # loop would otherwise shrink h by scale_solve_failed
+                    # every attempt until it underflows to exactly 0.0 --
+                    # at which point _solve_stage's self._shift =
+                    # 1 / (h * tab.At[i, i]) is infinite, and the next
+                    # stage solve fails in a way that has nothing to do
+                    # with the original divergence. dt_min matches
+                    # PETSc's own TSAdapt default floor (tsadapt.c:1155,
+                    # adapt->dt_min = 1e-20) when ts_adapt_dt_min is not
+                    # set, so a caller who already relies on that PETSc
+                    # default for a real TSADAPT gets the same floor here.
+                    dt_min = opts.getReal("ts_adapt_dt_min", 1e-20)
+                    if h < dt_min:
+                        ts.setConvergedReason(
+                            PETSc.TS.ConvergedReason.DIVERGED_STEP_REJECTED
+                        )
+                        raise ConvergenceError(
+                            f"stage solve diverged and the retry step h "
+                            f"shrank below ts_adapt_dt_min ({h:.3g} < "
+                            f"{dt_min:.3g}); TS_DIVERGED_STEP_REJECTED. "
+                            f"Last rejection: {last_reject_cause}."
+                        ) from exc
                     ts.setTimeStep(h)
                     continue
                 # TSAdaptChoose reads ts->vec_sol as the completed, order-p
