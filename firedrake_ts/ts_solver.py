@@ -351,6 +351,29 @@ class DAESolver(OptionsManager):
         ctx._nullspace_T = nullspace_T
         ctx._near_nullspace = near_nullspace
 
+    def set_stage_limiter(self, limiter):
+        r"""Register a limiter fired on each explicit substage value.
+
+        PETSc constructs the stepper itself from ``-ts_python_type``, so the
+        caller never holds a reference to it; this forwards to that instance.
+
+        :arg limiter: a callable taking the stage-value ``Vec`` and modifying
+            it in place. It is called before anything consumes the value.
+        """
+        if self.ts.getType() != PETSc.TS.Type.PYTHON:
+            raise ValueError(
+                f"a stage limiter requires ts_type 'python' with "
+                f"ts_python_type set to a Shu-Osher stepper; this TS is "
+                f"'{self.ts.getType()}', whose stage values are not "
+                f"available in a form a limiter can soundly act on"
+            )
+        context = self.ts.getPythonContext()
+        if not hasattr(context, "set_stage_limiter"):
+            raise ValueError(
+                f"{type(context).__name__} does not support stage limiters"
+            )
+        context.set_stage_limiter(limiter)
+
     def set_transfer_manager(self, manager):
         r"""Set the object that manages transfer between grid levels.
         Typically a :class:`~.TransferManager` object.

@@ -159,14 +159,28 @@ class ARKSSP:
         Those rows' stage equation reduces to Y_i = Z_i, so their value comes
         entirely from the explicit Shu-Osher recursion. Pinning them during
         the implicit solve is what stops the solve from undoing the limiter.
+
+        A non-mixed space is one field (``nfields = 1``), not a structural
+        exemption: ``explicitly_governed_fields`` answers correctly for it
+        too (e.g. a scalar DG field advanced purely through G, whose F is a
+        bare mass form with no dependence on the state at all -- exactly the
+        DG1 bounds test in ``tests/test_bounds.py``). Detection is therefore
+        unconditional and structural. Whether the freeze actually PINS
+        anything during a solve is a separate question, gated in the
+        application sites (``_apply_freeze_residual``, ``formSNESJacobian``,
+        ``_solve_stage``) on a limiter being registered: with no limiter
+        there is nothing for the implicit solve to undo, and for a
+        single-field problem freezing every row would make the stage solve
+        self-referentially trivial (zero Newton iterations) even though the
+        real linear mass-matrix solve is doing legitimate work -- see
+        ``test_stage_solves_do_work``.
         """
         ctx = dmhooks.get_appctx(ts.getDM())
         problem = ctx._problem
         V = problem.u_restrict.function_space()
-        if len(V) <= 1:
-            return None
+        nfields = len(V) if len(V) > 1 else 1
         detected = explicitly_governed_fields(
-            problem.F, problem.u_restrict, ctx._xdot, len(V)
+            problem.F, problem.u_restrict, ctx._xdot, nfields
         )
         fields = resolve_fields(
             "ts_explicitly_governed_fields", ts.getOptionsPrefix(), detected
@@ -177,9 +191,23 @@ class ARKSSP:
         rows = np.concatenate([ises[i].getIndices() for i in fields])
         return rows.astype(PETSc.IntType)
 
+    def _freeze_active(self):
+        """Whether the freeze should actually pin rows this solve.
+
+        Detection in ``_find_frozen_rows`` is unconditional and structural;
+        application is gated on a limiter being registered, since freezing
+        exists only to protect a limiter's correction from the implicit
+        solve. Applying it with no limiter would be harmless where some
+        other field remains for SNES to solve, but for a single, wholly
+        explicitly-governed field it would make the stage solve trivial
+        (see ``_find_frozen_rows``'s docstring), silently changing behaviour
+        no limiter asked for.
+        """
+        return self._frozen_rows is not None and self._limiter is not None
+
     def _apply_freeze_residual(self, x, f):
         """Replace frozen rows of the residual with ``x - Y_i``."""
-        if self._frozen_rows is None:
+        if not self._freeze_active():
             return
         target = self._Y[self._stage]
         xa = x.getArray(readonly=True)
@@ -264,7 +292,8 @@ class ARKSSP:
         # (or x^n), which would otherwise silently discard the predictor's
         # -- and any limiter's -- value on exactly the rows the freeze
         # exists to protect.
-        if self._frozen_rows is not None:
+        freeze = self._freeze_active()
+        if freeze:
             lo, _ = self._Y[i].getOwnershipRange()
             local = self._frozen_rows - lo
             frozen_values = self._Y[i].getArray(readonly=True)[local].copy()
@@ -278,7 +307,7 @@ class ARKSSP:
             self._Y[i - 1].copy(self._Y[i])
         else:
             ts.getSolution().copy(self._Y[i])
-        if self._frozen_rows is not None:
+        if freeze:
             self._Y[i].getArray()[local] = frozen_values
         snes.solve(None, self._Y[i])
         # The residual on frozen rows is self-referential (x - Y_i, the same
@@ -293,7 +322,7 @@ class ARKSSP:
         # nothing raising, since SNES's own convergence test also sees a
         # zero residual there by construction. Restoring the snapshot here,
         # unconditionally, is what actually holds the pin.
-        if self._frozen_rows is not None:
+        if freeze:
             self._Y[i].getArray()[local] = frozen_values
         reason = snes.getConvergedReason()
         if reason < 0:
@@ -304,7 +333,7 @@ class ARKSSP:
         self._Y[i].copy(self._Ydot[i])
         self._Ydot[i].axpy(-1.0, self._Z)
         self._Ydot[i].scale(self._shift)
-        if self._frozen_rows is not None:
+        if freeze:
             # A frozen row's implicit function is M_k Ydot_k alone (that is
             # what explicitly_governed_fields certifies), so its stage
             # equation is M_k Ydot_k = 0 and the correct derivative is
@@ -382,7 +411,7 @@ class ARKSSP:
         xdot.axpy(-1.0, self._Z)
         xdot.scale(self._shift)
         ts.computeIJacobian(self._stage_time, x, xdot, self._shift, A, B, True)
-        if self._frozen_rows is not None:
+        if self._freeze_active():
             A.zeroRows(self._frozen_rows, diag=1.0)
             if B is not None and B.handle != A.handle:
                 B.zeroRows(self._frozen_rows, diag=1.0)
