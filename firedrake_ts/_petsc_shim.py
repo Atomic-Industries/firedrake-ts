@@ -70,6 +70,15 @@ def _load():
         ctypes.c_int,  # inuse (PetscBool)
     ]
     lib.TSAdaptCandidateAdd.restype = ctypes.c_int
+    # SIX arguments, not nine. Verified against the installed headers:
+    #   petscts.h:1150
+    #   TSAdaptChoose(TSAdapt, TS, PetscReal, PetscInt*, PetscReal*, PetscBool*)
+    # An earlier draft of this shim declared trailing wlte/wltea/wlter output
+    # pointers. They do not exist: the real function never writes them, so
+    # they read back as ctypes' zero-initialised default and look like a
+    # converged error estimate. That did not crash only because the x86-64
+    # SysV ABI ignores unread trailing arguments -- an accident, not a
+    # guarantee.
     lib.TSAdaptChoose.argtypes = [
         ctypes.c_void_p,  # TSAdapt
         ctypes.c_void_p,  # TS
@@ -77,9 +86,6 @@ def _load():
         ctypes.POINTER(ctypes.c_int),  # next_sc
         ctypes.POINTER(ctypes.c_double),  # next_h
         ctypes.POINTER(ctypes.c_int),  # accept (PetscBool)
-        ctypes.POINTER(ctypes.c_double),  # wlte
-        ctypes.POINTER(ctypes.c_double),  # wltea
-        ctypes.POINTER(ctypes.c_double),  # wlter
     ]
     lib.TSAdaptChoose.restype = ctypes.c_int
     _lib = lib
@@ -118,13 +124,10 @@ def ts_adapt_candidate_add(adapt, name, order, stage_order, ccfl, cost, inuse):
 
 
 def ts_adapt_choose(adapt, ts, h):
-    """Returns ``(next_scheme, next_h, accept, wlte, wltea, wlter)``."""
+    """Returns ``(next_scheme, next_h, accept)``."""
     next_sc = ctypes.c_int()
     next_h = ctypes.c_double()
     accept = ctypes.c_int()
-    wlte = ctypes.c_double()
-    wltea = ctypes.c_double()
-    wlter = ctypes.c_double()
     _check(
         _load().TSAdaptChoose(
             adapt,
@@ -133,9 +136,6 @@ def ts_adapt_choose(adapt, ts, h):
             ctypes.byref(next_sc),
             ctypes.byref(next_h),
             ctypes.byref(accept),
-            ctypes.byref(wlte),
-            ctypes.byref(wltea),
-            ctypes.byref(wlter),
         ),
         "TSAdaptChoose",
     )
@@ -143,7 +143,4 @@ def ts_adapt_choose(adapt, ts, h):
         next_sc.value,
         next_h.value,
         bool(accept.value),
-        wlte.value,
-        wltea.value,
-        wlter.value,
     )
