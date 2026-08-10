@@ -2822,6 +2822,14 @@ def _load():
         ctypes.c_int,         # inuse (PetscBool)
     ]
     lib.TSAdaptCandidateAdd.restype = ctypes.c_int
+    # SIX arguments, not nine. Verified against the installed headers:
+    #   petscts.h:1150
+    #   TSAdaptChoose(TSAdapt, TS, PetscReal, PetscInt*, PetscReal*, PetscBool*)
+    # An earlier draft of this plan declared trailing wlte/wltea/wlter output
+    # pointers. They do not exist: the real function never writes them, so they
+    # read back as ctypes' zero-initialised default and look like a converged
+    # error estimate. That did not crash only because the x86-64 SysV ABI
+    # ignores unread trailing arguments -- an accident, not a guarantee.
     lib.TSAdaptChoose.argtypes = [
         ctypes.c_void_p,                  # TSAdapt
         ctypes.c_void_p,                  # TS
@@ -2829,9 +2837,6 @@ def _load():
         ctypes.POINTER(ctypes.c_int),     # next_sc
         ctypes.POINTER(ctypes.c_double),  # next_h
         ctypes.POINTER(ctypes.c_int),     # accept (PetscBool)
-        ctypes.POINTER(ctypes.c_double),  # wlte
-        ctypes.POINTER(ctypes.c_double),  # wltea
-        ctypes.POINTER(ctypes.c_double),  # wlter
     ]
     lib.TSAdaptChoose.restype = ctypes.c_int
     _lib = lib
@@ -2872,7 +2877,7 @@ def ts_adapt_candidate_add(
 
 
 def ts_adapt_choose(adapt, ts, h):
-    """Returns ``(next_scheme, next_h, accept, wlte, wltea, wlter)``."""
+    """Returns ``(next_scheme, next_h, accept)``."""
     next_sc = ctypes.c_int()
     next_h = ctypes.c_double()
     accept = ctypes.c_int()
@@ -2957,10 +2962,21 @@ Then wrap the stage loop in the reject/adapt loop. Replace the body of `step` af
 
 ```python
         # petsc4py binds setMaxStepRejections but NOT a getter, so read the
-        # option directly. PETSc's own default for ts->max_reject is 10.
-        max_reject = PETSc.Options(ts.getOptionsPrefix() or "").getInt(
-            "ts_max_reject", 10
+        # option directly. Two traps, both verified against the installed PETSc:
+        #   * ts.c:133 does PetscOptionsDeprecated("-ts_max_reject",
+        #     "-ts_max_step_rejections", "3.25", NULL), which REMOVES the old
+        #     key from the database during TSSetFromOptions -- long before this
+        #     runs. Reading "ts_max_reject" therefore always returns the
+        #     default, silently ignoring both spellings. Read the new name,
+        #     keeping the old one only as a legacy fallback.
+        #   * PETSc's "no bound" sentinel is PETSC_UNLIMITED == -3
+        #     (petscsys.h:367), not -1. Treated naively, max(1, n + 1) turns a
+        #     request for unlimited retries into exactly one attempt.
+        opts = PETSc.Options(ts.getOptionsPrefix() or "")
+        max_reject = opts.getInt(
+            "ts_max_step_rejections", opts.getInt("ts_max_reject", 10)
         )
+        attempts = 1 << 30 if max_reject < 0 else max(1, max_reject + 1)
 > **The adapt loop must hand `TSAdaptChoose` the COMPLETED step, not the pre-step state.**
 > `TSADAPTBASIC` forms its error estimate by comparing `ts->vec_sol` against the
 > lower-order solution `evaluatestep` returns. If `vec_sol` still holds the value from the
@@ -2972,7 +2988,7 @@ Then wrap the stage loop in the reject/adapt loop. Replace the body of `step` af
 > `TSStep_ARKIMEX`. Also note `evaluatestep` must `return True`; petsc4py raises otherwise.
 
         adapt = ts_get_adapt(ts)
-        for _ in range(max(1, max_reject + 1)):
+        for _ in range(attempts):
             self._take_stages(ts, tab, self._last_x, h, s)
             ts_adapt_candidates_clear(adapt)
             ts_adapt_candidate_add(
