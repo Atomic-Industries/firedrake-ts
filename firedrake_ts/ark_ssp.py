@@ -45,7 +45,6 @@ class ARKSSP:
         self.tableau_name = "esdirk_gamma5"
         self.radius = None
         self.setup_calls = 0
-        self.step_calls = 0
         # The exception raised by the most recent setUp/step call, if any.
         # DAESolver.solve reads this to recover the original exception:
         # PETSc's own error handler prints diagnostics as the error unwinds
@@ -345,14 +344,12 @@ class ARKSSP:
         # previous setUp/step must never be re-raised against this one.
         self._error = None
         try:
-            self.step_calls += 1
             tab = self._tab
             t = ts.getTime()
             h = ts.getTimeStep()
             x = ts.getSolution()
             s = len(tab.b)
 
-            self._last_h = h
             x.copy(self._last_x)
             # Once per step(), not once per retry: see _prepare_stage0_ydot's
             # docstring -- it depends only on (t^n, y^n), fixed for every
@@ -380,9 +377,55 @@ class ARKSSP:
             )
             attempts = 1 << 30 if max_reject < 0 else max(1, max_reject + 1)
             adapt = ts_get_adapt(ts)
+            # Both kinds of rejection -- LTE-based (TSAdaptChoose declines
+            # the completed candidate) and SNES-divergence-based (caught
+            # below) -- share this one counter and its ts_max_step_rejections
+            # cap. PETSc's own arkimex.c tracks stage-solve failures
+            # separately against ts_max_snes_failures (TSAdaptCheckStage,
+            # tsadapt.c), stopping with TS_DIVERGED_NONLINEAR_SOLVE once that
+            # second cap is hit even if step rejections are unlimited. This
+            # stepper does not reproduce that second counter: a single
+            # attempts budget governs every retry regardless of which check
+            # rejected it, so ts_max_snes_failures (DAESolver sets it to -1,
+            # i.e. unlimited, at ts_solver.py:271) has no effect here -- the
+            # reject loop's own cap is what actually bounds retries.
             for _ in range(attempts):
                 self._last_h = h
-                self._take_stages(ts, tab, self._last_x, h, s)
+                try:
+                    self._take_stages(ts, tab, self._last_x, h, s)
+                except ConvergenceError:
+                    # A stage's SNES diverged (_solve_stage). Reject this
+                    # attempt to the adapt loop and retry with a smaller h,
+                    # mirroring PETSc's own TSAdaptCheckStage (tsadapt.c
+                    # reject_stage: dt *= adapt->scale_solve_failed, default
+                    # 0.25) -- called from arkimex.c's own stage loop right
+                    # after SNESSolve, at arkimex.c:1474-1479, before falling
+                    # to reject_step. TSAdaptGetScaleSolveFailed has no
+                    # petsc4py binding, so read the option directly, exactly
+                    # as ts_max_step_rejections is read above. No completed
+                    # candidate exists yet at this point (not every stage
+                    # ran), so there is nothing to hand TSAdaptChoose; unlike
+                    # a normal rejection this path chooses next_h itself
+                    # rather than asking the adapt loop's error-based
+                    # controller for one. The enclosing `for`'s own range
+                    # already bounds how many times this can happen -- once
+                    # it's exhausted, falling out of the loop below reaches
+                    # the same DIVERGED_STEP_REJECTED this raise would
+                    # otherwise have skipped past.
+                    scale_solve_failed = opts.getReal(
+                        "ts_adapt_scale_solve_failed", 0.25
+                    )
+                    # x (ts->vec_sol) is never written by _take_stages --
+                    # only self._Y/_L/_Ydot are -- so this copy is a no-op
+                    # today. Restoring it anyway keeps this path visibly
+                    # symmetric with the completion-through-choose block's
+                    # own restore-on-rejection/restore-on-exception below,
+                    # so a future change to _take_stages that DOES touch x
+                    # does not silently fall outside that guarantee.
+                    self._last_x.copy(x)
+                    h *= scale_solve_failed
+                    ts.setTimeStep(h)
+                    continue
                 # TSAdaptChoose reads ts->vec_sol as the completed, order-p
                 # solution (TSErrorWeightedNorm's own docstring: "usually
                 # ts->vec_sol"; PETSc's own TSStep_ARKIMEX writes the
@@ -546,6 +589,14 @@ class ARKSSP:
         # implicit form has no dependence on the state (as in this task's
         # decay shakedown), so SNES would report zero iterations even with
         # the callbacks wired correctly.
+        #
+        # The i == 0 branch is unreachable for every tableau in TABLEAUX
+        # today: this method only runs when tab.At[i, i] > 0.0 (_take_stages'
+        # own guard), and every registry tableau has an explicit first stage
+        # (At[0, 0] == 0.0). It is retained rather than removed because it
+        # is what a fully-implicit tableau (At[0, 0] > 0.0, none of which
+        # exist in TABLEAUX yet) would need, and it matches PETSc's own
+        # ARKIMEX, which carries the identical case for the same reason.
         if i > 0:
             self._Y[i - 1].copy(self._Y[i])
         else:
@@ -570,8 +621,12 @@ class ARKSSP:
         reason = snes.getConvergedReason()
         if reason < 0:
             # petsc4py exposes no PETSc.ERR_* constants, so signal with
-            # Firedrake's own exception. Task 10 replaces this with a step
-            # rejection routed through TSAdapt.
+            # Firedrake's own exception. step()'s attempt loop catches this
+            # specific exception around _take_stages, rejects the attempt
+            # to the adapt loop (shrinking h by ts_adapt_scale_solve_failed)
+            # and retries, only letting it propagate once retries are
+            # exhausted -- see the comment there for the PETSc mechanism
+            # this mirrors.
             raise ConvergenceError(f"stage {i} SNES diverged, reason {reason}")
         self._Y[i].copy(self._Ydot[i])
         self._Ydot[i].axpy(-1.0, self._Z)

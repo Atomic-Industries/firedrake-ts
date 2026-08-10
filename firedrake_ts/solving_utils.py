@@ -76,12 +76,6 @@ def _classify_rows(F, u, udot, nfields):
     }
 
 
-def differential_fields(F, u, udot, nfields):
-    """Components whose residual row contains a time derivative."""
-    rows = _classify_rows(F, u, udot, nfields)
-    return tuple(i for i, (has_dot, _) in rows.items() if has_dot)
-
-
 def algebraic_fields(F, u, udot, nfields):
     """Components whose residual row has no time derivative.
 
@@ -628,7 +622,7 @@ class _TSContext(_SNESContext):
         Held on the context so it outlives the ``KSP`` that takes it as an
         operator.
         """
-        from firedrake import assemble, ufl_expr
+        from firedrake import assemble
 
         self._check_G_vanishes_on_algebraic_rows()
         mass = assemble(ufl_expr.derivative(self.F, self._xdot), bcs=self.bcs_F)
