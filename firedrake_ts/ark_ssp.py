@@ -21,6 +21,12 @@ from firedrake import dmhooks
 from firedrake.exceptions import ConvergenceError
 from firedrake.petsc import PETSc
 
+from firedrake_ts._petsc_shim import (
+    ts_adapt_candidate_add,
+    ts_adapt_candidates_clear,
+    ts_adapt_choose,
+    ts_get_adapt,
+)
 from firedrake_ts.solving_utils import explicitly_governed_fields, resolve_fields
 from firedrake_ts.tableaux import TABLEAUX, kraaijevanger_radius, shu_osher
 
@@ -56,6 +62,14 @@ class ARKSSP:
         self._Ydot = None  # implicit stage derivatives
         self._Z = None  # Butcher stage offset
         self._rhs = None  # scratch for computeRHSFunction
+        # Recorded at the top of each step() attempt, for evaluatestep --
+        # the value the solution held at the START of the step. step()
+        # overwrites ts.getSolution() with each attempt's order-p candidate
+        # before TSAdaptChoose runs (and restores it here on rejection), so
+        # evaluatestep must build its own answer from these rather than from
+        # ts.getSolution().
+        self._last_h = None
+        self._last_x = None
         # Set per stage, read by the SNES callbacks.
         self._stage = None
         self._shift = None
@@ -99,6 +113,7 @@ class ARKSSP:
             self._Ydot = [sol.duplicate() for _ in range(s)]
             self._Z = sol.duplicate()
             self._rhs = sol.duplicate()
+            self._last_x = sol.duplicate()
 
             self._frozen_rows = self._find_frozen_rows(ts)
             self._check_limiter_soundness()
@@ -231,21 +246,85 @@ class ARKSSP:
             x = ts.getSolution()
             s = len(tab.b)
 
-            for i in range(s):
-                self._shu_osher_predictor(x, h, i)
-                if self._limiter is not None:
-                    self._limiter(self._Y[i])
-                self._build_offset(tab, x, h, i)
-                if tab.At[i, i] > 0.0:
-                    self._solve_stage(ts, tab, h, i)
-                ts.computeRHSFunction(t + tab.c[i] * h, self._Y[i], self._rhs)
-                self._rhs.copy(self._L[i])
+            self._last_h = h
+            x.copy(self._last_x)
 
-            self._complete(tab, x, h)
-            ts.setTime(t + h)
+            # petsc4py binds setMaxStepRejections but NOT a getter, so read
+            # the option directly. PETSc's own default for ts->max_reject
+            # is 10.
+            max_reject = PETSc.Options(ts.getOptionsPrefix() or "").getInt(
+                "ts_max_reject", 10
+            )
+            adapt = ts_get_adapt(ts)
+            for _ in range(max(1, max_reject + 1)):
+                self._last_h = h
+                self._take_stages(ts, tab, self._last_x, h, s)
+                # TSAdaptChoose reads ts->vec_sol as the completed, order-p
+                # solution (TSErrorWeightedNorm's own docstring: "usually
+                # ts->vec_sol"; PETSc's own TSStep_ARKIMEX writes the
+                # completion into vec_sol before calling TSAdaptChoose, at
+                # ts/impls/arkimex/arkimex.c, and restores a saved pre-step
+                # copy on rejection). x IS ts->vec_sol here.
+                self._complete(tab, x, h)
+                ts_adapt_candidates_clear(adapt)
+                ts_adapt_candidate_add(
+                    adapt, None, tab.order, tab.order, 1.0, float(s), True
+                )
+                _sc, next_h, accept, _wlte, _a, _r = ts_adapt_choose(adapt, ts, h)
+                if accept:
+                    ts.setTime(t + h)
+                    ts.setTimeStep(next_h)
+                    return
+                # Rejected: restore x (ts->vec_sol) to the pre-step value
+                # before retrying with the smaller next_h -- _complete's
+                # non-stiffly-accurate branch reads x as the step's starting
+                # point, and would otherwise read back the just-rejected
+                # candidate. self._last_x itself is untouched, so the retried
+                # _take_stages still predicts from the correct x^n.
+                self._last_x.copy(x)
+                h = next_h
+                ts.setTimeStep(h)
+            ts.setConvergedReason(PETSc.TS.ConvergedReason.DIVERGED_STEP_REJECTED)
         except Exception as exc:
             self._error = exc
             raise
+
+    def _take_stages(self, ts, tab, x, h, s):
+        """Run all s stages from ``x`` with step ``h``. Populates Y, L, Ydot."""
+        t = ts.getTime()
+        for i in range(s):
+            self._shu_osher_predictor(x, h, i)
+            if self._limiter is not None:
+                self._limiter(self._Y[i])
+            self._build_offset(tab, x, h, i)
+            if tab.At[i, i] > 0.0:
+                self._solve_stage(ts, tab, h, i)
+            ts.computeRHSFunction(t + tab.c[i] * h, self._Y[i], self._rhs)
+            self._rhs.copy(self._L[i])
+
+    def evaluatestep(self, ts, order, U):
+        """Write the order-``order`` completion into ``U``.
+
+        ``TSADAPTBASIC`` gets its lower-order solution through
+        ``TSEvaluateStep``, which routes here. The error estimate
+        ``|h sum (b - bhat)_j L(Y_j)|`` reuses the ``L(Y_j)`` the step
+        computed anyway, so error control costs no extra evaluations.
+        """
+        tab = self._tab
+        h = self._last_h
+        x = self._last_x
+        weights_e = tab.b if order >= tab.order else tab.bhat
+        weights_i = tab.bt if order >= tab.order else tab.bhat
+        x.copy(U)
+        for j in range(len(tab.b)):
+            if weights_i[j] != 0.0:
+                U.axpy(h * weights_i[j], self._Ydot[j])
+            if weights_e[j] != 0.0:
+                U.axpy(h * weights_e[j], self._L[j])
+        # petsc4py's TSEvaluateStep_Python treats a falsy return as failure
+        # (PETSC_ERR_USER "Cannot evaluate step") whenever the caller -- as
+        # TSAdaptChoose_Basic does -- passes a NULL `done` pointer.
+        return True
 
     def _shu_osher_predictor(self, x, h, i):
         """Y_i = q_i x^n + sum_{j<i} P_ij (Y_j + (h/r) L_j).
