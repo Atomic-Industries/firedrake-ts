@@ -3126,7 +3126,9 @@ def test_exact_final_time_interpolate_lands_on_tmax():
     """Exercises TSInterpolate through the driver, not just directly."""
     solver, u = _solver(dt=0.03, tmax=1.0)
     solver.solve()
-    assert solver.ts.getTime() == pytest.approx(1.0, abs=1e-12)
+    # getSolveTime(), not getTime(): PETSc's TSGetTime docs note it "may\n    # not correspond to max_time" -- measured 1.02 (overshot) against
+    # getSolveTime()'s 1.0.
+    assert solver.ts.getSolveTime() == pytest.approx(1.0, abs=1e-12)
     assert float(u.dat.data_ro[0]) == pytest.approx(np.exp(-1.0), abs=1e-3)
 ```
 
