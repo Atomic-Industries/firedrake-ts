@@ -101,26 +101,7 @@ class ARKSSP:
             self._rhs = sol.duplicate()
 
             self._frozen_rows = self._find_frozen_rows(ts)
-            # The soundness hazard only exists where an implicit stage
-            # actually runs (tab.At[i, i] > 0.0, matching step()'s own
-            # guard on _solve_stage): a purely-explicit tableau such as
-            # ssprk2 never solves a stage, so there is nothing for the
-            # limiter's change to be undone by, regardless of whether any
-            # component was found freezable.
-            has_implicit_stage = np.any(np.diagonal(tab.At) > 0.0)
-            if (
-                self._limiter is not None
-                and self._frozen_rows is None
-                and has_implicit_stage
-            ):
-                raise ValueError(
-                    "a stage limiter is registered, but no component of this "
-                    "problem is free of an implicit operator: every row of "
-                    "dF/du is structurally nonzero. Limiting a component "
-                    "that has an implicit operator is not sound -- the "
-                    "stage solve would undo the correction. Move the "
-                    "operator into G, or drop the limiter."
-                )
+            self._check_limiter_soundness()
         except Exception as exc:
             self._error = exc
             raise
@@ -140,6 +121,37 @@ class ARKSSP:
     def set_stage_limiter(self, limiter):
         """Register a callable fired on each explicit substage value."""
         self._limiter = limiter
+        # setUp runs this same check once the tableau and frozen rows are
+        # known; re-run it here too, since a caller may register a limiter
+        # AFTER setUp has already run (e.g. against an already-solved-once
+        # TS). Without this, that ordering silently bypasses the guard
+        # instead of raising, giving unsound behaviour with no warning.
+        if self._tab is not None:
+            self._check_limiter_soundness()
+
+    def _check_limiter_soundness(self):
+        """Refuse a limiter that a stage solve could undo without a trace.
+
+        The soundness hazard only exists where an implicit stage actually
+        runs (tab.At[i, i] > 0.0, matching step()'s own guard on
+        _solve_stage): a purely-explicit tableau such as ssprk2 never
+        solves a stage, so there is nothing for the limiter's change to be
+        undone by, regardless of whether any component was found freezable.
+        """
+        has_implicit_stage = np.any(np.diagonal(self._tab.At) > 0.0)
+        if (
+            self._limiter is not None
+            and self._frozen_rows is None
+            and has_implicit_stage
+        ):
+            raise ValueError(
+                "a stage limiter is registered, but no component of this "
+                "problem is free of an implicit operator: every row of "
+                "dF/du is structurally nonzero. Limiting a component "
+                "that has an implicit operator is not sound -- the "
+                "stage solve would undo the correction. Move the "
+                "operator into G, or drop the limiter."
+            )
 
     def _find_frozen_rows(self, ts):
         """Global row indices of components with no implicit operator.
@@ -269,6 +281,20 @@ class ARKSSP:
         if self._frozen_rows is not None:
             self._Y[i].getArray()[local] = frozen_values
         snes.solve(None, self._Y[i])
+        # The residual on frozen rows is self-referential (x - Y_i, the same
+        # vector SNES is iterating on) so it cannot itself enforce the pin --
+        # it is identically zero regardless of what value the row holds.
+        # That only *looks* like a pin because Newton's own step happens to
+        # contribute zero there too, for a plain Newton/KSP iteration with a
+        # preconditioner that preserves the identity row. It does not hold
+        # for a fieldsplit that solves the non-frozen block approximately,
+        # nor for ngmres/anderson, whose iterate mixes past iterates -- there
+        # the row can drift by roughly the inner-solve tolerance with
+        # nothing raising, since SNES's own convergence test also sees a
+        # zero residual there by construction. Restoring the snapshot here,
+        # unconditionally, is what actually holds the pin.
+        if self._frozen_rows is not None:
+            self._Y[i].getArray()[local] = frozen_values
         reason = snes.getConvergedReason()
         if reason < 0:
             # petsc4py exposes no PETSc.ERR_* constants, so signal with
@@ -278,6 +304,17 @@ class ARKSSP:
         self._Y[i].copy(self._Ydot[i])
         self._Ydot[i].axpy(-1.0, self._Z)
         self._Ydot[i].scale(self._shift)
+        if self._frozen_rows is not None:
+            # A frozen row's implicit function is M_k Ydot_k alone (that is
+            # what explicitly_governed_fields certifies), so its stage
+            # equation is M_k Ydot_k = 0 and the correct derivative is
+            # exactly zero. The generic (Y_i - Z_i) * shift formula above
+            # instead gives the discarded limiter correction amplified by
+            # 1/h -- the same At_ji/At_ii-style amplification this project
+            # exists to eliminate, re-entering through Ydot rather than Y.
+            # It would otherwise reach other rows' dF/du_t dependence on
+            # this field via xdot in formSNESFunction/formSNESJacobian.
+            self._Ydot[i].getArray()[local] = 0.0
 
     def _complete(self, tab, x, h):
         """x^{n+1}.

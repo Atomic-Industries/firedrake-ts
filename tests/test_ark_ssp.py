@@ -256,12 +256,22 @@ def test_frozen_component_survives_the_implicit_solve():
     scratch = Function(W)
     CLAMP = 0.5
     drift = []
+    calls = [0]
 
     def clamping_limiter(vec):
-        """Force the explicitly-governed row to exactly CLAMP."""
+        """Force the explicitly-governed row to a value that is different
+        on every call (CLAMP + 0.1 * call count), not the same constant
+        every stage. A stale pin left over from the wrong stage is
+        otherwise numerically indistinguishable from a correct one: this
+        is the exact blind spot that hid the aliasing bug this test was
+        originally written to catch (a corrupted warm-start guess that
+        reverted a frozen row to the *previous* stage's value survived
+        undetected as long as every stage clamped to the same number).
+        """
         with scratch.dat.vec_wo as target:
             vec.copy(target)
-        scratch.sub(0).assign(CLAMP)
+        scratch.sub(0).assign(CLAMP + 0.1 * calls[0])
+        calls[0] += 1
         with scratch.dat.vec_ro as source:
             source.copy(vec)
 
@@ -308,14 +318,30 @@ def test_frozen_component_survives_the_implicit_solve():
 
 
 def test_nothing_is_frozen_when_every_row_has_an_implicit_operator():
+    """A genuinely mixed space where every row has diffusion: the branch
+    the name describes. len(V) > 1 so _find_frozen_rows actually calls
+    explicitly_governed_fields, rather than returning early on a
+    single-field space where that call is never reached.
+    """
     mesh = UnitIntervalMesh(4)
     V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
-    F = inner(u_t, v) * dx + inner(grad(u), grad(v)) * dx
-    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 0.02), G=-inner(u, v) * dx)
+    W = V * V
+    w = Function(W)
+    wdot = Function(W)
+    a, b = split(w)
+    adot, bdot = split(wdot)
+    va, vb = TestFunctions(W)
+    w.sub(0).assign(1.0)
+    w.sub(1).assign(1.0)
+
+    F = (
+        inner(adot, va) * dx
+        + inner(grad(a), grad(va)) * dx
+        + inner(bdot, vb) * dx
+        + inner(grad(b), grad(vb)) * dx
+    )
+    G = -inner(a, va) * dx - inner(b, vb) * dx
+    problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, 0.02), G=G)
     solver = firedrake_ts.DAESolver(
         problem,
         solver_parameters=dict(
