@@ -2877,13 +2877,16 @@ def ts_adapt_candidate_add(
 
 
 def ts_adapt_choose(adapt, ts, h):
-    """Returns ``(next_scheme, next_h, accept)``."""
+    """Returns ``(next_scheme, next_h, accept)``.
+
+    Six arguments, matching petscts.h:1150. Do not add trailing wlte/wltea/
+    wlter output pointers: the real function does not take them, so they would
+    read back as ctypes' zero-initialised default and look exactly like a
+    converged error estimate.
+    """
     next_sc = ctypes.c_int()
     next_h = ctypes.c_double()
     accept = ctypes.c_int()
-    wlte = ctypes.c_double()
-    wltea = ctypes.c_double()
-    wlter = ctypes.c_double()
     _check(
         _load().TSAdaptChoose(
             adapt,
@@ -2892,20 +2895,10 @@ def ts_adapt_choose(adapt, ts, h):
             ctypes.byref(next_sc),
             ctypes.byref(next_h),
             ctypes.byref(accept),
-            ctypes.byref(wlte),
-            ctypes.byref(wltea),
-            ctypes.byref(wlter),
         ),
         "TSAdaptChoose",
     )
-    return (
-        next_sc.value,
-        next_h.value,
-        bool(accept.value),
-        wlte.value,
-        wltea.value,
-        wlter.value,
-    )
+    return next_sc.value, next_h.value, bool(accept.value)
 ```
 
 - [ ] **Step 4: Add `evaluatestep` and the adapt loop to `ARKSSP`**
@@ -2994,7 +2987,7 @@ Then wrap the stage loop in the reject/adapt loop. Replace the body of `step` af
             ts_adapt_candidate_add(
                 adapt, None, tab.order, tab.order, 1.0, float(s), True
             )
-            _sc, next_h, accept, _wlte, _a, _r = ts_adapt_choose(adapt, ts, h)
+            _sc, next_h, accept = ts_adapt_choose(adapt, ts, h)
             if accept:
                 self._complete(tab, x, h)
                 ts.setTime(t + h)
