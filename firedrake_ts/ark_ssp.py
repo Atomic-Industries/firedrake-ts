@@ -349,6 +349,31 @@ class ARKSSP:
         # TSAdaptChoose_Basic does -- passes a NULL `done` pointer.
         return True
 
+    def interpolate(self, ts, t, U):
+        """Dense output at time ``t`` within the step just taken.
+
+        X(theta) = y_n + h sum_i [d_i theta + (w_i - d_i) theta^2] Ydot_i,
+        with w = bt for the implicit part and w = b for the explicit part.
+        The coefficients d are chosen so that d . g = 0 for the null
+        direction g of the singular At, which is what keeps the stiff
+        limit bounded -- a naive d = (1, 0, 0, 0) has d . g != 0 and makes
+        X(theta) diverge like z theta(theta - 1) as z -> -infinity.
+        """
+        tab = self._tab
+        h = self._last_h
+        if h is None:
+            raise ValueError("interpolate called before any step was taken")
+        theta = (t - (ts.getTime() - h)) / h
+        self._last_x.copy(U)
+        for i in range(len(tab.b)):
+            impl = tab.d[i] * theta + (tab.bt[i] - tab.d[i]) * theta**2
+            expl = tab.d[i] * theta + (tab.b[i] - tab.d[i]) * theta**2
+            if impl != 0.0:
+                U.axpy(h * impl, self._Ydot[i])
+            if expl != 0.0:
+                U.axpy(h * expl, self._L[i])
+        return True
+
     def _shu_osher_predictor(self, x, h, i):
         """Y_i = q_i x^n + sum_{j<i} P_ij (Y_j + (h/r) L_j).
 
