@@ -2961,6 +2961,16 @@ Then wrap the stage loop in the reject/adapt loop. Replace the body of `step` af
         max_reject = PETSc.Options(ts.getOptionsPrefix() or "").getInt(
             "ts_max_reject", 10
         )
+> **The adapt loop must hand `TSAdaptChoose` the COMPLETED step, not the pre-step state.**
+> `TSADAPTBASIC` forms its error estimate by comparing `ts->vec_sol` against the
+> lower-order solution `evaluatestep` returns. If `vec_sol` still holds the value from the
+> *start* of the step, the comparison is meaningless and the controller does not converge —
+> measured: the loop below, written naively, **hangs** under `-ts_adapt_type basic`. Write
+> the completion into `ts->vec_sol` before calling `TSAdaptChoose`, and restore the
+> pre-step value on rejection — including on an exception out of the loop, or the TS is
+> left holding a completion for a step that was rejected. This mirrors PETSc's own
+> `TSStep_ARKIMEX`. Also note `evaluatestep` must `return True`; petsc4py raises otherwise.
+
         adapt = ts_get_adapt(ts)
         for _ in range(max(1, max_reject + 1)):
             self._take_stages(ts, tab, self._last_x, h, s)
