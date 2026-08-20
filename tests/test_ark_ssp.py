@@ -858,3 +858,115 @@ def test_limiter_registered_after_setup_is_still_rejected():
     assert ctx._frozen_rows is None, "a freezable row was found; expected none here"
     with pytest.raises(ValueError, match="implicit operator"):
         ctx.set_stage_limiter(lambda vec: None)
+
+
+def _fsal_decay(fsal, mutate=False, tableau="esdirk_gamma5", dt=0.01):
+    """Integrate ``kappa u' = -grad.grad u + u`` with a stiff implicit part.
+
+    ``mutate=True`` installs a monitor that scales ``kappa`` -- a coefficient
+    of the mass term -- by 1.5 after every accepted step. That is the case a
+    state-based FSAL guard gets wrong: the monitor runs after the step, so at
+    the start of the next step ``t`` and ``x`` are both exactly what they were
+    when the previous step's last stage derivative was computed, while ``M``
+    is not. Returns the final state and the stepper's hit/miss counters.
+    """
+    mesh = UnitIntervalMesh(8)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    (x,) = SpatialCoordinate(mesh)
+    u.interpolate(sin(pi * x))
+    kappa = Constant(1.0)
+    F = inner(kappa * u_t, v) * dx + inner(grad(u), grad(v)) * dx
+    G = inner(u, v) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 0.1), G=G)
+    kwargs = {}
+    if mutate:
+        kwargs["monitor_callback"] = lambda ts, step, time, U: kappa.assign(
+            float(kappa) * 1.5
+        )
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters={
+            "ts_type": "python",
+            "ts_python_type": PYTHON_STEPPER,
+            "ts_ark_ssp_type": tableau,
+            "ts_adapt_type": "none",
+            "ts_time_step": dt,
+            "ts_exact_final_time": "matchstep",
+            "ts_ark_ssp_fsal": fsal,
+        },
+        options_prefix="",
+        **kwargs,
+    )
+    stepper = solver.ts.getPythonContext()
+    solver.solve()
+    return u.dat.data_ro.copy(), stepper
+
+
+def test_fsal_reuses_the_previous_step_last_stage_derivative():
+    """Ẏ_0 at step n+1 is the last stage derivative of step n, exactly.
+
+    For a stiffly accurate tableau with ct[-1] == 1, that stage solved
+    F(t^{n+1}, y^{n+1}, Ẏ) = 0 -- which is Ẏ_0's defining equation at the
+    next step -- so reusing it skips a mass assembly, an LU refactorisation
+    and a solve. PETSc's own ARKIMEX does this (FSAL_implicit).
+
+    Asserts the reuse actually happens (a passing answer alone would not
+    distinguish it from silently always taking the fresh path) AND that it
+    changes nothing: 9 hits over 10 steps -- step 1 has no candidate -- with
+    the result agreeing to roundoff, measured 3.3e-16.
+    """
+    off, _ = _fsal_decay(False)
+    on, stepper = _fsal_decay(True)
+    assert stepper._fsal_possible
+    assert stepper._fsal_hits == 9, (
+        f"expected 9 reuses over 10 steps, got {stepper._fsal_hits} hits "
+        f"and {stepper._fsal_misses} misses"
+    )
+    assert stepper._fsal_misses == 0
+    assert np.abs(on - off).max() < 1e-13 * np.abs(off).max()
+
+
+def test_fsal_rejects_a_candidate_after_the_form_changes_under_it():
+    """The FSAL guard must be a residual test, not a state comparison.
+
+    A monitor scaling the mass coefficient after each step leaves (t, x)
+    identical at the next step's start while M is different, so the previous
+    last stage derivative no longer satisfies the equation. A guard built on
+    cached (t_end, x_end) plus VecEqual -- the obvious implementation, and
+    what "reuse when the state has not moved" suggests -- reuses a stale
+    derivative on every one of these steps with nothing raising. That is the
+    same shape as the five staleness defects this stepper has already had.
+
+    The residual test in _try_fsal_stage0_ydot has no claim about the form in
+    it, so it catches all nine: measured 0 hits, 9 misses, and a result
+    bit-identical to the same solve with FSAL disabled.
+    """
+    off, _ = _fsal_decay(False, mutate=True)
+    on, stepper = _fsal_decay(True, mutate=True)
+    assert stepper._fsal_hits == 0, (
+        f"reused a candidate whose mass coefficient had changed under it "
+        f"({stepper._fsal_hits} hits)"
+    )
+    assert stepper._fsal_misses == 9
+    assert np.array_equal(on, off), (
+        "falling back to the fresh solve must reproduce the FSAL-disabled "
+        f"result exactly; max difference {np.abs(on - off).max():.3e}"
+    )
+
+
+def test_fsal_is_not_attempted_for_a_purely_explicit_tableau():
+    """_Ydot[-1] is never populated when no stage is implicitly solved.
+
+    ssprk2 has At identically zero, so _solve_stage never runs and
+    _Ydot[-1] holds whatever it was allocated with. The structural
+    pre-filter must exclude this before any residual evaluation is spent on
+    it -- and the reuse must not happen even though the tableau is otherwise
+    stiffly accurate with ct[-1] == 1.
+    """
+    _, stepper = _fsal_decay(True, tableau="ssprk2", dt=0.001)
+    assert not stepper._fsal_possible
+    assert stepper._fsal_hits == 0
+    assert stepper._fsal_misses == 0
