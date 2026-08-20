@@ -155,11 +155,17 @@ RUNG_PARAMS = {
 }
 
 
-def _rung1(stepper, dt=1e-3, tmax=1.0):
+def _rung1(stepper, dt=1e-2, tmax=1.0):
     """Index 1, one-cell DG0: ydot = z, 0 = z + y, z explicit. Exact y = e^-t.
 
     M = diag(1, 0) is genuinely singular and G vanishes on the algebraic row.
     No spatial discretisation error, so observed order is the tableau's alone.
+
+    dt=1e-2 rather than 1e-3: this helper's callers assert abs=1e-3, and the
+    measured errors at 1e-2 are 5.7e-6 (arkimex) and 3.1e-6 (arkssp) -- 176x
+    and 325x inside that -- for a tenth of the steps. It divides tmax exactly,
+    so stepover lands on 1.0 with no overshoot. No order test uses this
+    default; the convergence runs pass dt explicitly.
     """
     mesh = UnitIntervalMesh(1)
     R = FunctionSpace(mesh, "DG", 0)  # NOT "R": see the note in the brief
@@ -263,7 +269,10 @@ def test_two_algebraic_fields_drive_the_concatenated_zero_rows():
     G = inner(-y, vy) * dx
 
     problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, 1.0), G=G)
-    parameters = dict(RUNG_PARAMS, ts_time_step=1e-3, **ARKIMEX)
+    # dt=1e-2: order-2 arkimex against an abs=1e-3 tolerance, and this test is
+    # about zeroRows being driven with a genuinely concatenated index set, not
+    # about accuracy. 1e-2 divides tmax, so stepover lands on 1.0.
+    parameters = dict(RUNG_PARAMS, ts_time_step=1e-2, **ARKIMEX)
     firedrake_ts.DAESolver(
         problem, solver_parameters=parameters, options_prefix=""
     ).solve()

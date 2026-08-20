@@ -1,28 +1,20 @@
 """Error-controlled stepping via TSADAPTBASIC and the embedded pair."""
 
-import numpy as np
 import pytest
+from conftest import ARK_SSP as _ARK_SSP_BASE
+from conftest import EXACT_DECAY, scalar_problem
 from firedrake import *
 from firedrake.exceptions import ConvergenceError
 
 import firedrake_ts
 
-EXACT = np.exp(-1.0)
+EXACT = EXACT_DECAY
 
-ARK_SSP = {
-    "ts_type": "python",
-    "ts_python_type": "firedrake_ts.ark_ssp.ARKSSP",
-    "ts_ark_ssp_type": "esdirk_gamma5",
-}
+ARK_SSP = {**_ARK_SSP_BASE, "ts_ark_ssp_type": "esdirk_gamma5"}
 
 
 def _decay(extra, dt=1e-2):
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
+    u, u_t, v = scalar_problem()
     problem = firedrake_ts.DAEProblem(
         inner(u_t, v) * dx, u, u_t, (0.0, 1.0), G=-inner(u, v) * dx
     )

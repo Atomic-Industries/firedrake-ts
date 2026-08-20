@@ -1,22 +1,30 @@
 """The IMEX (``G``) path must actually advance the solution."""
 
-import numpy as np
 import pytest
+from conftest import EXACT_DECAY, scalar_problem
 from firedrake import *
 
 import firedrake_ts
 
-EXACT = np.exp(-1.0)  # solution of u' = -u at t = 1
+EXACT = EXACT_DECAY  # solution of u' = -u at t = 1
 
 
-def _decay(tableau="3", dt=1e-3, split=True):
-    """Integrate ``u' = -u`` to t = 1, with ``-u`` explicit when ``split``."""
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
+def _decay(tableau="3", dt=1e-2, split=True):
+    """Integrate ``u' = -u`` to t = 1, with ``-u`` explicit when ``split``.
+
+    dt=1e-2 rather than 1e-3: measured errors against EXACT are 4.8e-9 ("3"),
+    3.0e-6 ("2c"), 6.2e-6 ("a2") and 3.1e-6 ("prssp2"), i.e. 16x to 20000x
+    inside the abs=1e-4 that test_imex_advances_solution asserts, for a tenth
+    of the steps.
+
+    ``matchstep``, not ``stepover``: with ``stepover`` the accuracy assertions
+    silently depend on dt dividing tmax exactly. At dt=3e-3 all four tableaux
+    report err=7.35e-4 identically -- that is the overshoot to t=1.002, not
+    method error, and it would read as a method regression. 1e-2 and 1e-3 both
+    divide 1.0, so this changes nothing today; it stops the next dt change
+    from having to know that.
+    """
+    u, u_t, v = scalar_problem()
     if split:
         F, G = inner(u_t, v) * dx, -inner(u, v) * dx
     else:
@@ -29,7 +37,7 @@ def _decay(tableau="3", dt=1e-3, split=True):
             "ts_arkimex_type": tableau,
             "ts_adapt_type": "none",
             "ts_time_step": dt,
-            "ts_exact_final_time": "stepover",
+            "ts_exact_final_time": "matchstep",
         },
     )
     solver.solve()
@@ -76,10 +84,15 @@ def test_imex_stage_solves_use_the_dae_callbacks():
 
 
 def test_implicit_path_matches_imex_path():
-    """Splitting a term into G must not change the answer beyond method error."""
-    _, split = _decay(split=True)
+    """Splitting a term into G must not change the answer beyond method error.
+
+    Only the monolithic solve runs here. The split one is
+    test_imex_advances_solution["3"], which already pins it to within 1e-4 of
+    EXACT, so anchoring the monolithic result to EXACT gives the same claim by
+    transitivity instead of running the split path a third time.
+    """
     _, monolithic = _decay(split=False)
-    assert abs(split - monolithic) < 1e-3
+    assert abs(monolithic - EXACT) < 1e-3
 
 
 def test_heat_explicit_example_diffuses():
@@ -122,12 +135,7 @@ def _nonconstant_mass(kind, dt, tableau="3"):
     2.4e-2 for ``kind="t"``) that swamps the discretisation error being
     measured.
     """
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
+    u, u_t, v = scalar_problem()
     time = Constant(0.0)
     mass = (1.0 + u) if kind == "u" else (1.0 + time)
     F = inner(mass * u_t, v) * dx

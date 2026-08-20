@@ -2,24 +2,17 @@
 
 import numpy as np
 import pytest
+from conftest import ARK_SSP as _ARK_SSP_BASE
+from conftest import scalar_problem
 from firedrake import *
 
 import firedrake_ts
 
-ARK_SSP = {
-    "ts_type": "python",
-    "ts_python_type": "firedrake_ts.ark_ssp.ARKSSP",
-    "ts_ark_ssp_type": "esdirk_gamma5",
-}
+ARK_SSP = {**_ARK_SSP_BASE, "ts_ark_ssp_type": "esdirk_gamma5"}
 
 
 def _solver(dt=0.1, tmax=1.0, tableau="esdirk_gamma5"):
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
+    u, u_t, v = scalar_problem()
     problem = firedrake_ts.DAEProblem(
         inner(u_t, v) * dx, u, u_t, (0.0, tmax), G=-inner(u, v) * dx
     )
@@ -98,12 +91,7 @@ def test_dense_output_stays_bounded_on_a_stiff_step():
     y_n=1, y_n+1~-2e-11 -- comfortably inside the generous envelope
     asserted below, not diverging.
     """
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
+    u, u_t, v = scalar_problem()
     lam = 1e6
     h = 1.0
     F = inner(u_t, v) * dx + lam * inner(u, v) * dx

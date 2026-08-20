@@ -2,29 +2,26 @@
 
 import numpy as np
 import pytest
+from conftest import ARK_SSP, EXACT_DECAY, PYTHON_STEPPER, scalar_problem
 from firedrake import *
 
 import firedrake_ts
 
-EXACT = np.exp(-1.0)  # solution of u' = -u at t = 1
+EXACT = EXACT_DECAY  # solution of u' = -u at t = 1
 
-PYTHON_STEPPER = "firedrake_ts.ark_ssp.ARKSSP"
+#: Step sizes for the order-ratio tests. Four values, so three ratios: dt this
+#: size on ODE-exact problems is the asymptotic regime, not resolution-limited.
+_DTS = (0.1, 0.05, 0.025, 0.0125)
 
 
 def _decay(tableau, dt=1e-3, tmax=1.0, extra=None):
     """Integrate u' = -u to tmax with -u explicit, under ARKSSP."""
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
+    u, u_t, v = scalar_problem()
     F = inner(u_t, v) * dx
     G = -inner(u, v) * dx
     problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, tmax), G=G)
     parameters = {
-        "ts_type": "python",
-        "ts_python_type": PYTHON_STEPPER,
+        **ARK_SSP,
         "ts_ark_ssp_type": tableau,
         "ts_adapt_type": "none",
         "ts_time_step": dt,
@@ -172,245 +169,158 @@ def test_ssprk2_needs_no_implicit_solve():
     assert solver.snes.getIterationNumber() == 0
 
 
-def _pure_implicit_decay(dt, tmax=1.0):
-    """Integrate u' = -u with -u INSIDE F (implicit), G = None.
+def _esdirk_converge(build_F, u0, dt, tmax=1.0):
+    """One esdirk_gamma5 run of a scalar problem in F, with G = None.
 
-    This is the class of problem ARKSSP exists to serve: a nontrivial
-    implicit operator, with esdirk_gamma5's explicit first stage
-    (At[0, 0] == 0) actually exercised against a real dF/du. ``matchstep``
-    rather than ``stepover`` so the comparison against ``exp(-1)`` is not
-    confounded by stepover's overshoot past t = 1.
+    The five convergence helpers this replaces were 31-40 line copies of the
+    same block -- mesh, P1 space, u/u_t/v, initial value, DAEProblem, DAESolver
+    with a byte-identical six-key parameter dict, solve, return u[0] --
+    differing only in the initial value and the UFL form. ``build_F`` is called
+    as ``build_F(u, u_t, v, time)``; a ``time`` Constant is always created and
+    always passed to DAEProblem, which is harmless for the forms that ignore it.
+
+    ``matchstep`` rather than ``stepover`` so the comparison against the exact
+    solution is not confounded by stepover's overshoot past t = tmax.
     """
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
-    F = inner(u_t, v) * dx + inner(u, v) * dx
-    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, tmax))
-    solver = firedrake_ts.DAESolver(
+    u, u_t, v = scalar_problem(u0=u0)
+    time = Constant(0.0)
+    problem = firedrake_ts.DAEProblem(
+        build_F(u, u_t, v, time), u, u_t, (0.0, tmax), time=time
+    )
+    firedrake_ts.DAESolver(
         problem,
         solver_parameters={
-            "ts_type": "python",
-            "ts_python_type": PYTHON_STEPPER,
+            **ARK_SSP,
             "ts_ark_ssp_type": "esdirk_gamma5",
             "ts_adapt_type": "none",
             "ts_time_step": dt,
             "ts_exact_final_time": "matchstep",
         },
         options_prefix="",
-    )
-    solver.solve()
+    ).solve()
     return float(u.dat.data_ro[0])
 
 
-def test_esdirk_gamma5_converges_on_a_purely_implicit_problem():
-    """The stepper must converge, at design order, with the operator
-    entirely inside F and no G at all.
+# Every case below is a regression test for one member of the Ydot_0 defect
+# family, and the four are NOT interchangeable -- each defeats a guard that the
+# others pass. Keeping all four is the point; only the boilerplate is shared.
+#
+# purely_implicit -- u' = -u with -u INSIDE F, G = None.
+#   The class of problem ARKSSP exists to serve: a nontrivial implicit
+#   operator, with esdirk_gamma5's explicit first stage (At[0, 0] == 0)
+#   exercised against a real dF/du. Y_0 = y_n, so Ydot_0 must be evaluated
+#   from F(t^n, y_n, 0) rather than assumed zero: it is read with nonzero
+#   weight in _build_offset's At[1, 0], evaluatestep's bt[0] and
+#   interpolate's d[0]. Left unevaluated (Ydot_0 == 0, which is what
+#   sol.duplicate() happens to leave it at) the error is FLAT in dt -- it
+#   converges to the wrong limit rather than shrinking like h^2.
+#
+# nonpolynomial_source -- u' = exp(-t) (u(0) = 0), source INSIDE F, G = None.
+#   dF/du is structurally zero everywhere, but F(t, y, 0) != 0. A guard that
+#   conflates "dF/du is structurally zero" with "Ydot_0 = 0 exactly" gets this
+#   wrong -- those are not the same condition, and dF/du == 0 says nothing
+#   about F(t, y, 0). exp(-t) rather than a constant so a real O(h^2)
+#   truncation error remains to measure (see the separate constant-source test
+#   below for why that one cannot be a ratio test).
+#   Exact: u(t) = 1 - exp(-t), u(1) = 1 - exp(-1).
+#
+# state_dependent_mass -- (1 + u) u' = 1 (u(0) = 0), G = None.
+#   M = dF/du_t = (1 + u) v depends on the state itself: the variable
+#   density/porosity/saturation class. A mass matrix cached once at setUp (the
+#   initial condition u = 0) keeps solving Ydot_0 against M(0) forever however
+#   far u has moved -- flat in dt, silent, no exception. Measured on the
+#   unfixed code (mass reused from ctx._rhs_projection_mass_matrix, assembled
+#   once): errors 6.9e-2, 7.2e-2, 7.4e-2, 7.5e-2, i.e. ratios 0.96-0.99.
+#   Exact: (1 + u) du = dt, so u + u^2/2 = t, u(t) = sqrt(1 + 2t) - 1.
+#
+# time_dependent_mass -- (1 + t) u' = 1 (u(0) = 0), G = None.
+#   M = (1 + t) v depends on time but NOT the state, so dM/du is structurally
+#   zero. That distinction is the whole point, and why this case cannot be
+#   merged away in favour of the one above: a reassembly guarded on
+#   dM/du != 0 skips every reassembly here and keeps inverting M(t^0) = 1,
+#   while passing the M(u) test that motivated the guard. Measured with that
+#   guard in place: ratios 0.958/0.979/0.990, against arkimex's
+#   4.011/4.006/4.003 on the same problem. Regression test for 29d335e. No
+#   structural predicate on the form closes this in general either, since M
+#   may close over a mutable auxiliary Function -- hence unconditional
+#   reassembly. G is None, so this exercises the stage-0 mass solve alone, not
+#   the RHS projection, which test_imex covers separately for both kinds of
+#   non-constant mass.
+_CONVERGENCE_CASES = [
+    pytest.param(
+        lambda u, u_t, v, time: inner(u_t, v) * dx + inner(u, v) * dx,
+        1.0,
+        EXACT,
+        id="purely_implicit",
+    ),
+    pytest.param(
+        lambda u, u_t, v, time: inner(u_t, v) * dx - inner(exp(-time), v) * dx,
+        0.0,
+        1.0 - np.exp(-1.0),
+        id="nonpolynomial_source",
+    ),
+    pytest.param(
+        lambda u, u_t, v, time: (
+            inner((1.0 + u) * u_t, v) * dx - inner(Constant(1.0), v) * dx
+        ),
+        0.0,
+        np.sqrt(3.0) - 1.0,
+        id="state_dependent_mass",
+    ),
+    pytest.param(
+        lambda u, u_t, v, time: (
+            inner((1.0 + time) * u_t, v) * dx - inner(Constant(1.0), v) * dx
+        ),
+        0.0,
+        np.log(2.0),
+        id="time_dependent_mass",
+    ),
+]
 
-    esdirk_gamma5's first stage is explicit (At[0, 0] == 0), so Y_0 = y_n
-    and Ydot_0 must be evaluated from F(t^n, y_n, 0) rather than assumed
-    zero: read with nonzero weight in _build_offset's At[1, 0], in
-    evaluatestep's bt[0], and in interpolate's d[0]. Left unevaluated
-    (Ydot_0 == 0, the value sol.duplicate() happens to leave it at), the
-    measured error is FLAT in dt -- it converges to the wrong limit, not
-    to exp(-1) -- rather than shrinking like h^2.
+
+@pytest.mark.parametrize("build_F,u0,exact", _CONVERGENCE_CASES)
+def test_esdirk_gamma5_converges(build_F, u0, exact, request):
+    """Design order 2 on each Ydot_0 defect case. See _CONVERGENCE_CASES above.
+
+    Every one of these was flat in dt on the code that motivated it, so the
+    order ratio is the assertion that distinguishes fixed from broken -- an
+    exactness check would not. dt = 0.1 ... 0.0125 on ODE-exact problems is
+    the asymptotic regime, not resolution-limited, and the 3.4-4.6 band
+    excludes both order 1 (ratio 2) and order 3 (ratio 8).
     """
-    errors = [
-        abs(_pure_implicit_decay(dt) - EXACT) for dt in (0.1, 0.05, 0.025, 0.0125)
-    ]
+    errors = [abs(_esdirk_converge(build_F, u0, dt) - exact) for dt in _DTS]
     assert all(e > 0.0 for e in errors)
     ratios = [errors[i] / errors[i + 1] for i in range(len(errors) - 1)]
     for ratio in ratios:
         assert 3.4 < ratio < 4.6, f"observed order ratios {ratios}, expected ~4"
 
 
-def _constant_source(dt, tmax=1.0):
-    """Integrate u' = 1 (u(0) = 0) with the source written INSIDE F, G = None.
-
-    dF/du is structurally zero everywhere here (F has no dependence on u at
-    all), but F(t, y, 0) = -1 != 0 -- the state-independent Constant(1.0)
-    term makes it so. A guard that skips the stage-0 mass solve whenever
-    dF/du is zero (mistaking that for "F does not depend on the state, so
-    Ydot_0 = 0 exactly") gets this wrong: Ydot_0 is stuck at 0, and the step
-    is flat in dt at u(1) = bt[0] = 39/125 = 0.312 instead of converging to
-    the exact answer, 1.0.
-    """
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(0.0)
-    F = inner(u_t, v) * dx - inner(Constant(1.0), v) * dx
-    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, tmax))
-    solver = firedrake_ts.DAESolver(
-        problem,
-        solver_parameters={
-            "ts_type": "python",
-            "ts_python_type": PYTHON_STEPPER,
-            "ts_ark_ssp_type": "esdirk_gamma5",
-            "ts_adapt_type": "none",
-            "ts_time_step": dt,
-            "ts_exact_final_time": "matchstep",
-        },
-        options_prefix="",
-    )
-    solver.solve()
-    return float(u.dat.data_ro[0])
-
-
 def test_esdirk_gamma5_converges_on_a_constant_source():
-    """A constant-in-time source in F, with G = None, must not reproduce
-    the Ydot_0-never-computed defect.
+    """u' = 1 with the source INSIDE F: asserted EXACT, deliberately not a ratio.
 
-    Regression test for a guard that conflated "dF/du is structurally
-    zero" with "Ydot_0 = 0 exactly": those are NOT the same condition.
-    dF/du == 0 says nothing about F(t, y, 0), and a state-independent
-    source term (Constant(1.0) here) makes F(t, y, 0) nonzero while
-    dF/du stays zero. See test_esdirk_gamma5_converges_on_a_purely_implicit_
-    problem for the general (state-dependent) case this guard already
-    covered.
+    Same defect class as the nonpolynomial_source case above (dF/du
+    structurally zero while F(t, y, 0) != 0), but kept as its own test rather
+    than folded into the parametrized set, because the assertion is
+    fundamentally different and folding it in for symmetry would weaken it.
 
-    u' = 1 is checked against near-machine-precision closeness to 1.0,
-    NOT an order-2 ratio: any consistent (order >= 1) Runge-Kutta method
-    reproduces a constant-coefficient ODE exactly (its local truncation
-    error involves derivatives of u beyond the first, all zero for a
-    linear exact solution), so halving dt does not systematically shrink
-    an already-zero truncation error -- the residual left is solver-
-    tolerance noise, not the O(h^2) shrinking
-    test_esdirk_gamma5_converges_on_a_nonpolynomial_source below checks.
-    Before the fix, by contrast, the error is flat at 0.312, not
-    noise-small: that gap is exactly what distinguishes "fixed" from
-    "broken" here.
+    Any consistent (order >= 1) Runge-Kutta method reproduces a
+    constant-coefficient ODE exactly: the local truncation error involves
+    derivatives of u beyond the first, all zero for a linear exact solution.
+    So halving dt does not systematically shrink an already-zero truncation
+    error, and a ratio test here would be measuring solver-tolerance noise.
+    Before the fix the error is flat at u(1) = bt[0] = 39/125 = 0.312, not
+    noise-small -- that gap is what distinguishes fixed from broken here.
     """
-    for dt in (0.1, 0.05, 0.025, 0.0125):
-        value = _constant_source(dt)
+    for dt in _DTS:
+        value = _esdirk_converge(
+            lambda u, u_t, v, time: inner(u_t, v) * dx - inner(Constant(1.0), v) * dx,
+            0.0,
+            dt,
+        )
         assert abs(value - 1.0) < 1e-8, (
             f"u(1) = {value} at dt={dt}, expected ~1.0 to near machine "
             "precision (u' = const is exact for any consistent RK method)"
         )
-
-
-def _nonpolynomial_source(dt, tmax=1.0):
-    """Integrate u' = exp(-t) (u(0) = 0) with the source INSIDE F, G = None.
-
-    Same defect class as _constant_source (dF/du structurally zero,
-    F(t, y, 0) != 0), but with a source that is NOT a polynomial in t --
-    unlike u' = 1, no finite-order quadrature reproduces exp(-t) exactly, so
-    a real, measurable O(h^2) local truncation error survives and halving
-    dt should quarter it, giving actual evidence of design-order
-    convergence rather than the exact-to-round-off answer _constant_source
-    gets for a strictly polynomial right-hand side.
-    """
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(0.0)
-    time = Constant(0.0)
-    F = inner(u_t, v) * dx - inner(exp(-time), v) * dx
-    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, tmax), time=time)
-    solver = firedrake_ts.DAESolver(
-        problem,
-        solver_parameters={
-            "ts_type": "python",
-            "ts_python_type": PYTHON_STEPPER,
-            "ts_ark_ssp_type": "esdirk_gamma5",
-            "ts_adapt_type": "none",
-            "ts_time_step": dt,
-            "ts_exact_final_time": "matchstep",
-        },
-        options_prefix="",
-    )
-    solver.solve()
-    return float(u.dat.data_ro[0])
-
-
-def test_esdirk_gamma5_converges_on_a_nonpolynomial_source():
-    """A non-polynomial, purely time-dependent source in F, with G = None,
-    must converge to the exact answer at design order.
-
-    Same guard defect as test_esdirk_gamma5_converges_on_a_constant_source,
-    but exp(-t) in place of Constant(1.0) leaves a real O(h^2) truncation
-    error to measure, so this is the test that actually exercises "halving
-    dt quarters the error" for this defect class -- exact solution
-    u(t) = 1 - exp(-t), u(1) = 1 - exp(-1).
-    """
-    exact = 1.0 - np.exp(-1.0)
-    errors = [
-        abs(_nonpolynomial_source(dt) - exact) for dt in (0.1, 0.05, 0.025, 0.0125)
-    ]
-    assert all(e > 0.0 for e in errors)
-    ratios = [errors[i] / errors[i + 1] for i in range(len(errors) - 1)]
-    for ratio in ratios:
-        assert 3.4 < ratio < 4.6, f"observed order ratios {ratios}, expected ~4"
-
-
-def _state_dependent_mass(dt, tmax=1.0):
-    """Integrate ``(1 + u) u' = 1`` (``u(0) = 0``), G = None.
-
-    The mass matrix ``M = dF/du̇ = (1 + u) v`` depends on the state ``u``
-    itself -- exactly the class of problem (variable density, porosity,
-    saturation, ...) that a mass matrix cached once at ``setUp`` time (the
-    initial condition, ``u = 0``) gets wrong on every step after the
-    first: ``_prepare_stage0_ydot`` would keep solving ``Ẏ_0`` against
-    ``M(0)`` forever, no matter how far ``u`` had actually moved, giving a
-    step that is FLAT in ``dt`` rather than converging -- silent, no
-    exception. Exact solution: separating variables, ``(1 + u) du = dt``,
-    so ``u + u^2/2 = t`` and ``u(t) = sqrt(1 + 2t) - 1``;
-    ``u(1) = sqrt(3) - 1``.
-    """
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(0.0)
-    F = inner((1.0 + u) * u_t, v) * dx - inner(Constant(1.0), v) * dx
-    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, tmax))
-    solver = firedrake_ts.DAESolver(
-        problem,
-        solver_parameters={
-            "ts_type": "python",
-            "ts_python_type": PYTHON_STEPPER,
-            "ts_ark_ssp_type": "esdirk_gamma5",
-            "ts_adapt_type": "none",
-            "ts_time_step": dt,
-            "ts_exact_final_time": "matchstep",
-        },
-        options_prefix="",
-    )
-    solver.solve()
-    return float(u.dat.data_ro[0])
-
-
-def test_esdirk_gamma5_converges_on_a_state_dependent_mass_matrix():
-    """The mass matrix M = dF/du̇ depends on u itself, so a Ẏ_0 solved
-    against a stale M(y^0) -- cached once, at setUp -- is flat in dt
-    rather than converging. See _state_dependent_mass's docstring and
-    _reassemble_stage0_mass, which _prepare_stage0_ydot calls
-    unconditionally to reassemble the mass matrix at (t^n, y^n) every step
-    precisely to avoid this. Not gated on a structural test for state
-    dependence: such a test passes here but misses a purely time-dependent
-    M -- see test_imex's
-    test_rhs_projection_operator_is_assembled_at_the_stage_state.
-
-    Measured on the unfixed code (mass matrix reused unconditionally from
-    ctx._rhs_projection_mass_matrix, assembled once): errors of
-    6.9e-2, 7.2e-2, 7.4e-2, 7.5e-2 at dt = 0.1, 0.05, 0.025, 0.0125 --
-    ratios ~0.96-0.99, i.e. converging to the WRONG limit, not shrinking.
-    """
-    exact = np.sqrt(3.0) - 1.0
-    errors = [
-        abs(_state_dependent_mass(dt) - exact) for dt in (0.1, 0.05, 0.025, 0.0125)
-    ]
-    assert all(e > 0.0 for e in errors)
-    ratios = [errors[i] / errors[i + 1] for i in range(len(errors) - 1)]
-    for ratio in ratios:
-        assert 3.4 < ratio < 4.6, f"observed order ratios {ratios}, expected ~4"
 
 
 def test_esdirk_gamma5_refuses_f_nonlinear_in_udot():
@@ -422,12 +332,7 @@ def test_esdirk_gamma5_refuses_f_nonlinear_in_udot():
     exact 1.0) rather than merely inaccurate. setUp must refuse this
     outright instead of handing back a plausible-looking wrong answer.
     """
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(0.0)
+    u, u_t, v = scalar_problem(u0=0.0)
     F = inner(u_t * u_t - Constant(1.0), v) * dx
     problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 1.0))
     solver = firedrake_ts.DAESolver(
@@ -471,12 +376,7 @@ def _diverging_problem(max_step_rejections, dt=0.5, extra=None):
     """A trivial implicit problem, set up only to have its stage solver
     replaced -- the equation itself never needs to be hard to solve.
     """
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
+    u, u_t, v = scalar_problem()
     F = inner(u_t, v) * dx + inner(u, v) * dx
     problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, dt))
     parameters = dict(
@@ -577,12 +477,7 @@ def test_snes_divergence_with_unlimited_rejections_stops_at_a_step_floor():
 def test_shu_osher_matches_butcher_on_the_same_problem():
     """The Shu-Osher path and PETSc's Butcher-form TSRK must agree."""
     _, ours = _decay("ssprk2", dt=1e-3)
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
+    u, u_t, v = scalar_problem()
     problem = firedrake_ts.DAEProblem(
         inner(u_t, v) * dx, u, u_t, (0.0, 1.0), G=-inner(u, v) * dx
     )
@@ -607,12 +502,7 @@ def test_limiter_fires_once_per_stage():
     def counting_limiter(vec):
         calls.append(vec.norm())
 
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
+    u, u_t, v = scalar_problem()
     problem = firedrake_ts.DAEProblem(
         inner(u_t, v) * dx, u, u_t, (0.0, 0.05), G=-inner(u, v) * dx
     )
@@ -657,9 +547,6 @@ def test_complete_refuses_when_neither_stiffly_accurate_nor_explicit():
     stepper = ARKSSP()
     with pytest.raises(ValueError, match="bogus_non_sa"):
         stepper._complete(bogus, None, None)
-
-
-ARK_SSP = {"ts_type": "python", "ts_python_type": PYTHON_STEPPER}
 
 
 def test_frozen_component_survives_the_implicit_solve():
@@ -793,12 +680,7 @@ def test_nothing_is_frozen_when_every_row_has_an_implicit_operator():
 
 def test_limiter_on_an_implicit_component_is_rejected():
     """Limiting a component with an implicit operator is unsound; say so."""
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
+    u, u_t, v = scalar_problem()
     F = inner(u_t, v) * dx + inner(grad(u), grad(v)) * dx
     problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 0.02), G=-inner(u, v) * dx)
     solver = firedrake_ts.DAESolver(
@@ -829,12 +711,7 @@ def test_limiter_registered_after_setup_is_still_rejected():
     without a dedicated test, that guard could be deleted with nothing
     failing.
     """
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
+    u, u_t, v = scalar_problem()
     F = inner(u_t, v) * dx + inner(grad(u), grad(v)) * dx
     problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 0.02), G=-inner(u, v) * dx)
     solver = firedrake_ts.DAESolver(
@@ -990,12 +867,7 @@ def test_purely_explicit_tableau_refuses_a_non_mass_f_term():
     direction that looks like a plausible answer, which is why this is a
     refusal rather than a warning.
     """
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
+    u, u_t, v = scalar_problem()
     # The u term belongs in G for this tableau; putting it in F is the error.
     F = inner(u_t, v) * dx + inner(u, v) * dx
     problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 1.0))
@@ -1012,63 +884,3 @@ def test_purely_explicit_tableau_refuses_a_non_mass_f_term():
     )
     with pytest.raises(ValueError, match="purely explicit"):
         solver.solve()
-
-
-def _time_dependent_mass(dt, tmax=1.0):
-    """Integrate ``(1 + t) u' = 1`` (``u(0) = 0``), G = None.
-
-    The mass matrix ``M = dF/du̇ = (1 + t) v`` depends on time but NOT on the
-    state, so ``dM/du`` is structurally zero. That distinction is the whole
-    point: a reassembly guarded on ``dM/du != 0`` -- which is what
-    _prepare_stage0_ydot used to carry -- skips every reassembly here and
-    keeps inverting ``M(t^0) = 1``, while passing the ``M(u)`` test that
-    motivated the guard. No structural predicate on the form can close this
-    in general either, since ``M`` may also close over a mutable auxiliary
-    Function, which is why the reassembly is unconditional.
-
-    Exact solution: ``du = dt / (1 + t)``, so ``u = ln(1 + t)`` and
-    ``u(1) = ln 2``. G is None, so this exercises the stage-0 mass solve
-    alone, not the RHS projection (which test_imex covers separately for
-    both kinds of non-constant mass).
-    """
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(0.0)
-    time = Constant(0.0)
-    F = inner((1.0 + time) * u_t, v) * dx - inner(Constant(1.0), v) * dx
-    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, tmax), time=time)
-    solver = firedrake_ts.DAESolver(
-        problem,
-        solver_parameters={
-            "ts_type": "python",
-            "ts_python_type": PYTHON_STEPPER,
-            "ts_ark_ssp_type": "esdirk_gamma5",
-            "ts_adapt_type": "none",
-            "ts_time_step": dt,
-            "ts_exact_final_time": "matchstep",
-        },
-        options_prefix="",
-    )
-    solver.solve()
-    return float(u.dat.data_ro[0])
-
-
-def test_esdirk_gamma5_converges_on_a_time_dependent_mass_matrix():
-    """M depends on t but not on u, so a dM/du guard misses it entirely.
-
-    Measured with the reassembly guarded on dM/du != 0: ratios
-    0.958/0.979/0.990 -- converging to the wrong limit -- against arkimex's
-    4.011/4.006/4.003 on the same problem. This is the regression test for
-    the fix in 29d335e, which until now was verified only by hand.
-    """
-    exact = np.log(2.0)
-    errors = [
-        abs(_time_dependent_mass(dt) - exact) for dt in (0.1, 0.05, 0.025, 0.0125)
-    ]
-    assert all(e > 0.0 for e in errors)
-    ratios = [errors[i] / errors[i + 1] for i in range(len(errors) - 1)]
-    for ratio in ratios:
-        assert 3.4 < ratio < 4.6, f"observed order ratios {ratios}, expected ~4"
