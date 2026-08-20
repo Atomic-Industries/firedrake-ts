@@ -244,9 +244,15 @@ def test_shu_osher_form_holds_bounds_with_no_post_step_clamp():
         "range the stepper handed it, which proves nothing about the "
         "Shu-Osher induction"
     )
-    assert solver.ts.getStepNumber() == 126, (
-        f"expected 126 accepted steps, got {solver.ts.getStepNumber()} -- "
-        "the run did not advance the way this test assumes"
+    # A range, not == 126: the exact count is an artifact of stepover's final
+    # overshoot (0.2/0.0016 landing one rounding past the last whole step), so
+    # pinning it made any unrelated change to step accounting fail here with a
+    # message pointing at the wrong thing. The L1-vs-exact-translate bound
+    # above is what actually establishes the run advanced.
+    steps = solver.ts.getStepNumber()
+    assert 120 <= steps <= 130, (
+        f"expected ~126 accepted steps, got {steps} -- the run did not "
+        "advance the way this test assumes"
     )
 
 

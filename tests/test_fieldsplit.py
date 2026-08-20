@@ -1,5 +1,6 @@
 """Fieldsplit preconditioning must work on mixed DAE problems."""
 
+import numpy as np
 import pytest
 from firedrake import *
 
@@ -48,17 +49,17 @@ def _coupled(with_G):
 
 
 @pytest.mark.parametrize("with_G", [False, True])
-def test_split_does_not_raise(with_G):
-    """split() must not die on DAEProblem's attribute names."""
-    solver, _ = _coupled(with_G)
-    splits = solver._ctx.split([[0], [1]])
-    assert len(splits) == 2
-
-
-@pytest.mark.parametrize("with_G", [False, True])
 def test_fieldsplit_solve_runs(with_G):
-    """A full solve under pc_type: fieldsplit must complete and advance."""
+    """A full solve under pc_type: fieldsplit must complete and advance.
+
+    Also covers "split() must not die on DAEProblem's attribute names", which
+    had its own test: the real PC-fieldsplit setup below drives
+    ``_TSContext.split`` through ``DMCreateFieldDecomposition``, so a raising
+    ``split()`` fails this test too. Only its ``len(splits) == 2`` assertion
+    was not implied, so it is kept here.
+    """
     solver, w = _coupled(with_G)
+    assert len(solver._ctx.split([[0], [1]])) == 2
     solver.solve()
     assert solver.ts.getStepNumber() > 0
     assert norm(w.sub(0)) > 0.0
@@ -94,14 +95,15 @@ def test_supplied_jacobian_is_not_doubled():
     mass = inner(du, v) * dx
     stiffness = inner(grad(du), grad(v)) * dx
 
-    # Derive the complete Jacobian the same way DAEProblem does internally
-    # when no J is supplied -- this branch is untouched by the fix, so it
-    # is a trustworthy "sigma*dF/du_t + dF/du" to hand to a second problem
-    # as an already-complete, caller-supplied J.
-    reference = firedrake_ts.DAEProblem(F, u, udot, (0.0, 1.0))
-    reference.shift.assign(3.0)
-
-    supplied = firedrake_ts.DAEProblem(F, u, udot, (0.0, 1.0), J=reference.J)
+    # Built through the documented callable-of-sigma route, which is the only
+    # way a caller can express the shift dependency at all: the shift Constant
+    # is created inside DAEProblem.__init__. This test used to have to borrow
+    # `reference.J` from a second DAEProblem to get a J with a live shift in
+    # it, which was the API telling us it had no front door.
+    supplied = firedrake_ts.DAEProblem(
+        F, u, udot, (0.0, 1.0), J=lambda sigma: sigma * mass + stiffness
+    )
+    supplied.shift.assign(3.0)
 
     expected = assemble(3.0 * mass + stiffness).petscmat
     actual = assemble(supplied.J).petscmat
@@ -110,3 +112,44 @@ def test_supplied_jacobian_is_not_doubled():
     # its own -- the pre-fix code gave 4*M + K here, not 3*M + K -- so no
     # second assertion against an (inaccurate) doubled value is needed.
     assert (actual - expected).norm() < 1e-10
+
+
+def test_supplied_jacobian_of_the_shift_solves_a_pure_ode():
+    """A caller-supplied J must be usable on a problem where dF/du is zero.
+
+    u' = -u with the whole operator in G: dF/du is structurally zero, so the
+    only Newton matrix that works is sigma*M. Passing a bare form -- the only
+    thing the API accepted before -- could not reference the shift, so the
+    best a caller could do was ``derivative(F, u)``, i.e. the zero matrix,
+    and the stage solve had nothing to invert. This is the case that proves
+    the callable route is not merely tidier but necessary.
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    udot = Function(V)
+    v = TestFunction(V)
+    du = TrialFunction(V)
+    u.assign(1.0)
+
+    problem = firedrake_ts.DAEProblem(
+        inner(udot, v) * dx,
+        u,
+        udot,
+        (0.0, 1.0),
+        G=-inner(u, v) * dx,
+        J=lambda sigma: sigma * inner(du, v) * dx,
+    )
+    firedrake_ts.DAESolver(
+        problem,
+        solver_parameters={
+            "ts_type": "arkimex",
+            "ts_arkimex_type": "2c",
+            "ts_adapt_type": "none",
+            "ts_time_step": 1e-2,
+            "ts_exact_final_time": "matchstep",
+        },
+        options_prefix="",
+    ).solve()
+
+    assert float(u.dat.data_ro[0]) == pytest.approx(np.exp(-1.0), abs=1e-4)

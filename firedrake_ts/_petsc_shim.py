@@ -14,7 +14,19 @@ import ctypes
 import glob
 import os
 
+import numpy
 from firedrake.petsc import PETSc
+
+# PetscInt and PetscReal, derived from the running PETSc rather than assumed.
+# Hardcoding c_int/c_double is correct only for a 32-bit-index double build:
+# under --with-64-bit-indices, TSAdaptChoose writes an 8-byte PetscInt through
+# a 4-byte buffer (silent stack corruption), and under --with-precision=single
+# every real is mis-marshalled. This module exists to get the ABI right, so it
+# should not be guessing the scalar widths.
+_PetscInt = numpy.ctypeslib.as_ctypes_type(numpy.dtype(PETSc.IntType))
+_PetscReal = numpy.ctypeslib.as_ctypes_type(numpy.dtype(PETSc.RealType))
+# PetscBool is a C enum, i.e. int, independent of --with-64-bit-indices.
+_PetscBool = ctypes.c_int
 
 __all__ = [
     "ts_adapt_candidate_add",
@@ -63,11 +75,11 @@ def _load():
     lib.TSAdaptCandidateAdd.argtypes = [
         ctypes.c_void_p,  # TSAdapt
         ctypes.c_char_p,  # name
-        ctypes.c_int,  # order
-        ctypes.c_int,  # stageorder
-        ctypes.c_double,  # ccfl
-        ctypes.c_double,  # cost
-        ctypes.c_int,  # inuse (PetscBool)
+        _PetscInt,  # order
+        _PetscInt,  # stageorder
+        _PetscReal,  # ccfl
+        _PetscReal,  # cost
+        _PetscBool,  # inuse
     ]
     lib.TSAdaptCandidateAdd.restype = ctypes.c_int
     # SIX arguments, not nine. Verified against the installed headers:
@@ -82,10 +94,10 @@ def _load():
     lib.TSAdaptChoose.argtypes = [
         ctypes.c_void_p,  # TSAdapt
         ctypes.c_void_p,  # TS
-        ctypes.c_double,  # h
-        ctypes.POINTER(ctypes.c_int),  # next_sc
-        ctypes.POINTER(ctypes.c_double),  # next_h
-        ctypes.POINTER(ctypes.c_int),  # accept (PetscBool)
+        _PetscReal,  # h
+        ctypes.POINTER(_PetscInt),  # next_sc
+        ctypes.POINTER(_PetscReal),  # next_h
+        ctypes.POINTER(_PetscBool),  # accept
     ]
     lib.TSAdaptChoose.restype = ctypes.c_int
     _lib = lib
@@ -108,29 +120,29 @@ def ts_adapt_candidates_clear(adapt):
     _check(_load().TSAdaptCandidatesClear(adapt), "TSAdaptCandidatesClear")
 
 
-def ts_adapt_candidate_add(adapt, name, order, stage_order, ccfl, cost, inuse):
+def ts_adapt_candidate_add(adapt, order, stage_order, ccfl, cost, inuse):
     """Register one candidate scheme with the adapt controller.
 
-    DO NOT pass a Python-owned string here expecting PETSc to keep it.
+    Deliberately takes no ``name``, and passes ``NULL``.
     ``TSAdaptCandidateAdd`` stores the ``name`` POINTER without copying the
     bytes (``adapt->candidates.name[c] = name``,
     ``src/ts/interface/tsadapt.c:848``) and dereferences it later, when
-    ``-ts_adapt_monitor`` prints the chosen candidate (``:1001``). The
-    temporary produced by ``name.encode()`` below is freed as soon as this
-    call returns, so any non-``None`` ``name`` is a use-after-free waiting
-    for someone to enable that monitor.
+    ``-ts_adapt_monitor`` prints the chosen candidate (``:1001``). Any
+    Python-owned string would be freed as soon as this call returned, so a
+    ``name`` parameter could only ever be a use-after-free waiting for
+    someone to enable that monitor.
 
-    Callers therefore pass ``None``. PETSc's own ``TSStep_ARKIMEX`` passes
-    ``tab->name`` (``arkimex.c:1514``) safely only because that is a static
-    string with program lifetime; ``ARKTableau.name`` is not, so mirroring
-    that line -- the obvious tidy-up, and what makes the monitor output
-    prettier -- would break it. Keeping the parameter (rather than dropping
-    it) leaves room for a caller that owns a genuinely long-lived buffer.
+    PETSc's own ``TSStep_ARKIMEX`` passes ``tab->name``
+    (``arkimex.c:1514``) safely only because that is a static string with
+    program lifetime; ``ARKTableau.name`` is not, so mirroring that line --
+    the obvious tidy-up, and what makes the monitor output prettier -- would
+    break it. A caller owning a genuinely long-lived buffer can add the
+    parameter back at that point; offering it now only invites the bug.
     """
     _check(
         _load().TSAdaptCandidateAdd(
             adapt,
-            name.encode() if name is not None else None,
+            None,
             int(order),
             int(stage_order),
             float(ccfl),
@@ -142,7 +154,11 @@ def ts_adapt_candidate_add(adapt, name, order, stage_order, ccfl, cost, inuse):
 
 
 def ts_adapt_choose(adapt, ts, h, last_accepted=True):
-    """Returns ``(next_scheme, next_h, accept)``.
+    """Returns ``(next_h, accept)``.
+
+    The ``next_sc`` candidate index PETSc also writes is not returned: only
+    one candidate is ever registered, so it is always 0, and the sole caller
+    discarded it.
 
     ``accept`` is an IN/OUT argument, not pure output. ``TSAdaptChoose_Basic``
     reads it before writing it::
@@ -163,9 +179,9 @@ def ts_adapt_choose(adapt, ts, h, last_accepted=True):
     shrinking h twice as much as requested. ``last_accepted`` defaults to
     ``True`` so the common single-attempt case needs nothing from the caller.
     """
-    next_sc = ctypes.c_int()
-    next_h = ctypes.c_double()
-    accept = ctypes.c_int(1 if last_accepted else 0)
+    next_sc = _PetscInt()
+    next_h = _PetscReal()
+    accept = _PetscBool(1 if last_accepted else 0)
     _check(
         _load().TSAdaptChoose(
             adapt,
@@ -177,8 +193,4 @@ def ts_adapt_choose(adapt, ts, h, last_accepted=True):
         ),
         "TSAdaptChoose",
     )
-    return (
-        next_sc.value,
-        next_h.value,
-        bool(accept.value),
-    )
+    return next_h.value, bool(accept.value)

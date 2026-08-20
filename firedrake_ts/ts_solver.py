@@ -10,6 +10,10 @@ from petsctools import OptionsManager
 
 from firedrake_ts.solving_utils import _TSContext, check_ts_convergence
 
+# PETSC_ERR_PYTHON, include/petscsystypes.h. libpetsc4py wraps any exception
+# raised inside a Python callback with this code.
+_PETSC_ERR_PYTHON = 101
+
 
 def check_pde_args(F, G, J, Jp):
     if not isinstance(F, (ufl.BaseForm, slate.TensorBase)):
@@ -79,10 +83,20 @@ class DAEProblem:
         :param tspan: the tuple for start time and end time
         :param time: the :class:`.Constant` for time-dependent weak forms
         :param bcs: the boundary conditions (optional)
-        :param J: the Jacobian J = sigma*dF/du̇ + dF/du (optional)
+        :param J: the complete Jacobian ``J = sigma*dF/du̇ + dF/du``
+                 (optional). Either a form, or -- preferably -- a callable
+                 taking the shift ``sigma`` and returning the form, e.g.
+                 ``J=lambda sigma: sigma * mass + stiffness``. ``sigma`` is a
+                 :class:`.Constant` this class owns and reassigns before every
+                 Jacobian evaluation, so a plain form has no way to depend on
+                 it: passing ``derivative(F, u)`` gives a Newton matrix with
+                 no mass term, which is singular for a pure ODE. Use the
+                 callable form unless the Jacobian genuinely has no
+                 ``dF/du̇`` part.
         :param Jp: a form used for preconditioning the linear system,
                  optional, if not supplied then the Jacobian itself
-                 will be used.
+                 will be used. Accepts the same callable-of-``sigma`` form
+                 as ``J``.
         :param dict form_compiler_parameters: parameters to pass to the form
             compiler (optional)
         :is_linear: internally used to check if all domain/bc forms
@@ -105,7 +119,6 @@ class DAEProblem:
         self.tspan = tspan
         self.F = F
         self.G = G
-        self.Jp = Jp
 
         if not isinstance(self.u_restrict, function.Function):
             raise TypeError(
@@ -127,9 +140,20 @@ class DAEProblem:
         # sigma*dF/du_t + dF/du, per the docstring above -- re-adding the
         # shift*dF/du_t term here would double the mass contribution. Only
         # derive it from the residual when the caller didn't supply one.
-        self.J = J or (
-            self.shift * ufl_expr.derivative(F, udot) + ufl_expr.derivative(F, u)
+        #
+        # The shift is this Constant, created here and reassigned before every
+        # Jacobian evaluation, so a caller passing a bare form has no way to
+        # reference it and can only ever supply a J with the wrong (or no)
+        # mass term -- which for a pure ODE, where dF/du is zero, is singular.
+        # Hence the callable form: J may be a function of the shift, which
+        # makes the dependency expressible and impossible to forget.
+        self.J = self._resolve_jacobian(
+            J,
+            default=lambda: (
+                self.shift * ufl_expr.derivative(F, udot) + ufl_expr.derivative(F, u)
+            ),
         )
+        self.Jp = self._resolve_jacobian(Jp)
 
         # Derive the Jacobian for the G residual
         self.dGdu = ufl_expr.derivative(G, u) if G is not None else None
@@ -141,6 +165,23 @@ class DAEProblem:
         self.form_compiler_parameters = form_compiler_parameters
         self._constant_jacobian = False
         self._constant_rhs_jacobian = False
+
+    def _resolve_jacobian(self, J, default=None):
+        """A supplied Jacobian, calling it with the shift if it is a factory.
+
+        The already-a-Jacobian check comes FIRST, and covers the same types
+        ``check_pde_args`` accepts. Both are callable in their own right --
+        ``ufl.Form.__call__`` does argument substitution, and
+        ``slate.TensorBase`` defines ``__call__`` too -- so a bare
+        ``callable(J)`` test would invoke the form instead of using it.
+        """
+        if J is None:
+            return default() if default is not None else None
+        if isinstance(J, (ufl.BaseForm, slate.TensorBase)):
+            return J
+        if callable(J):
+            return J(self.shift)
+        return J
 
     def dirichlet_bcs(self):
         for bc in self.bcs:
@@ -399,7 +440,18 @@ class DAESolver(OptionsManager):
         # for any TS type but the ``TSPYTHON`` stepper that stashes its own.
         # ``arkimex`` is a builtin type, so that recovery does not apply,
         # and this check needs to raise before the callback boundary.
-        self._ctx._check_G_vanishes_on_algebraic_rows()
+        #
+        # Inside inserted_options(), because the check forces the
+        # _algebraic_fields cached_property, which reads
+        # -ts_algebraic_fields from the options database via resolve_fields.
+        # Options passed in solver_parameters only enter that database here,
+        # and OptionsManager deletes them again on exit -- so running the
+        # check outside meant the documented override was silently ignored
+        # AND cached wrong for the rest of the solve, stamping unit
+        # diagonals on the wrong rows of dF/du_t. It worked from the command
+        # line only, which is not a distinction any caller would expect.
+        with self.inserted_options():
+            self._ctx._check_G_vanishes_on_algebraic_rows()
 
         self._set_problem_eval_funcs(
             self._ctx,
@@ -432,6 +484,7 @@ class DAESolver(OptionsManager):
                     self._transfer_operators,
                 ):
                     stack.enter_context(ctx)
+                self._clear_python_stepper_error()
                 try:
                     self.ts.solve(work)
                 except PETSc.Error as exc:
@@ -443,13 +496,29 @@ class DAESolver(OptionsManager):
                     # So the stepper records its own exception and we
                     # re-raise that, which keeps PETSc's printed C-stack
                     # diagnostics intact.
-                    original = self._python_stepper_error()
+                    # Only PETSC_ERR_PYTHON can be a stashed Python exception.
+                    # Without this gate, any C-level PETSc failure would be
+                    # reported as whatever the stepper last stashed.
+                    original = (
+                        self._python_stepper_error()
+                        if exc.ierr == _PETSC_ERR_PYTHON
+                        else None
+                    )
                     if original is not None:
                         raise original from exc
                     raise
             work.copy(u)
         self._setup = True
         check_ts_convergence(self.ts)
+
+    def _python_stepper_context(self):
+        """The Python context of a ``TSPYTHON`` stepper, or ``None``."""
+        if self.ts.getType() != PETSc.TS.Type.PYTHON:
+            return None
+        try:
+            return self.ts.getPythonContext()
+        except PETSc.Error:
+            return None
 
     def _python_stepper_error(self):
         """The exception a TSPYTHON stepper recorded, if any.
@@ -458,13 +527,22 @@ class DAESolver(OptionsManager):
         ``ARKSSP._error``); anything else -- including a non-Python TS, or
         a Python context that doesn't record errors -- yields ``None``.
         """
-        if self.ts.getType() != PETSc.TS.Type.PYTHON:
-            return None
-        try:
-            context = self.ts.getPythonContext()
-        except PETSc.Error:
-            return None
-        return getattr(context, "_error", None)
+        return getattr(self._python_stepper_context(), "_error", None)
+
+    def _clear_python_stepper_error(self):
+        """Drop any stashed exception before a solve.
+
+        ``ARKSSP`` clears ``_error`` at the top of ``setUp`` and ``step``, but
+        neither runs again on a second ``solve()`` of an already-set-up TS. A
+        failure raised outside ``step()`` on that second solve -- from a
+        raising ``monitor_callback``, an event handler or ``TSTrajectory`` --
+        would otherwise be reported as the FIRST solve's exception, with a
+        misleading ``from`` chain. Cleared by the caller so this does not
+        depend on the callee's own housekeeping.
+        """
+        context = self._python_stepper_context()
+        if getattr(context, "_error", None) is not None:
+            context._error = None
 
     def adjoint_solve(self):
         r"""Solve the adjoint problem."""

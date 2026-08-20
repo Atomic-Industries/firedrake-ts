@@ -39,11 +39,16 @@ def _decay(tableau, dt=1e-3, tmax=1.0, extra=None):
 
 
 def test_stepper_is_selectable_and_sets_up():
-    """-ts_type python -ts_python_type must resolve and run setUp once."""
+    """-ts_type python -ts_python_type must resolve and run setUp."""
+    from firedrake_ts.ark_ssp import ARKSSP
+
     solver, _ = _decay("imex_euler", dt=0.1)
     ctx = solver.ts.getPythonContext()
-    assert type(ctx).__name__ == "ARKSSP"
-    assert ctx.setup_calls == 1
+    assert isinstance(ctx, ARKSSP)
+    # Asserts setUp ran by an artifact only setUp produces, rather than by a
+    # call counter that existed solely to be read here.
+    assert ctx._mass_ksp is not None
+    assert ctx._P is not None and ctx._q is not None
 
 
 def test_setup_rerun_destroys_the_stale_stage0_mass_ksp():
@@ -109,38 +114,16 @@ def test_stage_solves_do_work():
     assert solver.snes.getConvergedReason() > 0
 
 
-def test_matches_the_arkimex_path():
-    """ARKSSP and PETSc's own arkimex must agree beyond method error."""
-    _, ours = _decay("imex_euler", dt=1e-4)
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
-    problem = firedrake_ts.DAEProblem(
-        inner(u_t, v) * dx, u, u_t, (0.0, 1.0), G=-inner(u, v) * dx
-    )
-    firedrake_ts.DAESolver(
-        problem,
-        solver_parameters={
-            "ts_type": "arkimex",
-            "ts_arkimex_type": "2c",
-            "ts_adapt_type": "none",
-            "ts_time_step": 1e-4,
-            "ts_exact_final_time": "stepover",
-        },
-        options_prefix="",
-    ).solve()
-    assert abs(ours - float(u.dat.data_ro[0])) < 1e-3
-
-
-def test_radius_above_the_ssp_limit_is_rejected():
-    """Silently losing the SSP guarantee is the failure mode we must not have."""
-    from firedrake_ts.tableaux import ShuOsherError
-
-    with pytest.raises(ShuOsherError, match="exceeds the radius"):
-        _decay("ssprk2", dt=0.1, extra={"ts_ark_ssp_radius": 5.0})
+# The ARKSSP-vs-PETSc cross-check lives in
+# test_shu_osher_matches_butcher_on_the_same_problem, which makes the same
+# comparison against the same arkimex-2c reference at a tighter tolerance
+# (1e-5 vs 1e-3) and a tenth of the step count. An imex_euler version of it
+# at dt=1e-4 cost 42s -- 37% of the whole suite, 20k timesteps across two
+# solves -- to assert a 1e-3 bound on a difference of ~2e-5. Its content is
+# already covered analytically against exp(-1) by
+# test_imex_euler_advances_and_converges and _is_first_order above; at
+# dt=1e-3 the imex_euler error is ~5e-4 against that 1e-3 bound, too close to
+# retune rather than drop.
 
 
 def test_shu_osher_error_is_unwrapped_with_the_actionable_numbers():
@@ -151,12 +134,18 @@ def test_shu_osher_error_is_unwrapped_with_the_actionable_numbers():
     to the original ShuOsherError so the message -- naming both the
     offending r and the radius of absolute monotonicity R(A,b) -- reaches the
     caller directly instead of being hidden behind an opaque error code.
+
+    Subsumes a separate rejection test that made the identical call and
+    asserted only the "exceeds the radius" match, which is kept here so
+    nothing is lost: refusing an over-large radius is the whole point, since
+    silently losing the SSP guarantee is the failure mode we must not have.
     """
     from firedrake_ts.tableaux import ShuOsherError
 
     with pytest.raises(ShuOsherError) as excinfo:
         _decay("ssprk2", dt=0.1, extra={"ts_ark_ssp_radius": 5.0})
     message = str(excinfo.value)
+    assert "exceeds the radius" in message
     assert "r = 5.0" in message
     assert "R(A,b)" in message
 
@@ -170,9 +159,17 @@ def test_ssprk2_is_second_order():
 
 
 def test_ssprk2_needs_no_implicit_solve():
-    """At is identically zero, so no stage may enter the SNES."""
+    """At is identically zero, so no stage may enter the SNES.
+
+    Queries the SNES directly, for the same reason
+    ``test_stage_solves_do_work`` does: ``ts.getSNESIterations()`` is
+    unconditionally 0 for a TSPYTHON type that owns ``step()`` (PETSc only
+    accumulates ``ts->snes_its`` inside its own step drivers), so asserting
+    it reads 0 here could not fail and did not test the claim -- measured 0
+    for esdirk_gamma5 too, which solves a stage at every step.
+    """
     solver, _ = _decay("ssprk2", dt=1e-2)
-    assert solver.ts.getSNESIterations() == 0
+    assert solver.snes.getIterationNumber() == 0
 
 
 def _pure_implicit_decay(dt, tmax=1.0):

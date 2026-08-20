@@ -1,13 +1,10 @@
 """Tableau algebra. No Firedrake, no PETSc -- pure numpy at machine precision."""
 
-import dataclasses
-
 import numpy as np
 import pytest
 
 from firedrake_ts.tableaux import (
     ShuOsherError,
-    butcher_to_K,
     kraaijevanger_radius,
     shu_osher,
 )
@@ -71,27 +68,39 @@ def test_heun_gives_the_textbook_form():
     np.testing.assert_allclose(P, expected_P, atol=1e-14)
 
 
-@pytest.mark.parametrize("A,b,r", [(SSPRK32_A, SSPRK32_B, 2.0), (HEUN_A, HEUN_B, 1.0)])
+@pytest.mark.parametrize(
+    "A,b,r",
+    [
+        (SSPRK32_A, SSPRK32_B, 0.5),
+        (SSPRK32_A, SSPRK32_B, 1.0),
+        (SSPRK32_A, SSPRK32_B, 2.0),
+        (HEUN_A, HEUN_B, 0.25),
+        (HEUN_A, HEUN_B, 1.0),
+    ],
+)
 def test_shu_osher_reproduces_the_butcher_map(A, b, r):
-    """The two representations must agree to machine precision."""
-    P, q = shu_osher(A, b, r)
-    for z in [-0.3, -1.0 + 0.4j, 0.7, -2.5, 1.5 - 2.0j]:
-        np.testing.assert_allclose(
-            _stages_shu_osher(z, P, q, r), _stages_butcher(z, A, b), atol=1e-14
-        )
+    """The two representations must agree to machine precision, for any valid r.
 
+    Swept over r rather than tested only at r = R(A, b), because
+    ``-ts_ark_ssp_radius`` is a user-facing option for any 0 < r <= R and the
+    Butcher map must be independent of it -- the r-dependence is supposed to
+    cancel between ``P = r M^-1 K`` and the ``h/r`` in the stage recursion.
+    Nothing else covers a sub-maximal radius.
 
-@pytest.mark.parametrize("A,b,r", [(SSPRK32_A, SSPRK32_B, 2.0), (HEUN_A, HEUN_B, 1.0)])
-def test_rows_are_nonnegative_partitions_of_unity(A, b, r):
-    """Every row, INCLUDING the completion row, must be a convex combination.
-
-    This is what makes the accepted step bounded by a convex combination of
-    previous stages, so no post-step clamping is needed.
+    Nonnegativity is asserted here too, where it is a real claim about r <= R
+    across a range. There is deliberately NO ``P.sum(1) + q == 1`` assertion:
+    that is an algebraic identity for ANY A, b and invertible M, not a
+    property of the tableau -- with M = I + rK,
+    ``P.sum(1) + q = M^-1 (rKe + e) = M^-1 M e = e`` -- so it could not fail
+    and told us nothing about the conversion.
     """
     P, q = shu_osher(A, b, r)
     assert P.min() >= -1e-14
     assert q.min() >= -1e-14
-    np.testing.assert_allclose(P.sum(axis=1) + q, 1.0, atol=1e-14)
+    for z in [-0.3, -1.0 + 0.4j, 0.7, -2.5, 1.5 - 2.0j]:
+        np.testing.assert_allclose(
+            _stages_shu_osher(z, P, q, r), _stages_butcher(z, A, b), atol=1e-14
+        )
 
 
 def test_completion_row_equals_last_stage_row_under_stiff_accuracy():
@@ -126,9 +135,11 @@ def test_radius_is_sharp():
     assert "R(A,b) = 2" in message
 
 
-def test_butcher_to_K_shape():
-    K = butcher_to_K(HEUN_A, HEUN_B)
-    np.testing.assert_allclose(K, [[0, 0, 0], [1, 0, 0], [0.5, 0.5, 0]], atol=1e-14)
+# butcher_to_K's shape and placement are not asserted directly: transcribing
+# its six lines with Heun's numbers restates the implementation, and any
+# misplacement (a transpose, b in the wrong row) breaks
+# test_shu_osher_reproduces_the_butcher_map, which checks the stage map the
+# folded completion row is there to produce.
 
 
 def test_module_does_not_import_firedrake():
@@ -187,7 +198,12 @@ from firedrake_ts.tableaux import (  # noqa: E402
 
 
 def test_registry_has_the_expected_tableaux():
-    assert set(TABLEAUX) == {
+    """The documented -ts_ark_ssp_type values must all be registered.
+
+    A superset test, not equality: registering a new tableau is a legitimate
+    change and should not have to update this test to land.
+    """
+    assert set(TABLEAUX) >= {
         "imex_euler",
         "ssprk2",
         "esdirk_gamma5",
@@ -255,30 +271,19 @@ def test_ssp2_444_lsa_radius_and_embedding():
     assert report["r5_bhat_dot_c"] == pytest.approx(1 / 3, abs=1e-12)
 
 
-@pytest.mark.parametrize("name", ["imex_euler", "ssprk2"])
+@pytest.mark.parametrize("name", ["imex_euler"])
 def test_shakedown_tableaux_have_unit_radius(name):
+    """ssprk2 is covered by test_kraaijevanger_radius, whose local HEUN_A/HEUN_B
+    ARE this tableau's A and b, so parametrizing it here re-ran that check."""
     tab = TABLEAUX[name]
     assert kraaijevanger_radius(tab.A, tab.b) == pytest.approx(1.0, abs=1e-9)
 
 
-def test_arktableau_uses_identity_equality():
-    """ARKTableau uses identity-based equality and hash, not content equality.
-
-    This is essential for registry lookups: numpy arrays are unhashable and
-    direct equality is ambiguous. Regression here means eq=False was removed,
-    breaking both hash() and == with array-valued fields.
-    """
-    # Test 1: hash does not raise. Creating a set exercises hashing on all
-    # elements, so this verifies that hash() succeeds for all four tableaux.
-    tab = TABLEAUX["imex_euler"]
-    assert len({t for t in TABLEAUX.values()}) == 4
-
-    # Test 2: two separately-constructed instances with different arrays
-    # compare unequal without raising. This is the case that would raise
-    # ValueError ("truth value of array is ambiguous") if eq=True.
-    tab2 = dataclasses.replace(tab, b=np.array([2.0, -1.0]))
-    assert tab != tab2  # Should not raise, should be False
-    assert not (tab == tab2)  # Should not raise
+# ARKTableau's eq=False is not asserted. It was justified as "essential for
+# registry lookups", but TABLEAUX is {t.name: t} -- keyed by strings -- and
+# nothing in the package hashes or compares an ARKTableau, so the test pinned
+# a dataclass option no caller depends on, and its set-of-four assertion was a
+# second inventory pin that a fifth tableau would break.
 
 
 @pytest.mark.parametrize(

@@ -195,10 +195,11 @@ def test_adapt_choose_is_told_whether_the_last_attempt_failed():
     def spy(adapt, ts, h, last_accepted=True):
         seen.append(last_accepted)
         result = real_choose(adapt, ts, h, last_accepted)
-        if not result[2]:  # this attempt is being rejected
-            as_failed = real_choose(adapt, ts, h, False)
-            as_accepted = real_choose(adapt, ts, h, True)
-            ratios.append(as_failed[1] / as_accepted[1])
+        _, accept = result
+        if not accept:  # this attempt is being rejected
+            h_as_failed, _ = real_choose(adapt, ts, h, False)
+            h_as_accepted, _ = real_choose(adapt, ts, h, True)
+            ratios.append(h_as_failed / h_as_accepted)
         return result
 
     ark_ssp.ts_adapt_choose = spy

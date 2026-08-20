@@ -33,23 +33,23 @@ def _three_field():
 
 
 def test_algebraic_fields_finds_the_constraint_row():
+    """Exactly the pressure row: (1,), not (0, 1) and not (1, 2).
+
+    Together with the next test, this pins that differential/algebraic and
+    implicit/explicit are DIFFERENT questions over the same form: the two
+    answers here are (1,) and (0,), so they are disjoint, and T (row 2) --
+    which has both a time derivative and an implicit operator -- is in
+    neither. A separate test asserting that disjointness followed
+    deductively from these two exact tuples and could not fail on its own.
+    """
     F, w, wdot, _, _ = _three_field()
     assert algebraic_fields(F, w, wdot, 3) == (1,)
 
 
 def test_explicitly_governed_fields_finds_the_mass_only_row():
+    """Exactly the mass-only row: (0,). See the note above on the partitions."""
     F, w, wdot, _, _ = _three_field()
     assert explicitly_governed_fields(F, w, wdot, 3) == (0,)
-
-
-def test_partitions_are_distinct():
-    """Differential/algebraic is NOT implicit/explicit. T is in both halves."""
-    F, w, wdot, _, _ = _three_field()
-    algebraic = algebraic_fields(F, w, wdot, 3)
-    explicit_only = explicitly_governed_fields(F, w, wdot, 3)
-    assert set(algebraic).isdisjoint(explicit_only)
-    assert 2 not in algebraic
-    assert 2 not in explicit_only
 
 
 def test_nonsingular_two_field_has_no_algebraic_rows():
@@ -186,11 +186,10 @@ def _rung1(stepper, dt=1e-3, tmax=1.0):
 ARKIMEX = {"ts_type": "arkimex", "ts_arkimex_type": "2c"}
 
 
-def test_rung1_singular_mass_runs_under_arkimex():
-    """A singular mass matrix must not break the RHS projection."""
-    y, z = _rung1(ARKIMEX)
-    assert y == pytest.approx(np.exp(-1.0), abs=1e-3)
-    assert z == pytest.approx(-np.exp(-1.0), abs=1e-3)
+# "A singular mass matrix must not break the RHS projection" under arkimex is
+# test_rung1_dual_path[arkimex] below -- same helper, same tableau, same two
+# abs=1e-3 assertions. A standalone copy of it here was a second 1000-step run
+# of exactly that.
 
 
 def test_G_nonzero_on_an_algebraic_row_is_rejected():
@@ -216,23 +215,10 @@ def test_G_nonzero_on_an_algebraic_row_is_rejected():
         solver.solve()
 
 
-def test_nonsingular_projection_is_unchanged():
-    """The existing non-mixed path must be byte-identical."""
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    u.assign(1.0)
-    problem = firedrake_ts.DAEProblem(
-        inner(u_t, v) * dx, u, u_t, (0.0, 1.0), G=-inner(u, v) * dx
-    )
-    firedrake_ts.DAESolver(
-        problem,
-        solver_parameters=dict(RUNG_PARAMS, ts_time_step=1e-3, **ARKIMEX),
-        options_prefix="",
-    ).solve()
-    assert float(u.dat.data_ro[0]) == pytest.approx(np.exp(-1.0), abs=1e-4)
+# "The existing non-mixed path must be unchanged" is test_imex.py's
+# test_imex_advances_solution[2c]: same form, same tableau, same dt, same
+# abs=1e-4 tolerance, and it additionally asserts liveness and covers three
+# more tableaux. A copy of it here was strictly the weaker of the two.
 
 
 def test_project_rhs_false_is_rejected_when_G_is_supplied():
@@ -286,6 +272,50 @@ def test_two_algebraic_fields_drive_the_concatenated_zero_rows():
     assert float(w.sub(0).dat.data_ro[0]) == pytest.approx(exact_y, abs=1e-3)
     assert float(w.sub(1).dat.data_ro[0]) == pytest.approx(exact_y, abs=1e-3)
     assert float(w.sub(2).dat.data_ro[0]) == pytest.approx(-exact_y, abs=1e-3)
+
+
+def test_algebraic_fields_override_is_read_from_solver_parameters():
+    """``ts_algebraic_fields`` must work from ``solver_parameters``, not just
+    from the command line.
+
+    ``_algebraic_fields`` is a ``cached_property`` that reads the option out
+    of PETSc's database via ``resolve_fields``, and it is forced eagerly by
+    ``solve()``'s ``_check_G_vanishes_on_algebraic_rows`` call. Options given
+    in ``solver_parameters`` are only pushed into that database inside
+    ``inserted_options()`` (and deleted again on exit), so forcing the
+    property outside it resolved the option to its structural default AND
+    cached that for the rest of the solve -- silently ignoring the documented
+    override and stamping unit diagonals on the wrong rows of ``dF/du_t``.
+
+    Declaring row 0 algebraic here is deliberately WRONG for this problem
+    (row 0 is differential), because a correct override is indistinguishable
+    from the detected default. ``G`` is nonzero on row 0, so if the override
+    is honoured the ``G``-vanishes check must reject it; if it is dropped,
+    the solve proceeds happily -- which is exactly the bug.
+    """
+    mesh = UnitIntervalMesh(1)
+    R = FunctionSpace(mesh, "DG", 0)
+    W = R * R
+    w = Function(W)
+    wdot = Function(W)
+    y, z = split(w)
+    ydot, _zdot = split(wdot)
+    vy, vz = TestFunctions(W)
+    w.sub(0).assign(1.0)
+    w.sub(1).assign(1.0)
+    F = inner(ydot, vy) * dx + inner(z - y, vz) * dx
+    G = inner(-y, vy) * dx
+
+    problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, 0.1), G=G)
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters=dict(
+            RUNG_PARAMS, ts_time_step=1e-2, ts_algebraic_fields="0,1", **ARKIMEX
+        ),
+        options_prefix="",
+    )
+    with pytest.raises(ValueError, match="G is nonzero on algebraic"):
+        solver.solve()
 
 
 ARK_SSP_G5 = {

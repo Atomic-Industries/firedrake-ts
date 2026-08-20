@@ -45,14 +45,42 @@ def butcher_to_K(A, b):
     return K
 
 
-def _monotone_at(K, r, tol=1e-13):
-    """Is ``I + rK`` invertible with ``M^-1 K >= 0`` and ``M^-1 e >= 0``?"""
+# Tolerance on the monotonicity coefficients ``M^-1 K`` and ``M^-1 e``. At
+# ``r == R(A, b)`` some coefficient is mathematically exactly zero, so this
+# absorbs the rounding of that zero; measured worst case across all four
+# registered tableaux is -1e-13. Applied to ``M^-1 K`` and NOT to
+# ``P = r M^-1 K``, so that ``shu_osher`` tests exactly the quantity
+# ``kraaijevanger_radius`` bisected on -- see the note in ``shu_osher``.
+_MONOTONE_TOL = 1e-13
+
+
+def _shu_osher_raw(K, r):
+    """``(M^-1 K, M^-1 e)`` for ``M = I + rK``, or ``None`` if ``M`` is singular.
+
+    The single implementation behind both ``_monotone_at`` and ``shu_osher``,
+    so the predicate that chooses a radius and the predicate that enforces it
+    cannot drift apart.
+
+    Solves rather than inverting (as ``stability_function`` already does),
+    and tests conditioning rather than ``|det|``: the determinant scales as
+    ``sigma^n``, so a ``|det| < eps`` threshold means different things for
+    different tableau scalings and stage counts.
+    """
     n = K.shape[0]
     M = np.eye(n) + r * K
-    if abs(np.linalg.det(M)) < 1e-14:
+    cond = np.linalg.cond(M)
+    if not np.isfinite(cond) or cond > 1.0 / np.finfo(float).eps:
+        return None
+    return np.linalg.solve(M, K), np.linalg.solve(M, np.ones(n))
+
+
+def _monotone_at(K, r, tol=_MONOTONE_TOL):
+    """Is ``I + rK`` invertible with ``M^-1 K >= 0`` and ``M^-1 e >= 0``?"""
+    raw = _shu_osher_raw(K, r)
+    if raw is None:
         return False
-    Minv = np.linalg.inv(M)
-    return bool((Minv @ K >= -tol).all() and (Minv @ np.ones(n) >= -tol).all())
+    MinvK, q = raw
+    return bool((MinvK >= -tol).all() and (q >= -tol).all())
 
 
 def kraaijevanger_radius(A, b, hi=50.0, iterations=200):
@@ -91,14 +119,20 @@ def shu_osher(A, b, r):
     if r <= 0.0:
         raise ShuOsherError(f"r must be positive, got {r!r}")
     K = butcher_to_K(A, b)
-    n = K.shape[0]
-    M = np.eye(n) + r * K
-    if abs(np.linalg.det(M)) < 1e-14:
+    raw = _shu_osher_raw(K, r)
+    if raw is None:
         raise ShuOsherError(f"I + rK is singular at r = {r!r}")
-    Minv = np.linalg.inv(M)
-    P = r * (Minv @ K)
-    q = Minv @ np.ones(n)
-    if P.min() < -1e-13 or q.min() < -1e-13:
+    MinvK, q = raw
+    P = r * MinvK
+    # Tested on ``M^-1 K``, not on ``P = r M^-1 K``. The default radius is
+    # ``kraaijevanger_radius``'s bisection result (ark_ssp.py:165-172), which
+    # bisects on ``M^-1 K >= -tol``; testing ``P`` against the same absolute
+    # tolerance is a test r times stricter, so for the two r = 2 tableaux this
+    # function could reject the radius the bisection had just chosen, raising
+    # "r = 2.0 exceeds the radius of absolute monotonicity R(A,b) = 2.0". The
+    # margin was 8e-17: all four registered tableaux sit at min = -9.992e-14
+    # against a -1e-13 threshold, so a different BLAS or CPU was enough.
+    if MinvK.min() < -_MONOTONE_TOL or q.min() < -_MONOTONE_TOL:
         radius = kraaijevanger_radius(A, b)
         raise ShuOsherError(
             f"r = {r!r} exceeds the radius of absolute monotonicity "
@@ -116,9 +150,16 @@ class ARKTableau:
     embedded weights; ``At, bt`` the implicit tableau and completion; ``c, ct``
     the abscissae; ``d`` the dense-output theta-coefficients.
 
-    Uses identity-based equality to enable hashing for registry lookups, as
-    direct equality on ndarrays is ambiguous. Tableau lookup is by ``name`` via
-    ``TABLEAUX``, and content equality is not needed.
+    ``eq=False`` because ``==`` on ndarray fields is ambiguous; lookup is by
+    ``name`` via ``TABLEAUX``, so content equality is never needed.
+
+    The predicates below live here, rather than being spelled out at each use
+    site, because the stepper *branches* on them (``_complete`` raises when a
+    tableau is neither stiffly accurate nor purely explicit) while
+    ``acceptance_report`` *asserts* on them -- so two open-coded copies could
+    disagree, letting a tableau pass its acceptance test and then hit the raise.
+    ``has_implicit_part`` and ``has_implicit_stage`` are genuinely different
+    questions and had been used interchangeably; they are named apart here.
     """
 
     name: str
@@ -131,6 +172,33 @@ class ARKTableau:
     ct: np.ndarray
     d: np.ndarray
     order: int
+
+    @property
+    def stiffly_accurate(self):
+        """Do both completions equal their tableau's last stage row?"""
+        return bool(
+            np.allclose(self.b, self.A[-1], atol=1e-14)
+            and np.allclose(self.bt, self.At[-1], atol=1e-14)
+        )
+
+    @property
+    def purely_explicit(self):
+        """Is the implicit tableau identically zero, so no stage solves?"""
+        return not bool(np.any(self.At))
+
+    @property
+    def has_implicit_part(self):
+        """Does the implicit completion contribute, i.e. is any ``bt`` nonzero?
+
+        Distinct from ``has_implicit_stage``: this governs whether the
+        ``Ydot`` terms enter a completion at all.
+        """
+        return bool(np.any(self.bt))
+
+    @property
+    def has_implicit_stage(self):
+        """Does any stage have a positive implicit diagonal, needing a solve?"""
+        return bool(np.any(np.diagonal(self.At) > 0))
 
 
 def stability_function(At, w, z):
@@ -160,6 +228,7 @@ def acceptance_report(tab):
     return {
         "r3_explicit": bool(np.allclose(tab.b, tab.A[-1], atol=1e-14)),
         "r3_implicit": bool(np.allclose(tab.bt, tab.At[-1], atol=1e-14)),
+        "r3_stiffly_accurate": tab.stiffly_accurate,
         "r4_r_infinity": stability_function(tab.At, tab.bt, -1e8).real,
         "r5_bhat_sum": float(tab.bhat.sum()),
         "r5_bhat_dot_c": float(tab.bhat @ tab.c),
