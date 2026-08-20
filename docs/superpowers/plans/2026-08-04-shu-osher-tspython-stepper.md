@@ -297,9 +297,7 @@ def test_heun_gives_the_textbook_form():
     np.testing.assert_allclose(P, expected_P, atol=1e-14)
 
 
-@pytest.mark.parametrize(
-    "A,b,r", [(SSPRK32_A, SSPRK32_B, 2.0), (HEUN_A, HEUN_B, 1.0)]
-)
+@pytest.mark.parametrize("A,b,r", [(SSPRK32_A, SSPRK32_B, 2.0), (HEUN_A, HEUN_B, 1.0)])
 def test_shu_osher_reproduces_the_butcher_map(A, b, r):
     """The two representations must agree to machine precision."""
     P, q = shu_osher(A, b, r)
@@ -309,9 +307,7 @@ def test_shu_osher_reproduces_the_butcher_map(A, b, r):
         )
 
 
-@pytest.mark.parametrize(
-    "A,b,r", [(SSPRK32_A, SSPRK32_B, 2.0), (HEUN_A, HEUN_B, 1.0)]
-)
+@pytest.mark.parametrize("A,b,r", [(SSPRK32_A, SSPRK32_B, 2.0), (HEUN_A, HEUN_B, 1.0)])
 def test_rows_are_nonnegative_partitions_of_unity(A, b, r):
     """Every row, INCLUDING the completion row, must be a convex combination.
 
@@ -455,9 +451,7 @@ def _monotone_at(K, r, tol=1e-13):
     if abs(np.linalg.det(M)) < 1e-14:
         return False
     Minv = np.linalg.inv(M)
-    return bool(
-        (Minv @ K >= -tol).all() and (Minv @ np.ones(n) >= -tol).all()
-    )
+    return bool((Minv @ K >= -tol).all() and (Minv @ np.ones(n) >= -tol).all())
 
 
 def kraaijevanger_radius(A, b, hi=50.0, iterations=200):
@@ -683,7 +677,9 @@ def stability_function(At, w, z):
     At = np.asarray(At, dtype=float)
     n = At.shape[0]
     e = np.ones(n)
-    return 1.0 + z * (np.asarray(w, dtype=float) @ np.linalg.solve(np.eye(n) - z * At, e))
+    return 1.0 + z * (
+        np.asarray(w, dtype=float) @ np.linalg.solve(np.eye(n) - z * At, e)
+    )
 
 
 def acceptance_report(tab):
@@ -799,10 +795,7 @@ _SSP2_444_LSA = _t(
     order=2,
 )
 
-TABLEAUX = {
-    t.name: t
-    for t in (_IMEX_EULER, _SSPRK2, _ESDIRK_GAMMA5, _SSP2_444_LSA)
-}
+TABLEAUX = {t.name: t for t in (_IMEX_EULER, _SSPRK2, _ESDIRK_GAMMA5, _SSP2_444_LSA)}
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -1002,11 +995,11 @@ class ARKSSP:
         self._q = None
         self._r = None
         # Work vectors, allocated in setUp.
-        self._Y = None      # stage values
-        self._L = None      # explicit slopes, M^-1 G(Y_j)
-        self._Ydot = None   # implicit stage derivatives
-        self._Z = None      # Butcher stage offset
-        self._rhs = None    # scratch for computeRHSFunction
+        self._Y = None  # stage values
+        self._L = None  # explicit slopes, M^-1 G(Y_j)
+        self._Ydot = None  # implicit stage derivatives
+        self._Z = None  # Butcher stage offset
+        self._rhs = None  # scratch for computeRHSFunction
         # Set per stage, read by the SNES callbacks.
         self._stage = None
         self._shift = None
@@ -1108,9 +1101,7 @@ class ARKSSP:
             # petsc4py exposes no PETSc.ERR_* constants, so signal with
             # Firedrake's own exception. Task 10 replaces this with a step
             # rejection routed through TSAdapt.
-            raise ConvergenceError(
-                f"stage {i} SNES diverged, reason {reason}"
-            )
+            raise ConvergenceError(f"stage {i} SNES diverged, reason {reason}")
         self._Y[i].copy(self._Ydot[i])
         self._Ydot[i].axpy(-1.0, self._Z)
         self._Ydot[i].scale(self._shift)
@@ -1459,9 +1450,9 @@ def _three_field():
     fdot, pdot, Tdot = split(wdot)
     vf, vp, vT = TestFunctions(W)
     F = (
-        inner(fdot, vf) * dx           # mass only -> explicitly governed
-        + inner(p - T, vp) * dx        # algebraic constraint
-        + inner(Tdot, vT) * dx         # mass ...
+        inner(fdot, vf) * dx  # mass only -> explicitly governed
+        + inner(p - T, vp) * dx  # algebraic constraint
+        + inner(Tdot, vT) * dx  # mass ...
         + inner(grad(T), grad(vT)) * dx  # ... plus diffusion
     )
     return F, w, wdot, (f, p, T), (vf, vp, vT)
@@ -1815,69 +1806,65 @@ Expected: `test_rung1_singular_mass_runs_under_arkimex` fails — the mass matri
 In `firedrake_ts/solving_utils.py`, inside `_TSContext`:
 
 ```python
-    @cached_property
-    def _nfields(self):
-        V = self._problem.u_restrict.function_space()
-        return len(V) if len(V) > 1 else 1
+@cached_property
+def _nfields(self):
+    V = self._problem.u_restrict.function_space()
+    return len(V) if len(V) > 1 else 1
 
-    @cached_property
-    def _algebraic_fields(self):
-        """Components with no time derivative, so no invertible mass block."""
-        if self._nfields == 1:
-            return ()
-        detected = algebraic_fields(
-            self._problem.F,
-            self._problem.u_restrict,
-            self._xdot,
-            self._nfields,
-        )
-        return resolve_fields(
-            "ts_algebraic_fields", self.options_prefix, detected
-        )
 
-    def _check_G_vanishes_on_algebraic_rows(self):
-        if self.G is None or not self._algebraic_fields:
-            return
-        offending = set(nonzero_rows(self.G, self._nfields)) & set(
-            self._algebraic_fields
+@cached_property
+def _algebraic_fields(self):
+    """Components with no time derivative, so no invertible mass block."""
+    if self._nfields == 1:
+        return ()
+    detected = algebraic_fields(
+        self._problem.F,
+        self._problem.u_restrict,
+        self._xdot,
+        self._nfields,
+    )
+    return resolve_fields("ts_algebraic_fields", self.options_prefix, detected)
+
+
+def _check_G_vanishes_on_algebraic_rows(self):
+    if self.G is None or not self._algebraic_fields:
+        return
+    offending = set(nonzero_rows(self.G, self._nfields)) & set(self._algebraic_fields)
+    if offending:
+        raise ValueError(
+            f"G is nonzero on algebraic component(s) {sorted(offending)}, "
+            f"whose rows of dF/du_t are structurally zero. The mass "
+            f"projection M^-1 G is undefined there. Move those terms into "
+            f"the implicit residual F, or give those components a time "
+            f"derivative."
         )
-        if offending:
-            raise ValueError(
-                f"G is nonzero on algebraic component(s) {sorted(offending)}, "
-                f"whose rows of dF/du_t are structurally zero. The mass "
-                f"projection M^-1 G is undefined there. Move those terms into "
-                f"the implicit residual F, or give those components a time "
-                f"derivative."
-            )
 ```
 
 Then restrict the mass matrix. Replace `_rhs_projection_mass_matrix` with:
 
 ```python
-    @cached_property
-    def _rhs_projection_mass_matrix(self):
-        r"""The mass matrix ``dF/du_t``, assembled once.
+@cached_property
+def _rhs_projection_mass_matrix(self):
+    r"""The mass matrix ``dF/du_t``, assembled once.
 
-        On algebraic components this block is structurally zero, so a plain
-        solve would hit a zero pivot. Those rows are given a unit diagonal
-        instead: ``G`` is guaranteed zero there (checked separately), so the
-        projected result is zero on them either way, and the operator becomes
-        invertible.
+    On algebraic components this block is structurally zero, so a plain
+    solve would hit a zero pivot. Those rows are given a unit diagonal
+    instead: ``G`` is guaranteed zero there (checked separately), so the
+    projected result is zero on them either way, and the operator becomes
+    invertible.
 
-        Held on the context so it outlives the ``KSP`` that takes it as an
-        operator.
-        """
-        from firedrake import assemble, ufl_expr
+    Held on the context so it outlives the ``KSP`` that takes it as an
+    operator.
+    """
+    from firedrake import assemble, ufl_expr
 
-        self._check_G_vanishes_on_algebraic_rows()
-        mass = assemble(ufl_expr.derivative(self.F, self._xdot), bcs=self.bcs_F)
-        if self._algebraic_fields:
-            ises = self._problem.J.arguments()[0].function_space()._ises
-            rows = numpy.concatenate(
-                [ises[i].getIndices() for i in self._algebraic_fields]
-            )
-            mass.petscmat.zeroRows(rows.astype(PETSc.IntType), diag=1.0)
-        return mass
+    self._check_G_vanishes_on_algebraic_rows()
+    mass = assemble(ufl_expr.derivative(self.F, self._xdot), bcs=self.bcs_F)
+    if self._algebraic_fields:
+        ises = self._problem.J.arguments()[0].function_space()._ises
+        rows = numpy.concatenate([ises[i].getIndices() for i in self._algebraic_fields])
+        mass.petscmat.zeroRows(rows.astype(PETSc.IntType), diag=1.0)
+    return mass
 ```
 
 Add the imports used above to the module's own namespace — `algebraic_fields` and `nonzero_rows` are defined in this same file, so no import is needed, but confirm `numpy` is imported (it is, line 4).
@@ -1953,11 +1940,7 @@ def test_frozen_component_survives_the_implicit_solve():
 
     # Row 0: mass only -> explicitly governed, freezable.
     # Row 1: mass + diffusion -> implicit acts, not freezable.
-    F = (
-        inner(adot, va) * dx
-        + inner(bdot, vb) * dx
-        + inner(grad(b), grad(vb)) * dx
-    )
+    F = inner(adot, va) * dx + inner(bdot, vb) * dx + inner(grad(b), grad(vb)) * dx
     G = -inner(a, va) * dx - inner(b, vb) * dx
 
     # Dedicated scratch: w is also ctx._x, which the TS callbacks write into.
@@ -2023,9 +2006,7 @@ def test_nothing_is_frozen_when_every_row_has_an_implicit_operator():
     v = TestFunction(V)
     u.assign(1.0)
     F = inner(u_t, v) * dx + inner(grad(u), grad(v)) * dx
-    problem = firedrake_ts.DAEProblem(
-        F, u, u_t, (0.0, 0.02), G=-inner(u, v) * dx
-    )
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 0.02), G=-inner(u, v) * dx)
     solver = firedrake_ts.DAESolver(
         problem,
         solver_parameters=dict(
@@ -2050,9 +2031,7 @@ def test_limiter_on_an_implicit_component_is_rejected():
     v = TestFunction(V)
     u.assign(1.0)
     F = inner(u_t, v) * dx + inner(grad(u), grad(v)) * dx
-    problem = firedrake_ts.DAEProblem(
-        F, u, u_t, (0.0, 0.02), G=-inner(u, v) * dx
-    )
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 0.02), G=-inner(u, v) * dx)
     solver = firedrake_ts.DAESolver(
         problem,
         solver_parameters=dict(
@@ -2171,7 +2150,7 @@ def _rung3(stepper, dt=2e-3, tmax=0.1, n=8):
     u, lam = split(w)
     udot, lamdot = split(wdot)
     vu, vlam = TestFunctions(W)
-    x, = SpatialCoordinate(mesh)
+    (x,) = SpatialCoordinate(mesh)
     w.sub(0).interpolate(1.0 + 0.5 * sin(2 * pi * x))
 
     target = Function(V).interpolate(1.0 + 0.5 * sin(2 * pi * x))
@@ -2232,65 +2211,67 @@ Extend `setUp` (after the work-vector allocation):
 And the helper plus the freeze logic:
 
 ```python
-    def _find_frozen_rows(self, ts):
-        """Global row indices of components with no implicit operator.
+def _find_frozen_rows(self, ts):
+    """Global row indices of components with no implicit operator.
 
-        Those rows' stage equation reduces to Y_i = Z_i, so their value comes
-        entirely from the explicit Shu-Osher recursion. Pinning them during the
-        implicit solve is what stops the solve from undoing the limiter.
-        """
-        ctx = dmhooks.get_appctx(ts.getDM())
-        problem = ctx._problem
-        V = problem.u_restrict.function_space()
-        if len(V) <= 1:
-            return None
-        detected = explicitly_governed_fields(
-            problem.F, problem.u_restrict, ctx._xdot, len(V)
-        )
-        fields = resolve_fields(
-            "ts_explicitly_governed_fields", ts.getOptionsPrefix(), detected
-        )
-        if not fields:
-            return None
-        ises = problem.J.arguments()[0].function_space()._ises
-        rows = np.concatenate([ises[i].getIndices() for i in fields])
-        return rows.astype(PETSc.IntType)
+    Those rows' stage equation reduces to Y_i = Z_i, so their value comes
+    entirely from the explicit Shu-Osher recursion. Pinning them during the
+    implicit solve is what stops the solve from undoing the limiter.
+    """
+    ctx = dmhooks.get_appctx(ts.getDM())
+    problem = ctx._problem
+    V = problem.u_restrict.function_space()
+    if len(V) <= 1:
+        return None
+    detected = explicitly_governed_fields(
+        problem.F, problem.u_restrict, ctx._xdot, len(V)
+    )
+    fields = resolve_fields(
+        "ts_explicitly_governed_fields", ts.getOptionsPrefix(), detected
+    )
+    if not fields:
+        return None
+    ises = problem.J.arguments()[0].function_space()._ises
+    rows = np.concatenate([ises[i].getIndices() for i in fields])
+    return rows.astype(PETSc.IntType)
 
-    def _apply_freeze_residual(self, x, f):
-        """Replace frozen rows of the residual with ``x - Y_i``."""
-        if self._frozen_rows is None:
-            return
-        target = self._Y[self._stage]
-        xa = x.getArray(readonly=True)
-        ya = target.getArray(readonly=True)
-        fa = f.getArray()
-        lo, _ = x.getOwnershipRange()
-        local = self._frozen_rows - lo
-        fa[local] = xa[local] - ya[local]
+
+def _apply_freeze_residual(self, x, f):
+    """Replace frozen rows of the residual with ``x - Y_i``."""
+    if self._frozen_rows is None:
+        return
+    target = self._Y[self._stage]
+    xa = x.getArray(readonly=True)
+    ya = target.getArray(readonly=True)
+    fa = f.getArray()
+    lo, _ = x.getOwnershipRange()
+    local = self._frozen_rows - lo
+    fa[local] = xa[local] - ya[local]
 ```
 
 Now wire it into the callbacks:
 
 ```python
-    def formSNESFunction(self, args):
-        _snes, x, f, ts = args
-        xdot = self._rhs
-        x.copy(xdot)
-        xdot.axpy(-1.0, self._Z)
-        xdot.scale(self._shift)
-        ts.computeIFunction(self._stage_time, x, xdot, f, True)
-        self._apply_freeze_residual(x, f)
+def formSNESFunction(self, args):
+    _snes, x, f, ts = args
+    xdot = self._rhs
+    x.copy(xdot)
+    xdot.axpy(-1.0, self._Z)
+    xdot.scale(self._shift)
+    ts.computeIFunction(self._stage_time, x, xdot, f, True)
+    self._apply_freeze_residual(x, f)
 
-    def formSNESJacobian(self, snes, x, A, B, ts):
-        xdot = self._rhs
-        x.copy(xdot)
-        xdot.axpy(-1.0, self._Z)
-        xdot.scale(self._shift)
-        ts.computeIJacobian(self._stage_time, x, xdot, self._shift, A, B, True)
-        if self._frozen_rows is not None:
-            A.zeroRows(self._frozen_rows, diag=1.0)
-            if B is not None and B.handle != A.handle:
-                B.zeroRows(self._frozen_rows, diag=1.0)
+
+def formSNESJacobian(self, snes, x, A, B, ts):
+    xdot = self._rhs
+    x.copy(xdot)
+    xdot.axpy(-1.0, self._Z)
+    xdot.scale(self._shift)
+    ts.computeIJacobian(self._stage_time, x, xdot, self._shift, A, B, True)
+    if self._frozen_rows is not None:
+        A.zeroRows(self._frozen_rows, diag=1.0)
+        if B is not None and B.handle != A.handle:
+            B.zeroRows(self._frozen_rows, diag=1.0)
 ```
 
 Note `self._rhs` is reused as `xdot` scratch here; it is only live between `computeRHSFunction` and the copy into `_L[i]`, which never overlaps a stage solve. If that ever changes, allocate a dedicated vector.
@@ -2448,7 +2429,7 @@ def _advect(stepper_parameters, limited):
     f = Function(V, name="f")
     f_t = Function(V)
     v = TestFunction(V)
-    x, = SpatialCoordinate(mesh)
+    (x,) = SpatialCoordinate(mesh)
     f.interpolate(conditional(And(x > 0.25, x < 0.75), 1.0, 0.0))
 
     u = Constant(VELOCITY)
@@ -2522,7 +2503,7 @@ def test_limiting_does_not_destroy_mass():
     f = Function(V, name="f")
     f_t = Function(V)
     v = TestFunction(V)
-    x, = SpatialCoordinate(mesh)
+    (x,) = SpatialCoordinate(mesh)
     f.interpolate(conditional(And(x > 0.25, x < 0.75), 1.0, 0.0))
     initial_mass = assemble(f * dx)
     assert initial_mass > 0.0
@@ -2567,28 +2548,26 @@ Expected: `test_shu_osher_form_holds_bounds_with_no_post_step_clamp` fails with 
 In `firedrake_ts/ts_solver.py`, add to `DAESolver`:
 
 ```python
-    def set_stage_limiter(self, limiter):
-        r"""Register a limiter fired on each explicit substage value.
+def set_stage_limiter(self, limiter):
+    r"""Register a limiter fired on each explicit substage value.
 
-        PETSc constructs the stepper itself from ``-ts_python_type``, so the
-        caller never holds a reference to it; this forwards to that instance.
+    PETSc constructs the stepper itself from ``-ts_python_type``, so the
+    caller never holds a reference to it; this forwards to that instance.
 
-        :arg limiter: a callable taking the stage-value ``Vec`` and modifying
-            it in place. It is called before anything consumes the value.
-        """
-        if self.ts.getType() != PETSc.TS.Type.PYTHON:
-            raise ValueError(
-                f"a stage limiter requires ts_type 'python' with "
-                f"ts_python_type set to a Shu-Osher stepper; this TS is "
-                f"'{self.ts.getType()}', whose stage values are not "
-                f"available in a form a limiter can soundly act on"
-            )
-        context = self.ts.getPythonContext()
-        if not hasattr(context, "set_stage_limiter"):
-            raise ValueError(
-                f"{type(context).__name__} does not support stage limiters"
-            )
-        context.set_stage_limiter(limiter)
+    :arg limiter: a callable taking the stage-value ``Vec`` and modifying
+        it in place. It is called before anything consumes the value.
+    """
+    if self.ts.getType() != PETSc.TS.Type.PYTHON:
+        raise ValueError(
+            f"a stage limiter requires ts_type 'python' with "
+            f"ts_python_type set to a Shu-Osher stepper; this TS is "
+            f"'{self.ts.getType()}', whose stage values are not "
+            f"available in a form a limiter can soundly act on"
+        )
+    context = self.ts.getPythonContext()
+    if not hasattr(context, "set_stage_limiter"):
+        raise ValueError(f"{type(context).__name__} does not support stage limiters")
+    context.set_stage_limiter(limiter)
 ```
 
 - [ ] **Step 4: Run tests**
@@ -2813,13 +2792,13 @@ def _load():
     lib.TSAdaptCandidatesClear.argtypes = [ctypes.c_void_p]
     lib.TSAdaptCandidatesClear.restype = ctypes.c_int
     lib.TSAdaptCandidateAdd.argtypes = [
-        ctypes.c_void_p,      # TSAdapt
-        ctypes.c_char_p,      # name
-        ctypes.c_int,         # order
-        ctypes.c_int,         # stageorder
-        ctypes.c_double,      # ccfl
-        ctypes.c_double,      # cost
-        ctypes.c_int,         # inuse (PetscBool)
+        ctypes.c_void_p,  # TSAdapt
+        ctypes.c_char_p,  # name
+        ctypes.c_int,  # order
+        ctypes.c_int,  # stageorder
+        ctypes.c_double,  # ccfl
+        ctypes.c_double,  # cost
+        ctypes.c_int,  # inuse (PetscBool)
     ]
     lib.TSAdaptCandidateAdd.restype = ctypes.c_int
     # SIX arguments, not nine. Verified against the installed headers:
@@ -2831,12 +2810,12 @@ def _load():
     # error estimate. That did not crash only because the x86-64 SysV ABI
     # ignores unread trailing arguments -- an accident, not a guarantee.
     lib.TSAdaptChoose.argtypes = [
-        ctypes.c_void_p,                  # TSAdapt
-        ctypes.c_void_p,                  # TS
-        ctypes.c_double,                  # h
-        ctypes.POINTER(ctypes.c_int),     # next_sc
+        ctypes.c_void_p,  # TSAdapt
+        ctypes.c_void_p,  # TS
+        ctypes.c_double,  # h
+        ctypes.POINTER(ctypes.c_int),  # next_sc
         ctypes.POINTER(ctypes.c_double),  # next_h
-        ctypes.POINTER(ctypes.c_int),     # accept (PetscBool)
+        ctypes.POINTER(ctypes.c_int),  # accept (PetscBool)
     ]
     lib.TSAdaptChoose.restype = ctypes.c_int
     _lib = lib
@@ -2859,9 +2838,7 @@ def ts_adapt_candidates_clear(adapt):
     _check(_load().TSAdaptCandidatesClear(adapt), "TSAdaptCandidatesClear")
 
 
-def ts_adapt_candidate_add(
-    adapt, name, order, stage_order, ccfl, cost, inuse
-):
+def ts_adapt_candidate_add(adapt, name, order, stage_order, ccfl, cost, inuse):
     _check(
         _load().TSAdaptCandidateAdd(
             adapt,

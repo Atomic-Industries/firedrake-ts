@@ -2,6 +2,14 @@ repos:
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.1
     hooks:
+    # types_or overrides the hooks' default of Python files only. CI runs
+    # bare `ruff check .` / `ruff format --check .` (ci-firedrake-ts.yaml),
+    # which also formats Python inside markdown code fences -- so without
+    # this, a doc with an unformatted snippet passes pre-commit and fails
+    # CI, which is exactly what happened to the plan document under
+    # docs/superpowers/plans/.
     - id: ruff-check
       args: [--fix]
+      types_or: [python, pyi, jupyter, markdown]
     - id: ruff-format
+      types_or: [python, pyi, jupyter, markdown]
