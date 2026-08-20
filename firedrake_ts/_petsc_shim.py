@@ -109,6 +109,24 @@ def ts_adapt_candidates_clear(adapt):
 
 
 def ts_adapt_candidate_add(adapt, name, order, stage_order, ccfl, cost, inuse):
+    """Register one candidate scheme with the adapt controller.
+
+    DO NOT pass a Python-owned string here expecting PETSc to keep it.
+    ``TSAdaptCandidateAdd`` stores the ``name`` POINTER without copying the
+    bytes (``adapt->candidates.name[c] = name``,
+    ``src/ts/interface/tsadapt.c:848``) and dereferences it later, when
+    ``-ts_adapt_monitor`` prints the chosen candidate (``:1001``). The
+    temporary produced by ``name.encode()`` below is freed as soon as this
+    call returns, so any non-``None`` ``name`` is a use-after-free waiting
+    for someone to enable that monitor.
+
+    Callers therefore pass ``None``. PETSc's own ``TSStep_ARKIMEX`` passes
+    ``tab->name`` (``arkimex.c:1514``) safely only because that is a static
+    string with program lifetime; ``ARKTableau.name`` is not, so mirroring
+    that line -- the obvious tidy-up, and what makes the monitor output
+    prettier -- would break it. Keeping the parameter (rather than dropping
+    it) leaves room for a caller that owns a genuinely long-lived buffer.
+    """
     _check(
         _load().TSAdaptCandidateAdd(
             adapt,
@@ -123,11 +141,31 @@ def ts_adapt_candidate_add(adapt, name, order, stage_order, ccfl, cost, inuse):
     )
 
 
-def ts_adapt_choose(adapt, ts, h):
-    """Returns ``(next_scheme, next_h, accept)``."""
+def ts_adapt_choose(adapt, ts, h, last_accepted=True):
+    """Returns ``(next_scheme, next_h, accept)``.
+
+    ``accept`` is an IN/OUT argument, not pure output. ``TSAdaptChoose_Basic``
+    reads it before writing it::
+
+        if (!*accept) safety *= adapt->reject_safety;
+            /* The last attempt also failed, shorten more aggressively */
+
+    (``src/ts/adapt/impls/basic/adaptbasic.c:42``.) So the caller must say
+    whether the PREVIOUS attempt at this step was accepted.
+    ``TSStep_ARKIMEX`` declares ``accept = PETSC_TRUE`` once at step entry
+    (``arkimex.c:1343``) and sets it ``PETSC_FALSE`` at its ``reject_step``
+    label (``:1529``), which every rejection path reaches -- so the first
+    call in a step sees true and each retry sees false.
+
+    Passing a fresh zero-initialised ``c_int`` every call, as this did, makes
+    PETSc believe the previous attempt always failed, so ``reject_safety``
+    (default 0.5) is applied on the FIRST rejection as well as later ones,
+    shrinking h twice as much as requested. ``last_accepted`` defaults to
+    ``True`` so the common single-attempt case needs nothing from the caller.
+    """
     next_sc = ctypes.c_int()
     next_h = ctypes.c_double()
-    accept = ctypes.c_int()
+    accept = ctypes.c_int(1 if last_accepted else 0)
     _check(
         _load().TSAdaptChoose(
             adapt,

@@ -140,3 +140,100 @@ def test_design_order_two_without_the_limiter():
     _, fine = _decay({"ts_adapt_type": "none"}, dt=2e-2)
     ratio = abs(coarse - EXACT) / abs(fine - EXACT)
     assert 3.4 < ratio < 4.6, f"observed order ratio {ratio}, expected ~4"
+
+
+def test_adapt_choose_is_told_whether_the_last_attempt_failed():
+    """``accept`` is an IN/OUT argument to TSAdaptChoose, not pure output.
+
+    ``TSAdaptChoose_Basic`` reads it on the rejection branch::
+
+        if (enorm > 1) {
+          if (!*accept) safety *= adapt->reject_safety;
+
+    (``adaptbasic.c:41-42``; ``reject_safety`` defaults to 0.5,
+    ``tsadapt.c:1152``.) ``safety`` then scales the returned step through
+    ``hfac_lte = safety * enorm^(-1/order)``, so seeding it wrong changes the
+    answer -- but only on a step that is actually being rejected, which is
+    why this needs a tolerance tight enough to force one.
+
+    The shim passed a fresh zero-initialised ``c_int`` every call, i.e.
+    PETSC_FALSE, so PETSc always believed the previous attempt had failed and
+    applied the extra factor on FIRST rejections too. PETSc's own loop
+    declares ``accept = PETSC_TRUE`` once per step (``arkimex.c:1343``) and
+    clears it at ``reject_step`` (``:1529``).
+
+    SCOPE, measured: the effect is often absorbed entirely. ``hfac_lte`` is
+    clipped to ``adapt->clip``, default ``[0.1, 10]``, so the extra factor
+    only reaches ``next_h`` while ``safety * reject_safety *
+    enorm^(-1/order)`` stays above 0.1 -- for order 3 and the defaults
+    ``safety = 0.9``, ``reject_safety = 0.5`` (``tsadapt.c:1150-1153``) that
+    means ``enorm`` below roughly 91. A badly oversized step has ``enorm``
+    far above that and both seedings clip to the same floor: with the default
+    clip this test measures ratios ``[1.0, 1.0, 1.0, 0.654]`` across four
+    rejections -- no difference at all on the first three, and a partly
+    clipped 0.654 rather than 0.5 on the last. So this is a real but narrow
+    step-size inefficiency on mildly rejected steps, NOT a systematic
+    halving of every first rejection.
+
+    ``ts_adapt_clip`` is widened below purely to take the clip out of the
+    measurement, so the assertion can pin the exact factor rather than
+    whatever the clip leaves of it.
+
+    Both halves are checked: that the stepper threads True into the first
+    call of a step and False into a retry, and that PETSc's answer actually
+    differs between the two seedings by the reject_safety factor. Calling
+    TSAdaptChoose twice per rejection is side-effect-free here -- the only
+    state it mutates is ``timestepjustdecreased``, which this stepper never
+    sets, since it bypasses TSAdaptCheckStage.
+    """
+    from firedrake_ts import ark_ssp
+
+    seen = []
+    ratios = []
+    real_choose = ark_ssp.ts_adapt_choose
+
+    def spy(adapt, ts, h, last_accepted=True):
+        seen.append(last_accepted)
+        result = real_choose(adapt, ts, h, last_accepted)
+        if not result[2]:  # this attempt is being rejected
+            as_failed = real_choose(adapt, ts, h, False)
+            as_accepted = real_choose(adapt, ts, h, True)
+            ratios.append(as_failed[1] / as_accepted[1])
+        return result
+
+    ark_ssp.ts_adapt_choose = spy
+    try:
+        # A big first step against a tight-but-reachable tolerance forces a
+        # rejection immediately; ts_max_steps bounds the run so a tolerance
+        # that cannot be met does not turn this into an endless shrink.
+        _decay(
+            {
+                "ts_adapt_type": "basic",
+                "ts_rtol": 1e-9,
+                "ts_atol": 1e-11,
+                "ts_max_steps": 4,
+                # See the docstring: without this the default clip floor
+                # absorbs the factor being measured.
+                "ts_adapt_clip": "1e-8,10",
+            },
+            dt=0.5,
+        )
+    finally:
+        ark_ssp.ts_adapt_choose = real_choose
+
+    assert seen, "TSAdaptChoose was never called"
+    assert seen[0] is True, (
+        "the first attempt of the first step must report the previous attempt "
+        f"as accepted, got {seen[0]}"
+    )
+    assert any(x is False for x in seen), (
+        "no retry ever reported a failed previous attempt, so the rejection "
+        "path was not exercised; tighten the tolerance"
+    )
+    assert ratios, "no step was rejected, so the seeding could not be measured"
+    for ratio in ratios:
+        assert ratio == pytest.approx(0.5, rel=1e-9), (
+            f"seeding accept=False must shrink next_h by reject_safety=0.5; "
+            f"observed ratios {ratios} -- if this is 1.0 the argument is "
+            "being ignored"
+        )

@@ -13,7 +13,7 @@ ARK_SSP = {
 }
 
 
-def _solver(dt=0.1, tmax=1.0):
+def _solver(dt=0.1, tmax=1.0, tableau="esdirk_gamma5"):
     mesh = UnitIntervalMesh(4)
     V = FunctionSpace(mesh, "P", 1)
     u = Function(V)
@@ -27,6 +27,7 @@ def _solver(dt=0.1, tmax=1.0):
         problem,
         solver_parameters=dict(
             ARK_SSP,
+            ts_ark_ssp_type=tableau,
             ts_adapt_type="none",
             ts_time_step=dt,
             ts_exact_final_time="interpolate",
@@ -137,3 +138,40 @@ def test_dense_output_stays_bounded_on_a_stiff_step():
         "expected it to stay near [y_n+1, y_n] = [~0, 1] rather than "
         "diverge below the endpoints"
     )
+
+
+def test_interpolate_ignores_ydot_for_a_purely_explicit_tableau():
+    """A tableau with no implicit part must contribute no Ydot term.
+
+    With bt identically zero the implicit dense-output coefficient collapses
+    to d_i theta + (0 - d_i) theta^2 = d_i theta (1 - theta), which vanishes
+    at both ENDS of the step but not inside it: for ssprk2 (d = [1, 0]) it
+    puts a spurious 0.25 h Ydot_0 at theta = 0.5. evaluatestep already
+    carried this guard; interpolate did not.
+
+    Poisoning every _Ydot with NaN is what makes the defect observable at
+    all. The step's own value cannot: _setup_stage0_mass_solve now requires
+    F to be the mass form alone for a purely explicit tableau, so
+    F(t, y, 0) == 0 and Ydot_0 is identically zero -- the spurious weight
+    multiplies zero and the answer looks right. NaN distinguishes "the term
+    is zero" from "the term is not read", and only the latter is safe:
+    _Ydot[i] for i >= 1 is NEVER written for such a tableau (_solve_stage
+    does not run), so those Vecs hold whatever VecDuplicate left in them.
+    ssprk2 escapes reading them today only because its d[1] happens to be
+    0.0 -- an accident of one coefficient, not a property of the method.
+    """
+    solver, _ = _solver(dt=0.2, tmax=1.0, tableau="ssprk2")
+    solver.solve()
+    ts = solver.ts
+    ctx = ts.getPythonContext()
+    for vec in ctx._Ydot:
+        vec.set(np.nan)
+    mid = ts.getSolution().duplicate()
+    t_mid = ts.getTime() - 0.5 * ts.getTimeStep()
+    ctx.interpolate(ts, t_mid, mid)
+    values = mid.getArray()
+    assert np.all(np.isfinite(values)), (
+        f"interpolate read _Ydot for a tableau with no implicit part; got {values}"
+    )
+    # And the interpolant is still right, not merely finite.
+    assert abs(values[0] - np.exp(-t_mid)) < 0.05 * np.exp(-t_mid)

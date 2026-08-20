@@ -860,7 +860,7 @@ def test_limiter_registered_after_setup_is_still_rejected():
         ctx.set_stage_limiter(lambda vec: None)
 
 
-def _fsal_decay(fsal, mutate=False, tableau="esdirk_gamma5", dt=0.01):
+def _fsal_decay(fsal, mutate=False, tableau="esdirk_gamma5", dt=0.01, stiff=True):
     """Integrate ``kappa u' = -grad.grad u + u`` with a stiff implicit part.
 
     ``mutate=True`` installs a monitor that scales ``kappa`` -- a coefficient
@@ -878,7 +878,12 @@ def _fsal_decay(fsal, mutate=False, tableau="esdirk_gamma5", dt=0.01):
     (x,) = SpatialCoordinate(mesh)
     u.interpolate(sin(pi * x))
     kappa = Constant(1.0)
-    F = inner(kappa * u_t, v) * dx + inner(grad(u), grad(v)) * dx
+    # stiff=False keeps F to the mass form alone, which a purely explicit
+    # tableau requires -- _setup_stage0_mass_solve refuses a non-mass F
+    # there, since its completion never reads Ydot and would drop the term.
+    F = inner(kappa * u_t, v) * dx
+    if stiff:
+        F += inner(grad(u), grad(v)) * dx
     G = inner(u, v) * dx
     problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 0.1), G=G)
     kwargs = {}
@@ -966,7 +971,107 @@ def test_fsal_is_not_attempted_for_a_purely_explicit_tableau():
     it -- and the reuse must not happen even though the tableau is otherwise
     stiffly accurate with ct[-1] == 1.
     """
-    _, stepper = _fsal_decay(True, tableau="ssprk2", dt=0.001)
+    _, stepper = _fsal_decay(True, tableau="ssprk2", dt=0.001, stiff=False)
     assert not stepper._fsal_possible
     assert stepper._fsal_hits == 0
     assert stepper._fsal_misses == 0
+
+
+def test_purely_explicit_tableau_refuses_a_non_mass_f_term():
+    """A purely explicit tableau has nothing to integrate F's non-mass terms.
+
+    ssprk2 has At identically zero, so _complete takes the Shu-Osher branch,
+    which reads only x^n, the stage values Y and the explicit slopes
+    M^-1 G -- never Ydot. Any H in F = M u̇ + H is therefore computed by
+    _prepare_stage0_ydot into Ydot[0] and dropped from every step, silently
+    integrating M u̇ = G instead of the F = G that was posed.
+
+    Measured before the refusal: u̇ + u = 0 with u(0) = 1 posed with the u
+    term in F rather than G returned 0.0 at t = 1 where 1.0 is correct --
+    the stiff term dropped entirely, the initial condition decayed to
+    nothing by the mass-only equation u̇ = 0 it actually solved. Wrong in a
+    direction that looks like a plausible answer, which is why this is a
+    refusal rather than a warning.
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    # The u term belongs in G for this tableau; putting it in F is the error.
+    F = inner(u_t, v) * dx + inner(u, v) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 1.0))
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters=dict(
+            ARK_SSP,
+            ts_ark_ssp_type="ssprk2",
+            ts_adapt_type="none",
+            ts_time_step=0.1,
+            ts_exact_final_time="matchstep",
+        ),
+        options_prefix="",
+    )
+    with pytest.raises(ValueError, match="purely explicit"):
+        solver.solve()
+
+
+def _time_dependent_mass(dt, tmax=1.0):
+    """Integrate ``(1 + t) u' = 1`` (``u(0) = 0``), G = None.
+
+    The mass matrix ``M = dF/du̇ = (1 + t) v`` depends on time but NOT on the
+    state, so ``dM/du`` is structurally zero. That distinction is the whole
+    point: a reassembly guarded on ``dM/du != 0`` -- which is what
+    _prepare_stage0_ydot used to carry -- skips every reassembly here and
+    keeps inverting ``M(t^0) = 1``, while passing the ``M(u)`` test that
+    motivated the guard. No structural predicate on the form can close this
+    in general either, since ``M`` may also close over a mutable auxiliary
+    Function, which is why the reassembly is unconditional.
+
+    Exact solution: ``du = dt / (1 + t)``, so ``u = ln(1 + t)`` and
+    ``u(1) = ln 2``. G is None, so this exercises the stage-0 mass solve
+    alone, not the RHS projection (which test_imex covers separately for
+    both kinds of non-constant mass).
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(0.0)
+    time = Constant(0.0)
+    F = inner((1.0 + time) * u_t, v) * dx - inner(Constant(1.0), v) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, tmax), time=time)
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters={
+            "ts_type": "python",
+            "ts_python_type": PYTHON_STEPPER,
+            "ts_ark_ssp_type": "esdirk_gamma5",
+            "ts_adapt_type": "none",
+            "ts_time_step": dt,
+            "ts_exact_final_time": "matchstep",
+        },
+        options_prefix="",
+    )
+    solver.solve()
+    return float(u.dat.data_ro[0])
+
+
+def test_esdirk_gamma5_converges_on_a_time_dependent_mass_matrix():
+    """M depends on t but not on u, so a dM/du guard misses it entirely.
+
+    Measured with the reassembly guarded on dM/du != 0: ratios
+    0.958/0.979/0.990 -- converging to the wrong limit -- against arkimex's
+    4.011/4.006/4.003 on the same problem. This is the regression test for
+    the fix in 29d335e, which until now was verified only by hand.
+    """
+    exact = np.log(2.0)
+    errors = [
+        abs(_time_dependent_mass(dt) - exact) for dt in (0.1, 0.05, 0.025, 0.0125)
+    ]
+    assert all(e > 0.0 for e in errors)
+    ratios = [errors[i] / errors[i + 1] for i in range(len(errors) - 1)]
+    for ratio in ratios:
+        assert 3.4 < ratio < 4.6, f"observed order ratios {ratios}, expected ~4"

@@ -422,3 +422,83 @@ def test_rung3_pde_with_multiplier_runs(stepper):
         f"u drifted from the pinned target by {defect:.3e} -- the "
         "algebraic constraint should hold to near machine precision"
     )
+
+
+def test_stage0_ydot_is_zero_on_algebraic_rows():
+    """Ẏ_0 must be zero where dF/du_t is, not -F_alg(t^n, y^n, 0).
+
+    _reassemble_stage0_mass gives the algebraic rows a unit diagonal so the
+    mass matrix is invertible at all. That makes the stage-0 solve return
+    -F_alg(t^n, y^n, 0) on those rows -- not a derivative, since there is no
+    u_t in those equations -- and _build_offset then propagates it into every
+    later stage as h At_ij Ydot_j. PETSc zeroes the same rows immediately
+    after the solve that produces its own Ydot0
+    (VecISSet(Ydot0, ark->alg_is, 0.0), arkimex.c:1389).
+
+    The initial condition here is deliberately INCONSISTENT -- z(0) = 0 with
+    y(0) = 1 violates the constraint 0 = z + y by exactly 1 -- because a
+    consistent one makes the whole defect invisible: F_alg(t^0, y^0, 0) is
+    then already zero and the unfixed code writes a zero it did not mean.
+    _rung1's own y(0) = 1, z(0) = -1 is consistent, which is why no existing
+    test caught this. The assembled residual is checked below so the test
+    cannot pass vacuously.
+    """
+    from firedrake import ufl_expr  # noqa: F401
+
+    mesh = UnitIntervalMesh(1)
+    R = FunctionSpace(mesh, "DG", 0)
+    W = R * R
+    w = Function(W)
+    wdot = Function(W)
+    y, z = split(w)
+    ydot, _zdot = split(wdot)
+    vy, vz = TestFunctions(W)
+    w.sub(0).assign(1.0)
+    w.sub(1).assign(0.0)  # inconsistent: z + y = 1, not 0
+
+    F = inner(ydot, vy) * dx + inner(z + y, vz) * dx
+    G = inner(z, vy) * dx
+    problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, 0.05), G=G)
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters=dict(RUNG_PARAMS, ts_time_step=0.01, **ARK_SSP_G5),
+        options_prefix="",
+    )
+    stepper = solver.ts.getPythonContext()
+
+    # Non-vacuity, ASSEMBLED before the solve advances w: F(t^0, y^0, 0)
+    # really is nonzero on the algebraic row, so the unfixed code wrote
+    # -1.0 there rather than a zero it would have got for free. Assembling
+    # after solve() would read the final state, where the constraint is
+    # satisfied and the check would pass for the wrong reason. The row
+    # indices only exist once setUp has run, so the values are read out
+    # below; this Cofunction is unaffected by the solve.
+    residual = assemble(replace(F, {wdot: Function(W)}))
+
+    first = []
+    original = stepper._prepare_stage0_ydot
+
+    def spy(ts, t, x):
+        original(ts, t, x)
+        if not first:
+            first.append(stepper._Ydot[0].getArray(readonly=True).copy())
+
+    stepper._prepare_stage0_ydot = spy
+    solver.solve()
+
+    rows = stepper._algebraic_rows
+    assert rows is not None, "the algebraic row was not detected at all"
+    assert len(first) == 1
+
+    with residual.dat.vec_ro as r:
+        lo = r.getOwnershipRange()[0]
+        unfixed = r.getArray(readonly=True)[rows - lo].copy()
+    assert np.abs(unfixed).max() > 0.5, (
+        f"initial condition is not inconsistent enough to detect the "
+        f"defect; F_alg(t^0, y^0, 0) = {unfixed}"
+    )
+
+    assert np.all(first[0][rows - lo] == 0.0), (
+        f"Ydot_0 is {first[0][rows - lo]} on algebraic rows, expected 0; "
+        f"the unfixed value there is {-unfixed}"
+    )

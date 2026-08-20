@@ -109,11 +109,9 @@ class ARKSSP:
         self._mass_options = None
         self._mass_tensor = None
         self._mass_form = None
-        # Set in _setup_stage0_mass_solve, whenever tab.At is identically
-        # zero (a purely explicit tableau): whether F carries a term beyond
-        # the mass form dF/du̇, which _complete's purely-explicit branch
-        # would then silently drop -- see that method.
-        self._explicit_completion_drops_f_term = False
+        # Global row indices whose dF/du_t is structurally zero. Distinct
+        # from _frozen_rows, which is about dF/du -- see _find_algebraic_rows.
+        self._algebraic_rows = None
         # Recorded at the top of each step() attempt, for evaluatestep --
         # the value the solution held at the START of the step. step()
         # overwrites ts.getSolution() with each attempt's order-p candidate
@@ -204,6 +202,8 @@ class ARKSSP:
             self._fsal_valid = False
 
             self._frozen_rows = self._find_frozen_rows(ts)
+            # Read by _reassemble_stage0_mass, so computed before it runs.
+            self._algebraic_rows = self._find_algebraic_rows(ts)
             self._check_limiter_soundness()
             self._setup_stage0_mass_solve(ts)
         except Exception as exc:
@@ -318,6 +318,42 @@ class ARKSSP:
         rows = np.concatenate([ises[i].getIndices() for i in fields])
         return rows.astype(PETSc.IntType)
 
+    def _find_algebraic_rows(self, ts):
+        """Global row indices of components with no time derivative.
+
+        These are the rows where ``dF/du_t`` is structurally zero -- the
+        algebraic constraints of a DAE. NOT the same set as
+        ``_frozen_rows``, which is the rows with no ``dF/du``: one is about
+        the mass operator, the other about the implicit operator, and a
+        component can be in either, both or neither.
+
+        ``_reassemble_stage0_mass`` gives these rows a unit diagonal so the
+        mass matrix is invertible, which means the stage-0 solve returns
+        ``-F_alg(t^n, y^n, 0)`` on them rather than a derivative. That value
+        is meaningless -- there is no ``u_t`` in those equations -- and it
+        does not stay put: ``_build_offset`` propagates it into every later
+        stage as ``h At_ij Ydot_j``. ``_prepare_stage0_ydot`` therefore zeroes
+        it, matching PETSc, which does exactly this immediately after the
+        solve that produces its own ``Ydot0``
+        (``VecISSet(Ydot0, ark->alg_is, 0.0)``, ``arkimex.c:1389``).
+        """
+        ctx = dmhooks.get_appctx(ts.getDM())
+        if not ctx._algebraic_fields:
+            return None
+        # Same J-test-space idiom as _find_frozen_rows and
+        # _TSContext._rhs_projection_mass_matrix; see the comment there.
+        ises = ctx._problem.J.arguments()[0].function_space()._ises
+        rows = np.concatenate([ises[i].getIndices() for i in ctx._algebraic_fields])
+        return rows.astype(PETSc.IntType)
+
+    @staticmethod
+    def _zero_rows(vec, rows):
+        """Set ``vec`` to zero on the given global row indices, in place."""
+        if rows is None:
+            return
+        lo, _ = vec.getOwnershipRange()
+        vec.getArray()[rows - lo] = 0.0
+
     def _freeze_active(self):
         """Whether the freeze should actually pin rows this solve.
 
@@ -414,17 +450,16 @@ class ARKSSP:
         (a TS may be re-set-up after options change); destroy the previous
         ``KSP`` first rather than leaking it -- ``PETSc.KSP`` objects hold
         onto PETSc-side resources that Python's own garbage collector does
-        not reliably reclaim promptly. ``self._mass_tensor``/``self._mass_
-        form``/``self._explicit_completion_drops_f_term`` are reset before
-        either check below can raise, so a failed second ``setUp`` does not
-        leave them pointing at the previous run's objects.
+        not reliably reclaim promptly. ``self._mass_tensor`` and
+        ``self._mass_form`` are reset before any check below can raise, so a
+        failed second ``setUp`` does not leave them pointing at the previous
+        run's objects.
         """
         if self._mass_ksp is not None:
             self._mass_ksp.destroy()
             self._mass_ksp = None
         self._mass_tensor = None
         self._mass_form = None
-        self._explicit_completion_drops_f_term = False
         tab = self._tab
         ctx = dmhooks.get_appctx(ts.getDM())
         mass_form = ufl_expr.derivative(ctx.F, ctx._xdot)
@@ -436,28 +471,61 @@ class ARKSSP:
         # is not None -- see this method's docstring. Refuse rather than
         # hand back a plausible, silently wrong answer.
         if not is_zero_form(ufl_expr.derivative(mass_form, ctx._xdot)):
+            # The Ẏ_0 half of this only applies when the first stage is
+            # actually explicit; the M^-1 G half applies to every tableau,
+            # which is why the check itself is unconditional (it runs before
+            # the At[0, 0] > 0.0 early return below). Naming both as though
+            # both were in play -- as this message used to -- asserts
+            # tab.At[0, 0] == 0.0 as a fact even for a tableau where it is
+            # false.
+            affected = ["M^-1 G (whenever G is not None)"]
+            if tab.At[0, 0] == 0.0:
+                affected.insert(
+                    0,
+                    "Ẏ_0 = -M^-1 F(t^n, y^n, 0) (this tableau's first stage "
+                    f"is explicit, tab.At[0, 0] == 0.0 for {tab.name!r})",
+                )
             raise ValueError(
                 "F is nonlinear in u̇ (d^2F/du̇^2 is not structurally "
                 "zero). The mass matrix M = dF/du̇ is then not a "
-                "well-defined constant operator: Ẏ_0 = -M^-1 F(t^n, y^n, 0) "
-                "(needed because this tableau's first stage is explicit, "
-                f"tab.At[0, 0] == 0.0 for {tab.name!r}) and M^-1 G (needed "
-                "whenever G is not None, for any tableau) are both then "
-                "one Newton step away from their true meaning, not an "
+                "well-defined constant operator, so "
+                + " and ".join(affected)
+                + (" are" if len(affected) > 1 else " is")
+                + " one Newton step away from the true root rather than an "
                 "exact answer, with no exception raised otherwise. Rewrite "
                 "F to be affine in u̇."
             )
 
+        # A purely explicit tableau (At identically zero) has no implicit
+        # part at all: its completion (_complete's second branch) is the
+        # Shu-Osher row, which reads only x^n, the stage values Y and the
+        # explicit slopes L = M^-1 G. It never reads Ydot. So any term of F
+        # beyond the mass form dF/du̇ -- i.e. any H in F = M u̇ + H -- is
+        # computed by _prepare_stage0_ydot into Ydot[0] and then dropped
+        # from every step. The method integrates M u̇ = G instead of the
+        # requested M u̇ = G - H, with no exception and a plausible answer:
+        # measured on u̇ + u = 0 posed with u in F rather than G, ssprk2
+        # returns 0.0 where 1.0 is correct.
+        #
+        # Detected structurally, as "F with u̇ replaced by zero is not the
+        # zero form", and refused here at setUp rather than per step: the
+        # condition depends only on the tableau and the form, both fixed for
+        # the whole solve, so there is nothing a later check could learn.
         if not np.any(tab.At):
-            # A purely explicit tableau's completion (_complete) never
-            # reads Ydot -- only the explicit slopes L = M^-1 G -- so any
-            # term of F beyond the mass form dF/du̇ would be computed here
-            # (by _prepare_stage0_ydot, into Ydot[0]) and then silently
-            # dropped from every step's completion. Detected here,
-            # structurally, as "F(t, y, 0) is not the zero form"; enforced
-            # in _complete, once per step -- see that method.
             residual = ufl.replace(ctx.F, {ctx._xdot: ufl.zero(ctx._xdot.ufl_shape)})
-            self._explicit_completion_drops_f_term = not is_zero_form(residual)
+            if not is_zero_form(residual):
+                raise ValueError(
+                    f"tableau {tab.name!r} is purely explicit (At is "
+                    "identically zero), so it has no implicit part to "
+                    "integrate F's non-mass terms with: its completion reads "
+                    "only the stage values and the explicit slopes M^-1 G, "
+                    "never Ydot. F here is not the mass form alone -- "
+                    "F with u̇ set to zero is a nonzero form -- so those "
+                    "terms would be silently dropped from every step, "
+                    "integrating M u̇ = G rather than the F = G you posed. "
+                    "Move them into G, or choose a tableau with an implicit "
+                    "part (e.g. esdirk_gamma5)."
+                )
 
         if tab.At[0, 0] > 0.0:
             return  # _solve_stage populates Ydot[0] normally, in _take_stages.
@@ -508,10 +576,8 @@ class ARKSSP:
         self._mass_tensor = assemble(
             self._mass_form, bcs=ctx.bcs_F, tensor=self._mass_tensor
         )
-        if ctx._algebraic_fields:
-            ises = ctx._problem.J.arguments()[0].function_space()._ises
-            rows = np.concatenate([ises[i].getIndices() for i in ctx._algebraic_fields])
-            self._mass_tensor.petscmat.zeroRows(rows.astype(PETSc.IntType), diag=1.0)
+        if self._algebraic_rows is not None:
+            self._mass_tensor.petscmat.zeroRows(self._algebraic_rows, diag=1.0)
 
     def _try_fsal_stage0_ydot(self, ts, t, x, reference):
         r"""Try the previous step's last stage derivative as ``Ẏ_0``.
@@ -572,14 +638,20 @@ class ARKSSP:
             ts.computeIFunction(t, x, self._zero_xdot, self._rhs, True)
             return False
         self._fsal_hits += 1
+        # _Ydot[-1] came from _solve_stage's (Y - Z) * shift, which is no more
+        # meaningful on an algebraic row than the fresh path's -F_alg is.
+        # PETSc zeroes only its fresh Ydot0 (arkimex.c:1389) because its own
+        # stage solves already hold those rows fixed through the residual and
+        # Jacobian (arkimex.c:1897, :1940); this stepper's _solve_stage does
+        # not, so the copy is zeroed here as well as there.
+        self._zero_rows(self._Ydot[0], self._algebraic_rows)
         if self._freeze_active():
             # Already zero on those rows -- _solve_stage zeroes them when it
             # builds _Ydot[-1], and a frozen row's F is the mass term alone
             # so the residual test above sees zero there either way. Applied
             # anyway to keep this path's postcondition identical to the fresh
             # one's rather than resting on that agreement holding.
-            lo, _ = self._Ydot[0].getOwnershipRange()
-            self._Ydot[0].getArray()[self._frozen_rows - lo] = 0.0
+            self._zero_rows(self._Ydot[0], self._frozen_rows)
         return True
 
     def _prepare_stage0_ydot(self, ts, t, x):
@@ -618,15 +690,17 @@ class ARKSSP:
         with self._mass_options.inserted_options():
             self._mass_ksp.solve(self._rhs, self._Ydot[0])
         self._Ydot[0].scale(-1.0)
+        # The unit diagonal _reassemble_stage0_mass put on the algebraic rows
+        # makes the solve return -F_alg(t^n, y^n, 0) there, not a derivative.
+        # See _find_algebraic_rows; PETSc does the same at arkimex.c:1389.
+        self._zero_rows(self._Ydot[0], self._algebraic_rows)
         if self._freeze_active():
             # Same reasoning as _solve_stage's identical block at the end of
             # a real stage solve: a frozen row's implicit function is the
             # mass term alone, so M Ẏ = 0 there and the correct derivative
             # is exactly zero, not whatever -M^-1 F(t, y, 0) gives on a row
             # a limiter has no business perturbing further.
-            lo, _ = self._Ydot[0].getOwnershipRange()
-            local = self._frozen_rows - lo
-            self._Ydot[0].getArray()[local] = 0.0
+            self._zero_rows(self._Ydot[0], self._frozen_rows)
 
     # -- the step -------------------------------------------------------------
 
@@ -687,6 +761,12 @@ class ARKSSP:
             # needs to know which one kept firing, not just that "some"
             # rejection happened `attempts` times.
             last_reject_cause = None
+            # IN/OUT for TSAdaptChoose: whether the PREVIOUS attempt at this
+            # step was accepted. PETSc's TSStep_ARKIMEX declares the same
+            # thing once per step (accept = PETSC_TRUE, arkimex.c:1343) and
+            # clears it at its reject_step label (:1529), which both of this
+            # loop's rejection paths correspond to. See ts_adapt_choose.
+            last_accepted = True
             for _ in range(attempts):
                 self._last_h = h
                 try:
@@ -707,6 +787,10 @@ class ARKSSP:
                     # rather than asking the adapt loop's error-based
                     # controller for one.
                     last_reject_cause = str(exc)
+                    # Reaches PETSc's reject_step, which clears accept -- so
+                    # the next TSAdaptChoose in this step must see false even
+                    # though this path never calls it.
+                    last_accepted = False
                     scale_solve_failed = opts.getReal(
                         "ts_adapt_scale_solve_failed", 0.25
                     )
@@ -781,7 +865,7 @@ class ARKSSP:
                     ts_adapt_candidate_add(
                         adapt, None, tab.order, tab.order, 1.0, float(s), True
                     )
-                    _sc, next_h, accept = ts_adapt_choose(adapt, ts, h)
+                    _sc, next_h, accept = ts_adapt_choose(adapt, ts, h, last_accepted)
                 except Exception:
                     self._last_x.copy(x)
                     raise
@@ -807,6 +891,7 @@ class ARKSSP:
                     f"the adapt controller declined the completed step "
                     f"(h {h:.6g} -> {next_h:.6g})"
                 )
+                last_accepted = False
                 self._last_x.copy(x)
                 h = next_h
                 ts.setTimeStep(h)
@@ -922,9 +1007,29 @@ class ARKSSP:
         if h is None:
             raise ValueError("interpolate called before any step was taken")
         theta = (t - (ts.getTime() - h)) / h
+        # Same guard evaluatestep carries, for the same reason. A purely
+        # explicit tableau (bt identically zero) has no implicit part, so the
+        # interpolant must have no Ydot term: the implicit dense-output
+        # coefficient collapses to d_i theta + (0 - d_i) theta^2 =
+        # d_i theta (1 - theta), which is NOT zero inside the step even
+        # though it vanishes at both ends. For ssprk2 (d = [1, 0]) that puts
+        # a spurious 0.25 h Ydot_0 at theta = 0.5. Consistency is unaffected:
+        # at theta = 1 the explicit coefficient is already b_i on its own, so
+        # X(1) = y^n + h sum b_i L_i is still the completion.
+        #
+        # Dropping the term also stops this reading _Ydot[i] for i >= 1 at
+        # all, which for such a tableau _solve_stage never writes -- those
+        # Vecs hold whatever VecDuplicate left in them. ssprk2 escapes that
+        # today only because its d[1] is 0.0, i.e. by accident of one
+        # coefficient rather than by construction.
+        has_implicit = np.any(tab.bt)
         self._last_x.copy(U)
         for i in range(len(tab.b)):
-            impl = tab.d[i] * theta + (tab.bt[i] - tab.d[i]) * theta**2
+            impl = (
+                tab.d[i] * theta + (tab.bt[i] - tab.d[i]) * theta**2
+                if has_implicit
+                else 0.0
+            )
             expl = tab.d[i] * theta + (tab.b[i] - tab.d[i]) * theta**2
             if impl != 0.0:
                 U.axpy(h * impl, self._Ydot[i])
