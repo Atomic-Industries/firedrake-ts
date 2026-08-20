@@ -332,16 +332,16 @@ class ARKSSP:
 
         ``self._mass_tensor`` is this method's OWN assembly -- never
         ``ctx._rhs_projection_mass_matrix``, even though the two are the
-        same form. ``_prepare_stage0_ydot`` reassembles ``self._mass_tensor``
-        in place every step; sharing the ``Mat`` with ``_rhs_projection_
-        mass_matrix`` would mean that in-place reassembly silently rewrites
-        the operator ``_TSContext._assemble_projected_rhs_residual``'s own
-        ``KSP`` inverts, contradicting that property's "assembled once"
-        docstring and coupling two solves through a handle neither one's
-        caller can see. This is safe to build even when ``G`` is ``None``
-        (it is not gated on ``G`` -- only ``_rhs_projection_solver`` is,
-        which is why this method builds its own ``KSP`` instead of reusing
-        that one).
+        same form. Both are now reassembled in place, but at DIFFERENT
+        states: this one at ``(t^n, y^n)`` once per ``step()``, that one at
+        ``(t_j, Y_j)`` before every stage's projection solve. Sharing one
+        ``Mat`` would therefore have each reassembly silently overwrite the
+        operator the other's ``KSP`` inverts, with whichever ran last
+        deciding the state both solves see -- coupling two solves through a
+        handle neither one's caller can see. This is safe to build even when
+        ``G`` is ``None`` (it is not gated on ``G`` -- only
+        ``_rhs_projection_solver`` is, which is why this method builds its
+        own ``KSP`` instead of reusing that one).
 
         ``setUp`` may run more than once against the same stepper instance
         (a TS may be re-set-up after options change); destroy the previous

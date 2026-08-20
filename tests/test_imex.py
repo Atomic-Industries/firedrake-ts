@@ -100,3 +100,86 @@ def test_heat_explicit_example_diffuses():
     firedrake_ts.DAESolver(problem, options_prefix="").solve()
 
     assert sqrt(abs(assemble((u - u0) ** 2 * dx))) > 0.1
+
+
+def _nonconstant_mass(kind, dt, tableau="3"):
+    """Integrate ``M u' = -u`` to ``t = 1`` with ``-u`` explicit, ``M != 1``.
+
+    ``kind="u"`` uses ``M = (1 + u) v``, ``kind="t"`` uses ``M = (1 + t) v``.
+    Both put the whole right-hand side in ``G``, so every stage slope is
+    ``L_j = M^-1 G(t_j, Y_j)`` -- the projection whose operator must be
+    assembled at the same ``(t_j, Y_j)`` that ``G`` is.
+
+    Exact solutions. For ``M = 1 + u``: separating variables,
+    ``(1 + u)/u du = -dt``, so ``ln u + u = 1 - t`` and ``u(1)`` is the root
+    of ``ln u + u = 0``, i.e. the omega constant ``0.5671432904...``. For
+    ``M = 1 + t``: ``du/u = -dt/(1 + t)`` gives ``u = 1/(1 + t)``, so
+    ``u(1) = 1/2``.
+
+    ``matchstep`` rather than ``stepover``: ten steps of 0.1 overshoot 1.0 by
+    one rounding, and ``stepover`` then takes a whole extra step to t = 1.1,
+    which shows up as a spurious dt-dependent error (``|1/2.1 - 1/2|`` =
+    2.4e-2 for ``kind="t"``) that swamps the discretisation error being
+    measured.
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
+    time = Constant(0.0)
+    mass = (1.0 + u) if kind == "u" else (1.0 + time)
+    F = inner(mass * u_t, v) * dx
+    G = -inner(u, v) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 1.0), G=G, time=time)
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters={
+            "ts_type": "arkimex",
+            "ts_arkimex_type": tableau,
+            "ts_adapt_type": "none",
+            "ts_time_step": dt,
+            "ts_exact_final_time": "matchstep",
+        },
+        options_prefix="",
+    )
+    solver.solve()
+    return float(u.dat.data_ro[0])
+
+
+@pytest.mark.parametrize(
+    "kind,exact",
+    [("u", 0.5671432904097838), ("t", 0.5)],
+)
+def test_rhs_projection_operator_is_assembled_at_the_stage_state(kind, exact):
+    """``L_j = M^-1 G(Y_j)`` must invert ``M(t_j, Y_j)``, not ``M(t^0, y^0)``.
+
+    ``_TSContext._rhs_projection_mass_matrix`` used to be a plain
+    ``@cached_property`` -- "the mass matrix dF/du_t, assembled once" -- while
+    being the operator behind the explicit slope at every stage of every step.
+    For any mass matrix that is not constant (variable density, porosity,
+    saturation, a time-dependent coefficient) that inverts the operator
+    evaluated at the initial condition forever, which does not converge at
+    all: measured with the reassembly disabled, the error is flat to three
+    figures at 3.939e-02 (``kind="u"``) and 1.321e-01 (``kind="t"``) across
+    dt = 0.1, 0.05, 0.025, 0.0125 -- ratios 1.00, 1.00, 1.00 -- where
+    reassembling per stage gives the tableau's design order 3 (ratios 7.99,
+    9.73 and 8.15, 8.08). Flat, converging to the WRONG limit, with no error
+    raised.
+
+    This is the IMEX path in ``_TSContext``, so it applies to PETSc's own
+    ``arkimex`` (used here) exactly as much as to the Python stepper; both
+    ``kind`` cases matter because a structural test for state dependence
+    (``dM/du != 0``) catches ``kind="u"`` and silently misses ``kind="t"``.
+    See ``_reassemble_rhs_projection_mass_matrix``.
+    """
+    errors = [abs(_nonconstant_mass(kind, dt) - exact) for dt in (0.1, 0.05, 0.025)]
+    assert all(e > 0.0 for e in errors)
+    ratios = [errors[i] / errors[i + 1] for i in range(len(errors) - 1)]
+    for ratio in ratios:
+        assert 6.5 < ratio < 12.0, (
+            f"M({kind}): observed order ratios {ratios} from errors "
+            f"{errors}, expected ~8 (order 3); ratios near 1 mean the "
+            "projection operator is stale"
+        )

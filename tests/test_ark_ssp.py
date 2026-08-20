@@ -394,9 +394,12 @@ def test_esdirk_gamma5_converges_on_a_state_dependent_mass_matrix():
     """The mass matrix M = dF/du̇ depends on u itself, so a Ẏ_0 solved
     against a stale M(y^0) -- cached once, at setUp -- is flat in dt
     rather than converging. See _state_dependent_mass's docstring and
-    _setup_stage0_mass_solve/_prepare_stage0_ydot's self._mass_is_state_
-    dependent handling, which reassembles the mass matrix at (t^n, y^n)
-    every step precisely to avoid this.
+    _reassemble_stage0_mass, which _prepare_stage0_ydot calls
+    unconditionally to reassemble the mass matrix at (t^n, y^n) every step
+    precisely to avoid this. Not gated on a structural test for state
+    dependence: such a test passes here but misses a purely time-dependent
+    M -- see test_imex's
+    test_rhs_projection_operator_is_assembled_at_the_stage_state.
 
     Measured on the unfixed code (mass matrix reused unconditionally from
     ctx._rhs_projection_mass_matrix, assembled once): errors of

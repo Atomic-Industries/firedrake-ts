@@ -610,32 +610,95 @@ class _TSContext(_SNESContext):
             )
 
     @cached_property
+    def _rhs_projection_mass_form(self):
+        r"""The form ``dF/du_t``, built once and assembled repeatedly.
+
+        Separated from the tensor it assembles into so that
+        ``_reassemble_rhs_projection_mass_matrix`` does not rebuild the UFL
+        every call: the form is fixed, only the coefficient values it closes
+        over change.
+        """
+        return ufl_expr.derivative(self.F, self._xdot)
+
+    def _apply_algebraic_unit_diagonal(self, mass):
+        """Give algebraic rows of ``mass`` a unit diagonal, in place.
+
+        On algebraic components ``dF/du_t`` is structurally zero, so a plain
+        solve would hit a zero pivot. ``G`` is guaranteed zero on those rows
+        (``_check_G_vanishes_on_algebraic_rows``), so the projected result is
+        zero on them either way and a unit diagonal simply makes the operator
+        invertible. Must be re-applied after every assembly, since a fresh
+        assembly zeroes those rows out again.
+        """
+        if not self._algebraic_fields:
+            return
+        # Taken from J's test space, matching form_rhs_jacobian's
+        # existing idiom, not from F directly: correct because J is
+        # derived from F when not user-supplied, but this assumes a
+        # user-supplied J shares F's test-function space.
+        ises = self._problem.J.arguments()[0].function_space()._ises
+        rows = numpy.concatenate([ises[i].getIndices() for i in self._algebraic_fields])
+        mass.petscmat.zeroRows(rows.astype(PETSc.IntType), diag=1.0)
+
+    @cached_property
     def _rhs_projection_mass_matrix(self):
-        r"""The mass matrix ``dF/du_t``, assembled once.
+        r"""The tensor holding the mass matrix ``dF/du_t``.
 
-        On algebraic components this block is structurally zero, so a plain
-        solve would hit a zero pivot. Those rows are given a unit diagonal
-        instead: ``G`` is guaranteed zero there (checked separately), so the
-        projected result is zero on them either way, and the operator becomes
-        invertible.
+        This property performs only the FIRST, allocating assembly. The
+        operator is NOT constant in general, and is reassembled in place at
+        the current ``(t, u)`` before every projection solve -- see
+        ``_reassemble_rhs_projection_mass_matrix``, which
+        ``_assemble_projected_rhs_residual`` calls unconditionally.
 
-        Held on the context so it outlives the ``KSP`` that takes it as an
-        operator.
+        Held on the context so the tensor outlives the ``KSP`` that takes it
+        as an operator, and so that in-place reassembly reaches that ``KSP``
+        without a further ``setOperators``.
         """
         from firedrake import assemble
 
         self._check_G_vanishes_on_algebraic_rows()
-        mass = assemble(ufl_expr.derivative(self.F, self._xdot), bcs=self.bcs_F)
-        if self._algebraic_fields:
-            # Taken from J's test space, matching form_rhs_jacobian's
-            # existing idiom, not from F directly: correct because J is
-            # derived from F when not user-supplied, but this assumes a
-            # user-supplied J shares F's test-function space.
-            ises = self._problem.J.arguments()[0].function_space()._ises
-            rows = numpy.concatenate(
-                [ises[i].getIndices() for i in self._algebraic_fields]
-            )
-            mass.petscmat.zeroRows(rows.astype(PETSc.IntType), diag=1.0)
+        mass = assemble(self._rhs_projection_mass_form, bcs=self.bcs_F)
+        self._apply_algebraic_unit_diagonal(mass)
+        return mass
+
+    def _reassemble_rhs_projection_mass_matrix(self):
+        r"""Reassemble the projection operator ``M = dF/du_t`` at ``(t, u)``.
+
+        ``M^-1 G`` is only the intended projection when ``M`` is evaluated at
+        the same state ``G`` is: the explicit slope wanted at stage ``j`` is
+        ``M(t_j, Y_j)^-1 G(t_j, Y_j)``. ``form_rhs_function`` copies the
+        incoming stage state into ``ctx._x`` and assigns ``ctx._time`` before
+        calling ``_assemble_projected_rhs_residual``, so assembling here picks
+        up exactly that ``(t_j, Y_j)``.
+
+        Called unconditionally, NOT gated on any structural test of whether
+        ``M`` actually varies. An earlier version of this operator was a
+        plain ``@cached_property`` -- "assembled once" -- which silently
+        inverted ``M(t^0, y^0)`` for every stage of every step. On
+        ``(1 + u) u_t = -u`` that held the error flat at ``3.9e-2`` across
+        ``dt = 0.1, 0.05, 0.025`` (ratios 1.001, 1.000) where reassembly
+        recovers the design order (ratios 4.041, 4.021). Two sibling
+        narrowings of the same operator in ``ark_ssp`` failed the same way:
+        skipping reassembly unless ``dM/du`` was structurally nonzero misses
+        ``M``'s dependence on ``t`` (``M = (1 + t) v``) or on any other
+        mutable coefficient the form closes over, and no structural predicate
+        on the UFL form can rule that out in general. The cost is one
+        assembly and one refactorisation per stage; buy it back with a
+        measured cache keyed on state, never with a guess about the form.
+
+        Reassembles into the existing tensor rather than allocating a fresh
+        one: same sparsity, and the same PETSc handle the ``KSP`` already
+        holds as its operator, so no ``setOperators`` is needed -- PETSc's
+        assembly bumps the ``Mat``'s state counter, which is what tells the
+        ``KSP`` its factorisation is stale.
+        """
+        from firedrake import assemble
+
+        allocated = "_rhs_projection_mass_matrix" in self.__dict__
+        mass = self._rhs_projection_mass_matrix
+        if allocated:
+            assemble(self._rhs_projection_mass_form, bcs=self.bcs_F, tensor=mass)
+            self._apply_algebraic_unit_diagonal(mass)
         return mass
 
     @cached_property
@@ -683,6 +746,9 @@ class _TSContext(_SNESContext):
             if self.project_rhs:
                 # TODO maybe the riesz_repre is the correct way?
                 # assign(self._projected_G, self._G.riesz_representation())
+                # Before the solve, not once: M is state- and time-dependent
+                # in general, and this is the operator the KSP inverts.
+                self._reassemble_rhs_projection_mass_matrix()
                 ksp = self._rhs_projection_solver
                 with (
                     self._rhs_projection_options.inserted_options(),
