@@ -17,6 +17,7 @@ populates those counters, and petsc4py binds no setter for them. As a result
 """
 
 import numpy as np
+import ufl
 from firedrake import dmhooks, ufl_expr
 from firedrake.exceptions import ConvergenceError
 from firedrake.petsc import DEFAULT_KSP_PARAMETERS, PETSc
@@ -77,14 +78,13 @@ class ARKSSP:
         # cached in a separate flag.
         self._mass_ksp = None
         self._mass_options = None
-        # Whether M = dF/du_dot depends on the state u -- see
-        # _setup_stage0_mass_solve. When True, _prepare_stage0_ydot
-        # reassembles self._mass_tensor at the current (t^n, y^n) every
-        # step() rather than reusing a single assembly across the whole
-        # solve.
-        self._mass_is_state_dependent = False
         self._mass_tensor = None
         self._mass_form = None
+        # Set in _setup_stage0_mass_solve, whenever tab.At is identically
+        # zero (a purely explicit tableau): whether F carries a term beyond
+        # the mass form dF/du̇, which _complete's purely-explicit branch
+        # would then silently drop -- see that method.
+        self._explicit_completion_drops_f_term = False
         # Recorded at the top of each step() attempt, for evaluatestep --
         # the value the solution held at the START of the step. step()
         # overwrites ts.getSolution() with each attempt's order-p candidate
@@ -294,27 +294,30 @@ class ARKSSP:
         nonzero ``d^2F/du̇^2``), that same formula is only the first Newton
         step away from ``Ẏ_0 = 0``, not the true root -- silently wrong,
         with no exception -- so this refuses such a problem outright below
-        rather than return a plausible-looking, wrong answer.
+        rather than return a plausible-looking, wrong answer. That refusal
+        is checked unconditionally, for every tableau, NOT only when the
+        first stage is explicit: ``M^-1 G``
+        (``_TSContext._rhs_projection_solver``, used whenever ``G`` is not
+        ``None``) rests on exactly the same affine-in-``u̇`` assumption, for
+        every tableau, whether or not its first stage is explicit.
 
         Built unconditionally whenever the first stage is explicit --
-        NOT gated on whether ``dF/du`` is structurally zero. A previous
-        version skipped the solve there on the reasoning that a state-
-        independent ``F`` gives ``Ẏ_0 = 0`` "exactly"; that reasoning is
-        false. ``dF/du == 0`` says nothing about ``F(t^n, y^n, 0)`` itself
-        -- a purely time-dependent or constant forcing term (e.g.
-        ``F = inner(u_t, v)*dx - inner(Constant(1.0), v)*dx``, i.e.
-        ``u̇ = 1``) has zero ``dF/du`` but nonzero ``F(t, y, 0)``, and
-        skipping the solve there silently reproduces the exact defect this
-        stage-0 handling exists to fix: ``Ẏ_0`` stuck at zero, giving a
-        step that is flat in ``dt`` rather than converging. For a genuinely
-        mass-only ``F`` (no source term at all), ``F(t^n, y^n, 0)`` really
-        is zero, so this solve just returns zero at the cost of one extra
-        ``IFunction`` evaluation and one mass solve per step -- cheap
-        insurance against silently dropping a source term. This is NOT
-        skipped merely because a limiter or the freeze is active -- those
-        constrain what a limiter may do to a stage *value*, which is
-        orthogonal to whether an explicit first stage's derivative needs
-        solving for at all.
+        NOT gated on whether ``dF/du`` is structurally zero, and NOT gated
+        on whether ``M`` itself depends on the state. Two previous versions
+        each narrowed this on a structural predicate that looked sufficient
+        and was not: skipping the solve when ``dF/du`` was structurally
+        zero (false -- ``dF/du == 0`` says nothing about ``F(t^n, y^n, 0)``
+        itself, e.g. a purely time-dependent or constant source), and
+        reusing a single assembly of ``M`` across the whole solve unless
+        ``dM/du`` was structurally nonzero (also false -- a structurally
+        zero ``dM/du`` says nothing about ``M``'s dependence on ``t``, e.g.
+        ``M = (1 + t) v``, or on some other mutable coefficient the form
+        closes over; no structural predicate on the UFL form can rule that
+        out in general). ``_prepare_stage0_ydot`` therefore reassembles
+        ``M`` at the current ``(t^n, y^n)`` every ``step()``,
+        unconditionally -- one extra assembly per step, not per stage,
+        alongside the ``IFunction`` evaluation and mass solve that path
+        already performs every step.
 
         Builds a bare ``PETSc.KSP`` on the assembled mass matrix, following
         ``_TSContext._rhs_projection_solver``'s idiom in
@@ -327,76 +330,75 @@ class ARKSSP:
         no ``SNES`` and so cannot collide -- true whether or not that
         operator gets reassembled between solves.
 
-        Whether ``M`` itself may change between steps is detected here via
-        ``self._mass_is_state_dependent = not is_zero_form(dM/du)``:
-
-        * When ``M`` does NOT depend on ``u`` (the common case -- e.g. any
-          problem with a constant-coefficient mass term), the mass matrix
-          is reused from ``ctx._rhs_projection_mass_matrix`` exactly as
-          before: it is exactly the same ``dF/du̇`` (with the same
-          algebraic-row diag=1 treatment) whether it is used to project
-          ``G`` or to solve for ``Ẏ_0``, and ``_TSContext`` caches it once.
-          Reassembling every step here would cost a real assembly for no
-          benefit, since the answer would not change.
-        * When ``M`` DOES depend on ``u`` (e.g. variable density, porosity,
-          saturation -- any ``M(u)``), reusing that one assembly at every
-          step is exactly the defect this method exists to fix: ``Ẏ_0`` was
-          being solved against ``M(u^0)`` forever, on every step, no matter
-          how far the state had moved from the initial condition -- silent,
-          flat-in-``dt`` non-convergence, with no exception. In this case
-          ``self._mass_form`` (``dF/du̇``, undifferentiated further) is kept
-          so ``_prepare_stage0_ydot`` can reassemble it into
-          ``self._mass_tensor`` in place at the current ``(t^n, y^n)``
-          before every solve, and reset the ``KSP``'s operator to match.
-
-        That property is safe to call even when ``G`` is ``None`` (it is
-        not gated on ``G`` -- only ``_rhs_projection_solver`` is, which is
-        why this method builds its own ``KSP`` instead of reusing that
-        one).
+        ``self._mass_tensor`` is this method's OWN assembly -- never
+        ``ctx._rhs_projection_mass_matrix``, even though the two are the
+        same form. ``_prepare_stage0_ydot`` reassembles ``self._mass_tensor``
+        in place every step; sharing the ``Mat`` with ``_rhs_projection_
+        mass_matrix`` would mean that in-place reassembly silently rewrites
+        the operator ``_TSContext._assemble_projected_rhs_residual``'s own
+        ``KSP`` inverts, contradicting that property's "assembled once"
+        docstring and coupling two solves through a handle neither one's
+        caller can see. This is safe to build even when ``G`` is ``None``
+        (it is not gated on ``G`` -- only ``_rhs_projection_solver`` is,
+        which is why this method builds its own ``KSP`` instead of reusing
+        that one).
 
         ``setUp`` may run more than once against the same stepper instance
         (a TS may be re-set-up after options change); destroy the previous
         ``KSP`` first rather than leaking it -- ``PETSc.KSP`` objects hold
         onto PETSc-side resources that Python's own garbage collector does
-        not reliably reclaim promptly.
+        not reliably reclaim promptly. ``self._mass_tensor``/``self._mass_
+        form``/``self._explicit_completion_drops_f_term`` are reset before
+        either check below can raise, so a failed second ``setUp`` does not
+        leave them pointing at the previous run's objects.
         """
         if self._mass_ksp is not None:
             self._mass_ksp.destroy()
             self._mass_ksp = None
+        self._mass_tensor = None
+        self._mass_form = None
+        self._explicit_completion_drops_f_term = False
         tab = self._tab
-        if tab.At[0, 0] > 0.0:
-            self._mass_is_state_dependent = False
-            self._mass_form = None
-            self._mass_tensor = None
-            return
         ctx = dmhooks.get_appctx(ts.getDM())
         mass_form = ufl_expr.derivative(ctx.F, ctx._xdot)
 
-        # F affine in u_dot? d^2F/du_dot^2 == 0 is required for
+        # F affine in u_dot? d^2F/du_dot^2 == 0 is required both for
         # -M^-1 F(t^n, y^n, 0) to be the exact root rather than one Newton
-        # step from zero -- see this method's docstring. Refuse rather than
-        # hand back a plausible, silently wrong Ẏ_0.
+        # step from zero (only relevant when the first stage is explicit),
+        # and for M^-1 G to mean anything at all for ANY tableau whenever G
+        # is not None -- see this method's docstring. Refuse rather than
+        # hand back a plausible, silently wrong answer.
         if not is_zero_form(ufl_expr.derivative(mass_form, ctx._xdot)):
             raise ValueError(
                 "F is nonlinear in u̇ (d^2F/du̇^2 is not structurally "
-                "zero), but this tableau's first stage is explicit "
-                f"(tab.At[0, 0] == 0.0 for {tab.name!r}). "
-                "Ẏ_0 = -M^-1 F(t^n, y^n, 0) is exact only when F is affine "
-                "in u̇; otherwise it is one Newton step away from the true "
-                "root of F(t^n, y^n, ·) = 0, and using it gives a silently "
-                "wrong answer with no exception. Rewrite F to be affine in "
-                "u̇, or choose a tableau with an implicit first stage "
-                "(tab.At[0, 0] > 0.0)."
+                "zero). The mass matrix M = dF/du̇ is then not a "
+                "well-defined constant operator: Ẏ_0 = -M^-1 F(t^n, y^n, 0) "
+                "(needed because this tableau's first stage is explicit, "
+                f"tab.At[0, 0] == 0.0 for {tab.name!r}) and M^-1 G (needed "
+                "whenever G is not None, for any tableau) are both then "
+                "one Newton step away from their true meaning, not an "
+                "exact answer, with no exception raised otherwise. Rewrite "
+                "F to be affine in u̇."
             )
 
-        self._mass_is_state_dependent = not is_zero_form(
-            ufl_expr.derivative(mass_form, ctx._x)
-        )
-        mass = ctx._rhs_projection_mass_matrix
-        self._mass_tensor = mass
-        self._mass_form = mass_form if self._mass_is_state_dependent else None
-        ksp = PETSc.KSP().create(comm=mass.comm)
-        ksp.setOperators(mass.petscmat)
+        if not np.any(tab.At):
+            # A purely explicit tableau's completion (_complete) never
+            # reads Ydot -- only the explicit slopes L = M^-1 G -- so any
+            # term of F beyond the mass form dF/du̇ would be computed here
+            # (by _prepare_stage0_ydot, into Ydot[0]) and then silently
+            # dropped from every step's completion. Detected here,
+            # structurally, as "F(t, y, 0) is not the zero form"; enforced
+            # in _complete, once per step -- see that method.
+            residual = ufl.replace(ctx.F, {ctx._xdot: ufl.zero(ctx._xdot.ufl_shape)})
+            self._explicit_completion_drops_f_term = not is_zero_form(residual)
+
+        if tab.At[0, 0] > 0.0:
+            return  # _solve_stage populates Ydot[0] normally, in _take_stages.
+
+        self._mass_form = mass_form
+        self._reassemble_stage0_mass(ctx)  # first assembly; builds the Mat.
+        ksp = PETSc.KSP().create(comm=self._mass_tensor.comm)
+        ksp.setOperators(self._mass_tensor.petscmat)
         parameters = {
             k: v for k, v in DEFAULT_KSP_PARAMETERS.items() if k != "mat_type"
         }
@@ -406,24 +408,27 @@ class ARKSSP:
         self._mass_ksp = ksp
 
     def _reassemble_stage0_mass(self, ctx):
-        """Reassemble ``self._mass_tensor`` at the current state, in place.
+        """(Re)assemble ``self._mass_tensor`` at the current state.
 
-        Only called from ``_prepare_stage0_ydot`` when
-        ``self._mass_is_state_dependent`` -- see ``_setup_stage0_mass_solve``
-        for why the common, state-independent case must NOT pay for this
-        every step. ``ctx._x`` (== ``ctx._problem.u_restrict``, the same
-        coefficient ``self._mass_form`` is built from) already holds
-        ``y^n`` by the time this runs: ``_prepare_stage0_ydot`` calls
-        ``ts.computeIFunction`` first, and that callback
-        (``_TSContext.form_function``) copies the incoming state into
-        ``ctx._x`` itself.
+        Called from ``_setup_stage0_mass_solve`` (``self._mass_tensor`` is
+        ``None`` there, so this performs the first, allocating assembly)
+        and, unconditionally, from ``_prepare_stage0_ydot`` on every
+        ``step()`` (``self._mass_tensor`` already exists there, so this
+        reassembles in place). ``ctx._x`` (== ``ctx._problem.u_restrict``,
+        the same coefficient ``self._mass_form`` is built from) already
+        holds the state this must be assembled at: the initial condition on
+        the first call, and ``y^n`` on every later call, because
+        ``_prepare_stage0_ydot`` calls ``ts.computeIFunction`` first, and
+        that callback (``_TSContext.form_function``) copies the incoming
+        state into ``ctx._x`` itself.
 
         ``tensor=self._mass_tensor`` reassembles into the existing
-        ``Matrix``/``Mat`` in place, rather than allocating a fresh one each
-        step: same sparsity, same PETSc handle the ``KSP`` already has as
-        its operator, so no ``setOperators`` call is needed after this --
-        PETSc's own assembly bumps the ``Mat``'s state counter, which is
-        what tells the ``KSP`` its factorisation is stale.
+        ``Matrix``/``Mat`` in place once it exists, rather than allocating a
+        fresh one each step: same sparsity, same PETSc handle the ``KSP``
+        already has as its operator, so no ``setOperators`` call is needed
+        after this -- PETSc's own assembly bumps the ``Mat``'s state
+        counter, which is what tells the ``KSP`` its factorisation is
+        stale.
 
         Mirrors ``_TSContext._rhs_projection_mass_matrix``'s algebraic-row
         handling (unit diagonal on any row with a structurally zero
@@ -433,7 +438,9 @@ class ARKSSP:
         """
         from firedrake import assemble
 
-        assemble(self._mass_form, bcs=ctx.bcs_F, tensor=self._mass_tensor)
+        self._mass_tensor = assemble(
+            self._mass_form, bcs=ctx.bcs_F, tensor=self._mass_tensor
+        )
         if ctx._algebraic_fields:
             ises = ctx._problem.J.arguments()[0].function_space()._ises
             rows = np.concatenate([ises[i].getIndices() for i in ctx._algebraic_fields])
@@ -442,13 +449,14 @@ class ARKSSP:
     def _prepare_stage0_ydot(self, ts, t, x):
         """Populate ``Ẏ_0`` once per ``step()``, before the retry loop.
 
-        ``Ẏ_0 = -M(y^n)^-1 F(t^n, y^n, 0)`` depends only on ``(t^n, y^n)``,
-        i.e. on ``(t, x)`` as passed in here -- neither of which changes
-        across retries of the same step inside ``step()``'s reject loop
-        (only ``h`` does). So this runs exactly once per ``step()`` call,
-        not once per attempt inside ``_take_stages``, and it must be
-        called with THIS step's ``t^n``/``y^n``: ``step()`` calls it right
-        after recording ``self._last_x``, before entering the retry loop.
+        ``Ẏ_0 = -M(t^n, y^n)^-1 F(t^n, y^n, 0)`` depends only on
+        ``(t^n, y^n)``, i.e. on ``(t, x)`` as passed in here -- neither of
+        which changes across retries of the same step inside ``step()``'s
+        reject loop (only ``h`` does). So this runs exactly once per
+        ``step()`` call, not once per attempt inside ``_take_stages``, and
+        it must be called with THIS step's ``t^n``/``y^n``: ``step()``
+        calls it right after recording ``self._last_x``, before entering
+        the retry loop.
         """
         if self._tab.At[0, 0] > 0.0:
             return  # _solve_stage populates _Ydot[0] normally, in _take_stages.
@@ -456,15 +464,15 @@ class ARKSSP:
         # the first stage is explicit -- see that method's docstring for
         # why skipping it based on dF/du alone is unsound.
         ts.computeIFunction(t, x, self._zero_xdot, self._rhs, True)
-        if self._mass_is_state_dependent:
-            # M depends on u: the assembly cached in setUp is stale by now
-            # (built from whatever u happened to be at setUp time, e.g.
-            # the initial condition) -- reassemble at THIS step's y^n
-            # before solving, or Ẏ_0 solves against the wrong operator on
-            # every step after the first. ctx._x already holds y^n, from
-            # the computeIFunction call just above.
-            ctx = dmhooks.get_appctx(ts.getDM())
-            self._reassemble_stage0_mass(ctx)
+        # Reassemble M at THIS step's (t^n, y^n), unconditionally -- see
+        # _setup_stage0_mass_solve's docstring for why no structural
+        # predicate on the form is a sound basis for skipping this. ctx._x
+        # already holds y^n, from the computeIFunction call just above; the
+        # form itself may also depend on t directly (e.g. M = (1 + t) v),
+        # which ctx._time -- updated by that same computeIFunction call --
+        # already reflects.
+        ctx = dmhooks.get_appctx(ts.getDM())
+        self._reassemble_stage0_mass(ctx)
         with self._mass_options.inserted_options():
             self._mass_ksp.solve(self._rhs, self._Ydot[0])
         self._Ydot[0].scale(-1.0)
