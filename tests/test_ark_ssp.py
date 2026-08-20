@@ -352,6 +352,99 @@ def test_esdirk_gamma5_converges_on_a_nonpolynomial_source():
         assert 3.4 < ratio < 4.6, f"observed order ratios {ratios}, expected ~4"
 
 
+def _state_dependent_mass(dt, tmax=1.0):
+    """Integrate ``(1 + u) u' = 1`` (``u(0) = 0``), G = None.
+
+    The mass matrix ``M = dF/du̇ = (1 + u) v`` depends on the state ``u``
+    itself -- exactly the class of problem (variable density, porosity,
+    saturation, ...) that a mass matrix cached once at ``setUp`` time (the
+    initial condition, ``u = 0``) gets wrong on every step after the
+    first: ``_prepare_stage0_ydot`` would keep solving ``Ẏ_0`` against
+    ``M(0)`` forever, no matter how far ``u`` had actually moved, giving a
+    step that is FLAT in ``dt`` rather than converging -- silent, no
+    exception. Exact solution: separating variables, ``(1 + u) du = dt``,
+    so ``u + u^2/2 = t`` and ``u(t) = sqrt(1 + 2t) - 1``;
+    ``u(1) = sqrt(3) - 1``.
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(0.0)
+    F = inner((1.0 + u) * u_t, v) * dx - inner(Constant(1.0), v) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, tmax))
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters={
+            "ts_type": "python",
+            "ts_python_type": PYTHON_STEPPER,
+            "ts_ark_ssp_type": "esdirk_gamma5",
+            "ts_adapt_type": "none",
+            "ts_time_step": dt,
+            "ts_exact_final_time": "matchstep",
+        },
+        options_prefix="",
+    )
+    solver.solve()
+    return float(u.dat.data_ro[0])
+
+
+def test_esdirk_gamma5_converges_on_a_state_dependent_mass_matrix():
+    """The mass matrix M = dF/du̇ depends on u itself, so a Ẏ_0 solved
+    against a stale M(y^0) -- cached once, at setUp -- is flat in dt
+    rather than converging. See _state_dependent_mass's docstring and
+    _setup_stage0_mass_solve/_prepare_stage0_ydot's self._mass_is_state_
+    dependent handling, which reassembles the mass matrix at (t^n, y^n)
+    every step precisely to avoid this.
+
+    Measured on the unfixed code (mass matrix reused unconditionally from
+    ctx._rhs_projection_mass_matrix, assembled once): errors of
+    6.9e-2, 7.2e-2, 7.4e-2, 7.5e-2 at dt = 0.1, 0.05, 0.025, 0.0125 --
+    ratios ~0.96-0.99, i.e. converging to the WRONG limit, not shrinking.
+    """
+    exact = np.sqrt(3.0) - 1.0
+    errors = [
+        abs(_state_dependent_mass(dt) - exact) for dt in (0.1, 0.05, 0.025, 0.0125)
+    ]
+    assert all(e > 0.0 for e in errors)
+    ratios = [errors[i] / errors[i + 1] for i in range(len(errors) - 1)]
+    for ratio in ratios:
+        assert 3.4 < ratio < 4.6, f"observed order ratios {ratios}, expected ~4"
+
+
+def test_esdirk_gamma5_refuses_f_nonlinear_in_udot():
+    """``Ẏ_0 = -M^-1 F(t^n, y^n, 0)`` is exact only when F is affine in u̇.
+
+    ``F = inner(u_t*u_t - Constant(1.0), v)*dx`` (i.e. ``u̇^2 = 1``) has a
+    nonzero d^2F/du̇^2, so that formula is one Newton step from zero, not
+    the true root -- silently wrong (measured: u(1) = -0.308 against an
+    exact 1.0) rather than merely inaccurate. setUp must refuse this
+    outright instead of handing back a plausible-looking wrong answer.
+    """
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(0.0)
+    F = inner(u_t * u_t - Constant(1.0), v) * dx
+    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 1.0))
+    solver = firedrake_ts.DAESolver(
+        problem,
+        solver_parameters=dict(
+            ARK_SSP,
+            ts_ark_ssp_type="esdirk_gamma5",
+            ts_adapt_type="none",
+            ts_time_step=0.1,
+            ts_exact_final_time="matchstep",
+        ),
+        options_prefix="",
+    )
+    with pytest.raises(ValueError, match="nonlinear in"):
+        solver.solve()
+
+
 def _flaky_stage_solver(ctx, n_failures):
     """Wrap ``ctx._solve_stage`` to raise on its first ``n_failures`` calls.
 
