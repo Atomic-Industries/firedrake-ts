@@ -242,7 +242,7 @@ def test_project_rhs_false_is_rejected_when_G_is_supplied():
     problem = firedrake_ts.DAEProblem(
         inner(u_t, v) * dx, u, u_t, (0.0, 1.0), G=-inner(u, v) * dx
     )
-    with pytest.raises(ValueError, match="mass matrix"):
+    with pytest.raises(ValueError, match="raw dual G"):
         firedrake_ts.DAESolver(problem, project_rhs=False, options_prefix="")
 
 
