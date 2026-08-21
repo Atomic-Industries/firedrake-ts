@@ -1,7 +1,7 @@
 """Error-controlled stepping via TSADAPTBASIC and the embedded pair."""
 
 import pytest
-from conftest import ARK_SSP as _ARK_SSP_BASE
+from conftest import ARK_SSP_G5 as ARK_SSP
 from conftest import EXACT_DECAY, scalar_problem
 from firedrake import *
 from firedrake.exceptions import ConvergenceError
@@ -9,8 +9,6 @@ from firedrake.exceptions import ConvergenceError
 import firedrake_ts
 
 EXACT = EXACT_DECAY
-
-ARK_SSP = {**_ARK_SSP_BASE, "ts_ark_ssp_type": "esdirk_gamma5"}
 
 
 def _decay(extra, dt=1e-2):
@@ -29,19 +27,14 @@ def _decay(extra, dt=1e-2):
     return solver, float(u.dat.data_ro[0])
 
 
-def test_shim_resolves_ts_adapt_symbols():
-    from firedrake_ts._petsc_shim import ts_get_adapt
-
-    mesh = UnitIntervalMesh(2)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    u_t = Function(V)
-    v = TestFunction(V)
-    problem = firedrake_ts.DAEProblem(
-        inner(u_t, v) * dx, u, u_t, (0.0, 0.1), G=-inner(u, v) * dx
-    )
-    solver = firedrake_ts.DAESolver(problem, options_prefix="")
-    assert ts_get_adapt(solver.ts) is not None
+# "The shim resolves the TSAdapt symbols" had its own test, asserting
+# ts_get_adapt(ts) is not None on a solver it built for the purpose. Every
+# adaptive test below reaches that symbol first: ark_ssp.py:776 calls
+# ts_get_adapt at the top of the adaptive branch, before the
+# candidates_clear/candidate_add/choose sequence, so an unresolved symbol
+# fails test_adapt_basic_selects_steps and
+# test_adapt_choose_is_told_whether_the_last_attempt_failed -- the latter of
+# which additionally asserts ts_adapt_choose was called at all.
 
 
 def test_evaluatestep_gives_the_embedded_solution():

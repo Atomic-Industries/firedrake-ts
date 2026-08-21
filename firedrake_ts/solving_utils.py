@@ -137,7 +137,13 @@ def resolve_fields(option, prefix, detected, nfields=None):
     range`` from inside ``_apply_algebraic_unit_diagonal``, and a negative one
     quietly selected a field from the end.
     """
-    values = tuple(PETSc.Options(prefix or "").getIntArray(option, list(detected)))
+    # int() per element, not just tuple(): getIntArray hands back numpy
+    # integers, which index correctly but make this path's return type differ
+    # from the structural detection it overrides -- and render in the error
+    # below as "[np.int32(2)]" rather than "[2]".
+    values = tuple(
+        int(i) for i in PETSc.Options(prefix or "").getIntArray(option, list(detected))
+    )
     if nfields is not None:
         bad = [i for i in values if not 0 <= i < nfields]
         if bad:

@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from conftest import ARK_SSP_G5, ARKIMEX_2C
 from firedrake import *
 
 import firedrake_ts
@@ -20,7 +21,7 @@ def _three_field():
     W = V * V * V
     w = Function(W)
     wdot = Function(W)
-    f, p, T = split(w)
+    _f, p, T = split(w)
     fdot, _pdot, Tdot = split(wdot)
     vf, vp, vT = TestFunctions(W)
     F = (
@@ -29,30 +30,11 @@ def _three_field():
         + inner(Tdot, vT) * dx  # mass ...
         + inner(grad(T), grad(vT)) * dx  # ... plus diffusion
     )
-    return F, w, wdot, (f, p, T), (vf, vp, vT)
+    return F, w, wdot, 3
 
 
-def test_algebraic_fields_finds_the_constraint_row():
-    """Exactly the pressure row: (1,), not (0, 1) and not (1, 2).
-
-    Together with the next test, this pins that differential/algebraic and
-    implicit/explicit are DIFFERENT questions over the same form: the two
-    answers here are (1,) and (0,), so they are disjoint, and T (row 2) --
-    which has both a time derivative and an implicit operator -- is in
-    neither. A separate test asserting that disjointness followed
-    deductively from these two exact tuples and could not fail on its own.
-    """
-    F, w, wdot, _, _ = _three_field()
-    assert algebraic_fields(F, w, wdot, 3) == (1,)
-
-
-def test_explicitly_governed_fields_finds_the_mass_only_row():
-    """Exactly the mass-only row: (0,). See the note above on the partitions."""
-    F, w, wdot, _, _ = _three_field()
-    assert explicitly_governed_fields(F, w, wdot, 3) == (0,)
-
-
-def test_nonsingular_two_field_has_no_algebraic_rows():
+def _two_field(diffusive):
+    """Two differential fields; ``diffusive`` gives each row an implicit part."""
     mesh = UnitIntervalMesh(4)
     V = FunctionSpace(mesh, "P", 1)
     W = V * V
@@ -61,33 +43,50 @@ def test_nonsingular_two_field_has_no_algebraic_rows():
     a, b = split(w)
     adot, bdot = split(wdot)
     va, vb = TestFunctions(W)
-    F = (
-        inner(adot, va) * dx
-        + inner(grad(a), grad(va)) * dx
-        + inner(bdot, vb) * dx
-        + inner(grad(b), grad(vb)) * dx
-    )
-    assert algebraic_fields(F, w, wdot, 2) == ()
-    assert explicitly_governed_fields(F, w, wdot, 2) == ()
-
-
-def test_mass_only_rows_are_all_explicitly_governed():
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    W = V * V
-    w = Function(W)
-    wdot = Function(W)
-    adot, bdot = split(wdot)
-    va, vb = TestFunctions(W)
     F = inner(adot, va) * dx + inner(bdot, vb) * dx
-    assert explicitly_governed_fields(F, w, wdot, 2) == (0, 1)
-    assert algebraic_fields(F, w, wdot, 2) == ()
+    if diffusive:
+        F += inner(grad(a), grad(va)) * dx + inner(grad(b), grad(vb)) * dx
+    return F, w, wdot, 2
+
+
+# The two predicates answer DIFFERENT questions over the same form, and the
+# three cases below are what pins that rather than any one of them alone:
+#
+# mixed_character -- (1,) algebraic and (0,) explicitly governed, so the two
+#   answers are disjoint, and T (row 2, which has both a time derivative and an
+#   implicit operator) is in neither. A separate test asserting that
+#   disjointness would follow deductively from these two exact tuples and could
+#   not fail on its own.
+# both_differential -- neither predicate fires: every row has a mass term AND
+#   an implicit operator. This is also the form under which
+#   test_rung3_pde_with_multiplier_runs[arkssp] exercises the empty-tuple path
+#   through field_rows() end to end.
+# both_mass_only -- (0, 1): mass-only rows are ALL explicitly governed, and a
+#   singular mass matrix is not implied by one (algebraic is still empty).
+#
+# Each was its own test with one or two assertions and a copy of the same
+# preamble; the forms are the data, so they are parameters here.
+@pytest.mark.parametrize(
+    "build,expected_algebraic,expected_explicit",
+    [
+        pytest.param(_three_field, (1,), (0,), id="mixed_character"),
+        pytest.param(lambda: _two_field(True), (), (), id="both_differential"),
+        pytest.param(lambda: _two_field(False), (), (0, 1), id="both_mass_only"),
+    ],
+)
+def test_field_partitions(build, expected_algebraic, expected_explicit):
+    """``algebraic_fields`` and ``explicitly_governed_fields`` on one form."""
+    F, w, wdot, nfields = build()
+    assert algebraic_fields(F, w, wdot, nfields) == expected_algebraic
+    assert explicitly_governed_fields(F, w, wdot, nfields) == expected_explicit
 
 
 def test_nonzero_rows_locates_G():
-    _F, _w, _wdot, (f, _p, T), (vf, vp, _vT) = _three_field()
-    assert nonzero_rows(inner(f, vf) * dx, 3) == (0,)
-    assert nonzero_rows(inner(T, vp) * dx, 3) == (1,)
+    _F, w, _wdot, nfields = _three_field()
+    f, _p, T = split(w)
+    vf, vp, _vT = TestFunctions(w.function_space())
+    assert nonzero_rows(inner(f, vf) * dx, nfields) == (0,)
+    assert nonzero_rows(inner(T, vp) * dx, nfields) == (1,)
 
 
 def test_absent_residual_row_raises():
@@ -117,6 +116,17 @@ def test_resolve_fields_prefers_an_explicit_override():
 
     Same pattern as -pc_fieldsplit_detect_saddle_point: detection is the
     default, not the only option.
+
+    The out-of-range rejection is checked here and nowhere else. That
+    validation exists because an index past the end otherwise surfaced as
+    ``IndexError: tuple index out of range`` from inside
+    ``_apply_algebraic_unit_diagonal`` -- far from the option that caused it --
+    and a NEGATIVE index quietly selected a field from the end instead of
+    failing, which is the dangerous half: ``-ts_algebraic_fields -1`` on a
+    three-field problem would stamp a unit diagonal on row 2 and report
+    nothing. That half cannot be reached through
+    ``test_G_vanishes_on_algebraic_rows[declared]`` below, which exercises the
+    honoured-override path.
     """
     from firedrake.petsc import PETSc
 
@@ -127,6 +137,19 @@ def test_resolve_fields_prefers_an_explicit_override():
     opts["probe_ts_algebraic_fields"] = "0,2"
     try:
         assert resolve_fields("ts_algebraic_fields", "probe_", (1,)) == (0, 2)
+        assert resolve_fields("ts_algebraic_fields", "probe_", (1,), nfields=3) == (
+            0,
+            2,
+        )
+        with pytest.raises(ValueError, match=r"\[2\]"):
+            resolve_fields("ts_algebraic_fields", "probe_", (1,), nfields=2)
+    finally:
+        del opts["probe_ts_algebraic_fields"]
+
+    opts["probe_ts_algebraic_fields"] = "-1"
+    try:
+        with pytest.raises(ValueError, match=r"\[-1\]"):
+            resolve_fields("ts_algebraic_fields", "probe_", (1,), nfields=3)
     finally:
         del opts["probe_ts_algebraic_fields"]
 
@@ -189,17 +212,43 @@ def _rung1(stepper, dt=1e-2, tmax=1.0):
     return float(w.sub(0).dat.data_ro[0]), float(w.sub(1).dat.data_ro[0])
 
 
-ARKIMEX = {"ts_type": "arkimex", "ts_arkimex_type": "2c"}
-
-
 # "A singular mass matrix must not break the RHS projection" under arkimex is
 # test_rung1_dual_path[arkimex] below -- same helper, same tableau, same two
 # abs=1e-3 assertions. A standalone copy of it here was a second 1000-step run
 # of exactly that.
 
 
-def test_G_nonzero_on_an_algebraic_row_is_rejected():
-    """The projection is undefined there; fail loudly, not silently."""
+@pytest.mark.parametrize(
+    "which_row,extra",
+    [
+        pytest.param("algebraic", {}, id="detected"),
+        pytest.param("differential", {"ts_algebraic_fields": "0,1"}, id="declared"),
+    ],
+)
+def test_G_vanishes_on_algebraic_rows(which_row, extra):
+    """``G`` on an algebraic row is undefined there; fail loudly, not silently.
+
+    Two cases, because the row set has two sources and only the first was
+    covered by the check's own test:
+
+    ``detected`` -- ``G`` is nonzero on row 1, which ``algebraic_fields``
+    detects structurally. The straightforward case.
+
+    ``declared`` -- ``G`` is nonzero on row 0, which is DIFFERENTIAL, and
+    ``ts_algebraic_fields`` declares rows 0 and 1 algebraic anyway. Declaring
+    row 0 is deliberately wrong for this problem, because a correct override is
+    indistinguishable from the detected default: if the option is honoured the
+    check must reject, and if it is dropped the solve proceeds happily -- which
+    is the bug this case was written for. ``_algebraic_fields`` is a
+    ``cached_property`` reading the option out of PETSc's database via
+    ``resolve_fields``, forced eagerly by ``solve()``'s
+    ``_check_G_vanishes_on_algebraic_rows``; options from
+    ``solver_parameters`` are only in that database inside
+    ``inserted_options()``, so forcing the property outside it resolved to the
+    structural default AND cached that for the rest of the solve, silently
+    ignoring the documented override and stamping unit diagonals on the wrong
+    rows of ``dF/du_t``.
+    """
     mesh = UnitIntervalMesh(1)
     R = FunctionSpace(mesh, "DG", 0)  # NOT "R": see the note in the brief
     W = R * R
@@ -208,16 +257,19 @@ def test_G_nonzero_on_an_algebraic_row_is_rejected():
     y, z = split(w)
     ydot, _zdot = split(wdot)
     vy, vz = TestFunctions(W)
-    F = inner(ydot, vy) * dx + inner(z + y, vz) * dx
-    G = inner(y, vz) * dx  # nonzero on the ALGEBRAIC row
+    w.sub(0).assign(1.0)
+    w.sub(1).assign(1.0)
+    F = inner(ydot, vy) * dx + inner(z - y, vz) * dx
+    # Row 1 is the algebraic one; row 0 is differential.
+    G = inner(y, vz) * dx if which_row == "algebraic" else inner(-y, vy) * dx
 
     problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, 0.1), G=G)
     solver = firedrake_ts.DAESolver(
         problem,
-        solver_parameters=dict(RUNG_PARAMS, ts_time_step=0.05, **ARKIMEX),
+        solver_parameters=dict(RUNG_PARAMS, ts_time_step=0.05, **ARKIMEX_2C, **extra),
         options_prefix="",
     )
-    with pytest.raises(ValueError, match="algebraic"):
+    with pytest.raises(ValueError, match="G is nonzero on algebraic"):
         solver.solve()
 
 
@@ -272,7 +324,7 @@ def test_two_algebraic_fields_drive_the_concatenated_zero_rows():
     # dt=1e-2: order-2 arkimex against an abs=1e-3 tolerance, and this test is
     # about zeroRows being driven with a genuinely concatenated index set, not
     # about accuracy. 1e-2 divides tmax, so stepover lands on 1.0.
-    parameters = dict(RUNG_PARAMS, ts_time_step=1e-2, **ARKIMEX)
+    parameters = dict(RUNG_PARAMS, ts_time_step=1e-2, **ARKIMEX_2C)
     firedrake_ts.DAESolver(
         problem, solver_parameters=parameters, options_prefix=""
     ).solve()
@@ -283,58 +335,13 @@ def test_two_algebraic_fields_drive_the_concatenated_zero_rows():
     assert float(w.sub(2).dat.data_ro[0]) == pytest.approx(-exact_y, abs=1e-3)
 
 
-def test_algebraic_fields_override_is_read_from_solver_parameters():
-    """``ts_algebraic_fields`` must work from ``solver_parameters``, not just
-    from the command line.
-
-    ``_algebraic_fields`` is a ``cached_property`` that reads the option out
-    of PETSc's database via ``resolve_fields``, and it is forced eagerly by
-    ``solve()``'s ``_check_G_vanishes_on_algebraic_rows`` call. Options given
-    in ``solver_parameters`` are only pushed into that database inside
-    ``inserted_options()`` (and deleted again on exit), so forcing the
-    property outside it resolved the option to its structural default AND
-    cached that for the rest of the solve -- silently ignoring the documented
-    override and stamping unit diagonals on the wrong rows of ``dF/du_t``.
-
-    Declaring row 0 algebraic here is deliberately WRONG for this problem
-    (row 0 is differential), because a correct override is indistinguishable
-    from the detected default. ``G`` is nonzero on row 0, so if the override
-    is honoured the ``G``-vanishes check must reject it; if it is dropped,
-    the solve proceeds happily -- which is exactly the bug.
-    """
-    mesh = UnitIntervalMesh(1)
-    R = FunctionSpace(mesh, "DG", 0)
-    W = R * R
-    w = Function(W)
-    wdot = Function(W)
-    y, z = split(w)
-    ydot, _zdot = split(wdot)
-    vy, vz = TestFunctions(W)
-    w.sub(0).assign(1.0)
-    w.sub(1).assign(1.0)
-    F = inner(ydot, vy) * dx + inner(z - y, vz) * dx
-    G = inner(-y, vy) * dx
-
-    problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, 0.1), G=G)
-    solver = firedrake_ts.DAESolver(
-        problem,
-        solver_parameters=dict(
-            RUNG_PARAMS, ts_time_step=1e-2, ts_algebraic_fields="0,1", **ARKIMEX
-        ),
-        options_prefix="",
-    )
-    with pytest.raises(ValueError, match="G is nonzero on algebraic"):
-        solver.solve()
+# "ts_algebraic_fields must be read from solver_parameters, not just the
+# command line" is test_G_vanishes_on_algebraic_rows[declared] above: same
+# override, same deliberately-wrong row 0, same rejection, and it reuses the
+# G-check setup instead of repeating 25 lines of it.
 
 
-ARK_SSP_G5 = {
-    "ts_type": "python",
-    "ts_python_type": "firedrake_ts.ark_ssp.ARKSSP",
-    "ts_ark_ssp_type": "esdirk_gamma5",
-}
-
-
-@pytest.mark.parametrize("stepper", [ARKIMEX, ARK_SSP_G5], ids=["arkimex", "arkssp"])
+@pytest.mark.parametrize("stepper", [ARKIMEX_2C, ARK_SSP_G5], ids=["arkimex", "arkssp"])
 def test_rung1_dual_path(stepper):
     """Index 1, singular mass, exact solution. Both steppers must agree."""
     y, z = _rung1(stepper)
@@ -390,7 +397,7 @@ def test_stiff_accuracy_is_what_buys_the_constraint_defect():
     at 7.7e-06 -- about ten orders of magnitude apart.
     """
     _, _, stiffly_accurate = _rung2(ARK_SSP_G5, dt=1e-2)
-    _, _, shipped = _rung2(ARKIMEX, dt=1e-2)
+    _, _, shipped = _rung2(ARKIMEX_2C, dt=1e-2)
     assert stiffly_accurate < 1e-10, (
         f"stiffly accurate tableau gave defect {stiffly_accurate:.3e}, "
         "expected machine precision -- R3 is not being exploited"
@@ -439,7 +446,7 @@ def _rung3(stepper, dt=2e-3, tmax=0.1, n=8):
     return w, target
 
 
-@pytest.mark.parametrize("stepper", [ARKIMEX, ARK_SSP_G5], ids=["arkimex", "arkssp"])
+@pytest.mark.parametrize("stepper", [ARKIMEX_2C, ARK_SSP_G5], ids=["arkimex", "arkssp"])
 def test_rung3_pde_with_multiplier_runs(stepper):
     """The PDE-scale rung: real accuracy, not just liveness.
 

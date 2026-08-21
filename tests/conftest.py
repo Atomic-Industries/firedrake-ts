@@ -21,6 +21,14 @@ PYTHON_STEPPER = "firedrake_ts.ark_ssp.ARKSSP"
 #: Selects the ARKSSP stepper. Merge a tableau and step size on top.
 ARK_SSP = {"ts_type": "python", "ts_python_type": PYTHON_STEPPER}
 
+#: ARKSSP on the production tableau -- the one nearly every stepper test wants.
+#: Five files were each re-deriving or re-spelling this.
+ARK_SSP_G5 = {**ARK_SSP, "ts_ark_ssp_type": "esdirk_gamma5"}
+
+#: PETSc's own second-order ARK-IMEX, the reference stepper for every
+#: cross-check and negative control. Also spelled in five places before.
+ARKIMEX_2C = {"ts_type": "arkimex", "ts_arkimex_type": "2c"}
+
 #: Solution of ``u' = -u`` at ``t = 1``, the oracle for every decay test.
 EXACT_DECAY = np.exp(-1.0)
 

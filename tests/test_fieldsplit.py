@@ -2,13 +2,13 @@
 
 import numpy as np
 import pytest
+from conftest import ARKIMEX_2C, scalar_problem
 from firedrake import *
 
 import firedrake_ts
 
 FIELDSPLIT = {
-    "ts_type": "arkimex",
-    "ts_arkimex_type": "2c",
+    **ARKIMEX_2C,
     "ts_adapt_type": "none",
     "ts_time_step": 0.05,
     "ts_exact_final_time": "stepover",
@@ -84,12 +84,8 @@ def test_supplied_jacobian_is_not_doubled():
     the wrong matrix. Regressing this fix would reintroduce that silent
     corruption.
     """
-    mesh = UnitIntervalMesh(8)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    udot = Function(V)
-    v = TestFunction(V)
-    du = TrialFunction(V)
+    u, udot, v = scalar_problem(cells=8)
+    du = TrialFunction(u.function_space())
 
     F = inner(udot, v) * dx + inner(grad(u), grad(v)) * dx
     mass = inner(du, v) * dx
@@ -124,13 +120,8 @@ def test_supplied_jacobian_of_the_shift_solves_a_pure_ode():
     and the stage solve had nothing to invert. This is the case that proves
     the callable route is not merely tidier but necessary.
     """
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    u = Function(V)
-    udot = Function(V)
-    v = TestFunction(V)
-    du = TrialFunction(V)
-    u.assign(1.0)
+    u, udot, v = scalar_problem()
+    du = TrialFunction(u.function_space())
 
     problem = firedrake_ts.DAEProblem(
         inner(udot, v) * dx,
@@ -142,13 +133,12 @@ def test_supplied_jacobian_of_the_shift_solves_a_pure_ode():
     )
     firedrake_ts.DAESolver(
         problem,
-        solver_parameters={
-            "ts_type": "arkimex",
-            "ts_arkimex_type": "2c",
-            "ts_adapt_type": "none",
-            "ts_time_step": 1e-2,
-            "ts_exact_final_time": "matchstep",
-        },
+        solver_parameters=dict(
+            ARKIMEX_2C,
+            ts_adapt_type="none",
+            ts_time_step=1e-2,
+            ts_exact_final_time="matchstep",
+        ),
         options_prefix="",
     ).solve()
 

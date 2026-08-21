@@ -44,7 +44,10 @@ DM-scoped SNESSetFunction, or a bug in the freeze zeroing every Ydot row)
 fails loudly instead of passing by accident.
 """
 
+from collections import namedtuple
+
 import numpy as np
+from conftest import ARK_SSP_G5, ARKIMEX_2C
 from firedrake import *
 
 import firedrake_ts
@@ -52,6 +55,11 @@ import firedrake_ts
 N = 40
 CFL = 0.064
 VELOCITY = 1.0
+
+#: What one advection run yields. ``initial_mass`` is measured before the solve
+#: so the mass claim can be checked on the same run as the bounds claim rather
+#: than by repeating it.
+Advection = namedtuple("Advection", "lo hi f solver initial_mass")
 
 
 def _zhang_shu(V, V0, mean_range=None, clipped=None):
@@ -124,19 +132,21 @@ def _zhang_shu(V, V0, mean_range=None, clipped=None):
     return limiter
 
 
-def _advect(stepper_parameters, limited, mean_range=None, clipped=None, velocity=None):
+def _advect(stepper_parameters, limited, mean_range=None, clipped=None):
     """DG1 upwind advection of a square wave on a periodic interval.
 
-    Returns ``(min, max, f, solver)`` -- the trace bounds, the solution
-    Function itself (so a caller can check it against the exact translate),
-    and the solver (so a caller can check the accepted step count).
+    Returns an ``Advection``: the trace bounds, the solution Function itself
+    (so a caller can check it against the exact translate), the solver (so a
+    caller can check the accepted step count), and the pre-solve mass.
 
-    :arg velocity: overrides the transport velocity used in ``G`` without
-        touching the CFL-based timestep, which is derived from the module
-        constant ``VELOCITY`` regardless. Exists only for the "did this test
-        actually detect a stalled advection" sanity check -- setting the
-        physical velocity to zero while leaving ``dt`` alone is exactly
-        "transport silently absent, everything else identical."
+    A ``velocity`` override used to hang off this signature, for the "would
+    this test actually detect a stalled advection" sanity check -- set the
+    physical velocity to zero, leave the CFL-derived dt alone, and you have
+    "transport silently absent, everything else identical." No test ever
+    passed it, and its answer is recorded permanently in the L1 assertion
+    below, which names the ~0.4 a stationary solution produces against the
+    ~0.016 of a real run. Keeping an unused parameter so the experiment can be
+    re-run is not worth it once the number is written down.
     """
     mesh = PeriodicUnitIntervalMesh(N)
     # variant="equispaced" is REQUIRED, not cosmetic: see the module docstring.
@@ -147,8 +157,9 @@ def _advect(stepper_parameters, limited, mean_range=None, clipped=None, velocity
     v = TestFunction(V)
     (x,) = SpatialCoordinate(mesh)
     f.interpolate(conditional(And(x > 0.25, x < 0.75), 1.0, 0.0))
+    initial_mass = float(assemble(f * dx))
 
-    u = Constant(VELOCITY if velocity is None else velocity)
+    u = Constant(VELOCITY)
     n = FacetNormal(mesh)
     un = 0.5 * (u * n[0] + abs(u * n[0]))
 
@@ -175,15 +186,7 @@ def _advect(stepper_parameters, limited, mean_range=None, clipped=None, velocity
         )
     solver.solve()
     data = f.dat.data_ro
-    return float(data.min()), float(data.max()), f, solver
-
-
-ARK_SSP = {
-    "ts_type": "python",
-    "ts_python_type": "firedrake_ts.ark_ssp.ARKSSP",
-    "ts_ark_ssp_type": "esdirk_gamma5",
-}
-ARKIMEX = {"ts_type": "arkimex", "ts_arkimex_type": "2c"}
+    return Advection(float(data.min()), float(data.max()), f, solver, initial_mass)
 
 
 def test_shu_osher_form_holds_bounds_with_no_post_step_clamp():
@@ -196,12 +199,20 @@ def test_shu_osher_form_holds_bounds_with_no_post_step_clamp():
     advected close to its exact translate, and that the limiter genuinely
     scaled at least one cell -- which a stationary or over-limited solution
     would fail. See the module docstring.
+
+    Mass conservation is checked here too, on this run. It had a test of its
+    own, which re-ran the identical 126-step limited solve behind a
+    forty-line copy of ``_advect``'s body -- the second most expensive test in
+    the suite, for two lines of assertion about a solve already performed.
+    Both claims are about the same limiter on the same trajectory, and the
+    module docstring already ties them together: if the limiter is not
+    scaling about the mean, the bounds result would be meaningless even if it
+    passed.
     """
     mean_range = []
     clipped = [0]
-    lo, hi, f, solver = _advect(
-        ARK_SSP, limited=True, mean_range=mean_range, clipped=clipped
-    )
+    run = _advect(ARK_SSP_G5, limited=True, mean_range=mean_range, clipped=clipped)
+    lo, hi, f, solver = run.lo, run.hi, run.f, run.solver
     assert lo >= -1e-12, f"min = {lo}, expected >= 0 to machine precision"
     assert hi <= 1.0 + 1e-12, f"max = {hi}, expected <= 1 to machine precision"
 
@@ -255,6 +266,17 @@ def test_shu_osher_form_holds_bounds_with_no_post_step_clamp():
         "advance the way this test assumes"
     )
 
+    # Mass neutrality. Zhang-Shu scales about the cell mean, so the limiter
+    # must not move the mass at all: COOL-193 measured it exact to 2e-16 with
+    # the limiter active, the defect it describes being purely in boundedness.
+    # Measured drift here is ~2.3e-16; 1e-13 is generous but four orders
+    # tighter than the 1e-12 it replaced, which constrained nothing.
+    assert run.initial_mass > 0.0
+    final_mass = float(assemble(f * dx))
+    assert abs(final_mass - run.initial_mass) < 1e-13 * abs(run.initial_mass), (
+        f"mass drifted from {run.initial_mass} to {final_mass}"
+    )
+
 
 def test_negative_control_butcher_form_does_not_bound():
     """Proves the test problem is actually challenging.
@@ -262,60 +284,9 @@ def test_negative_control_butcher_form_does_not_bound():
     If this ever starts passing, the bounds test above is not evidence for
     anything -- strengthen the problem before trusting it.
     """
-    lo, hi, _, _ = _advect(ARKIMEX, limited=False)
-    assert lo < -1e-4 or hi > 1.0 + 1e-4, (
-        f"the Butcher-form control stayed in bounds (min={lo}, max={hi}); "
-        "this problem is not exercising the defect COOL-193 describes"
-    )
-
-
-def test_limiting_does_not_destroy_mass():
-    """Zhang-Shu scales about the cell mean, so it must be mass-neutral.
-
-    COOL-193 measured mass exact to 2e-16 with the limiter active -- the
-    defect it describes is purely in boundedness. If this regresses, the
-    limiter is not scaling about the mean and the bounds result above would
-    be meaningless even if it passed.
-    """
-    mesh = PeriodicUnitIntervalMesh(N)
-    # variant="equispaced" is REQUIRED, not cosmetic: see the module docstring.
-    V = FunctionSpace(mesh, "DG", 1, variant="equispaced")
-    V0 = FunctionSpace(mesh, "DG", 0)
-    f = Function(V, name="f")
-    f_t = Function(V)
-    v = TestFunction(V)
-    (x,) = SpatialCoordinate(mesh)
-    f.interpolate(conditional(And(x > 0.25, x < 0.75), 1.0, 0.0))
-    initial_mass = assemble(f * dx)
-    assert initial_mass > 0.0
-
-    u = Constant(VELOCITY)
-    n = FacetNormal(mesh)
-    un = 0.5 * (u * n[0] + abs(u * n[0]))
-    F = inner(f_t, v) * dx
-    G = (
-        f * u * v.dx(0) * dx
-        - (un("+") * f("+") - un("-") * f("-")) * (v("+") - v("-")) * dS
-    )
-
-    dt = CFL / (N * VELOCITY)
-    problem = firedrake_ts.DAEProblem(F, f, f_t, (0.0, 0.2), G=G)
-    solver = firedrake_ts.DAESolver(
-        problem,
-        solver_parameters=dict(
-            ARK_SSP,
-            ts_adapt_type="none",
-            ts_time_step=dt,
-            ts_exact_final_time="stepover",
-        ),
-        options_prefix="",
-    )
-    solver.set_stage_limiter(_zhang_shu(V, V0))
-    solver.solve()
-
-    final_mass = assemble(f * dx)
-    # Measured drift is ~2.3e-16; 1e-13 is still generous but four orders
-    # tighter than the 1e-12 this replaced, which constrained nothing.
-    assert abs(final_mass - initial_mass) < 1e-13 * abs(initial_mass), (
-        f"mass drifted from {initial_mass} to {final_mass}"
+    run = _advect(ARKIMEX_2C, limited=False)
+    assert run.lo < -1e-4 or run.hi > 1.0 + 1e-4, (
+        f"the Butcher-form control stayed in bounds (min={run.lo}, "
+        f"max={run.hi}); this problem is not exercising the defect COOL-193 "
+        "describes"
     )

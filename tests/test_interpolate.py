@@ -2,13 +2,11 @@
 
 import numpy as np
 import pytest
-from conftest import ARK_SSP as _ARK_SSP_BASE
+from conftest import ARK_SSP_G5 as ARK_SSP
 from conftest import scalar_problem
 from firedrake import *
 
 import firedrake_ts
-
-ARK_SSP = {**_ARK_SSP_BASE, "ts_ark_ssp_type": "esdirk_gamma5"}
 
 
 def _solver(dt=0.1, tmax=1.0, tableau="esdirk_gamma5"):

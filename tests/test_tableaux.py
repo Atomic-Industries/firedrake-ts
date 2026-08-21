@@ -4,9 +4,12 @@ import numpy as np
 import pytest
 
 from firedrake_ts.tableaux import (
+    TABLEAUX,
     ShuOsherError,
+    acceptance_report,
     kraaijevanger_radius,
     shu_osher,
+    stability_function,
 )
 
 # Ketcheson's optimal SSPRK(3,2) in stiffly accurate form. Four stages with
@@ -103,16 +106,30 @@ def test_shu_osher_reproduces_the_butcher_map(A, b, r):
         )
 
 
-def test_completion_row_equals_last_stage_row_under_stiff_accuracy():
-    """b == A[s-1,:] means the completion IS the last stage."""
-    P, q = shu_osher(SSPRK32_A, SSPRK32_B, 2.0)
-    np.testing.assert_allclose(P[-1], P[-2], atol=1e-14)
-    np.testing.assert_allclose(q[-1], q[-2], atol=1e-14)
+# "The completion row equals the last stage row under stiff accuracy" -- i.e.
+# P[-1] == P[-2] and q[-1] == q[-2] for SSPRK32 at r = 2 -- had its own test,
+# which could not fail: test_ssprk32_gives_the_textbook_form above pins those
+# five rows to exact values in which P[3, 2] == P[4, 2] == 2/3 and
+# q[3] == q[4] == 1/3, so the equality is a consequence of assertions already
+# made on the same call. The general property (b == A[s-1,:] in the tableau
+# itself) is asserted directly by test_stiff_accuracy_r3 below.
 
 
 def test_kraaijevanger_radius():
+    """R(A, b) for the two reference tableaux and for imex_euler.
+
+    imex_euler is included here rather than in a separate registry test: its
+    A and b differ from Heun's (b = [1, 0], not [1/2, 1/2]), so it is a third
+    tableau, but it is one assertion, not a test. ssprk2 deliberately is NOT
+    included -- HEUN_A/HEUN_B above ARE ssprk2's A and b, so a registry lookup
+    for it would re-run the second assertion with extra steps.
+    """
     assert kraaijevanger_radius(SSPRK32_A, SSPRK32_B) == pytest.approx(2.0, abs=1e-9)
     assert kraaijevanger_radius(HEUN_A, HEUN_B) == pytest.approx(1.0, abs=1e-9)
+    imex_euler = TABLEAUX["imex_euler"]
+    assert kraaijevanger_radius(imex_euler.A, imex_euler.b) == pytest.approx(
+        1.0, abs=1e-9
+    )
 
 
 def test_radius_is_sharp():
@@ -190,13 +207,6 @@ def test_module_does_not_import_firedrake():
     )
 
 
-from firedrake_ts.tableaux import (  # noqa: E402
-    TABLEAUX,
-    acceptance_report,
-    stability_function,
-)
-
-
 def test_registry_has_the_expected_tableaux():
     """The documented -ts_ark_ssp_type values must all be registered.
 
@@ -251,32 +261,49 @@ def test_esdirk_gamma5_matches_the_spec_closed_form():
         )
 
 
-def test_acceptance_report_reproduces_the_spec_table():
-    """Acceptance report reproduces published properties of esdirk_gamma5."""
-    report = acceptance_report(TABLEAUX["esdirk_gamma5"])
-    assert report["r3_explicit"] is True
-    assert report["r3_implicit"] is True
+#: Published spec-table values per tableau, as ``acceptance_report`` keys. Both
+#: tableaux were checked by a test of their own, differing only in which keys
+#: they listed; the keys are the data, so they are data here.
+#:
+#: r5 (the embedded pair) is the only property in this table that NOTHING else
+#: in the suite asserts, and it is the reason both entries must stay. The rest
+#: overlap deliberately with the direct tests above: r3 with
+#: test_stiff_accuracy_r3, r4 with test_l_stability_r4, r6 with
+#: test_kraaijevanger_radius. Those pin the tableau; this pins that the report
+#: routes each key to the right computation, which is a claim about
+#: acceptance_report rather than about the tableau, and would otherwise be
+#: made nowhere.
+_SPEC_TABLE = {
+    "esdirk_gamma5": {
+        "r3_explicit": True,
+        "r3_implicit": True,
+        "r5_bhat_dot_c": 16 / 25,
+        # Explicit first stage: At[0,0] == 0, the "circle" entry in the table.
+        "r8_min_diagonal": 0.0,
+    },
+    "ssp2_444_lsa": {
+        "r5_bhat_dot_c": 1 / 3,
+    },
+}
+
+
+@pytest.mark.parametrize("name", sorted(_SPEC_TABLE))
+def test_acceptance_report_reproduces_the_spec_table(name):
+    """acceptance_report must reproduce the published properties of each tableau.
+
+    The shared claims -- L-stability, SSP radius 2, a consistent embedded pair
+    -- are asserted for every tableau in the table; ``_SPEC_TABLE`` carries
+    only what is specific to one.
+    """
+    report = acceptance_report(TABLEAUX[name])
     assert abs(report["r4_r_infinity"]) < 1e-6
     assert report["r5_bhat_sum"] == pytest.approx(1.0, abs=1e-14)
-    assert report["r5_bhat_dot_c"] == pytest.approx(16 / 25, abs=1e-12)
     assert report["r6_radius"] == pytest.approx(2.0, abs=1e-9)
-    # Explicit first stage: At[0,0] == 0, the "circle" entry in the spec table.
-    assert report["r8_min_diagonal"] == pytest.approx(0.0, abs=1e-14)
-
-
-def test_ssp2_444_lsa_radius_and_embedding():
-    report = acceptance_report(TABLEAUX["ssp2_444_lsa"])
-    assert report["r6_radius"] == pytest.approx(2.0, abs=1e-9)
-    assert report["r5_bhat_sum"] == pytest.approx(1.0, abs=1e-14)
-    assert report["r5_bhat_dot_c"] == pytest.approx(1 / 3, abs=1e-12)
-
-
-@pytest.mark.parametrize("name", ["imex_euler"])
-def test_shakedown_tableaux_have_unit_radius(name):
-    """ssprk2 is covered by test_kraaijevanger_radius, whose local HEUN_A/HEUN_B
-    ARE this tableau's A and b, so parametrizing it here re-ran that check."""
-    tab = TABLEAUX[name]
-    assert kraaijevanger_radius(tab.A, tab.b) == pytest.approx(1.0, abs=1e-9)
+    for key, expected in _SPEC_TABLE[name].items():
+        if isinstance(expected, bool):
+            assert report[key] is expected, key
+        else:
+            assert report[key] == pytest.approx(expected, abs=1e-12), key
 
 
 # ARKTableau's eq=False is not asserted. It was justified as "essential for

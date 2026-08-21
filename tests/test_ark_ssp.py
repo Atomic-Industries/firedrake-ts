@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-from conftest import ARK_SSP, EXACT_DECAY, PYTHON_STEPPER, scalar_problem
+from conftest import ARK_SSP, ARK_SSP_G5, ARKIMEX_2C, EXACT_DECAY, scalar_problem
 from firedrake import *
 
 import firedrake_ts
@@ -15,7 +15,17 @@ _DTS = (0.1, 0.05, 0.025, 0.0125)
 
 
 def _decay(tableau, dt=1e-3, tmax=1.0, extra=None):
-    """Integrate u' = -u to tmax with -u explicit, under ARKSSP."""
+    """Integrate u' = -u to tmax with -u explicit, under ARKSSP.
+
+    ``matchstep``, not ``stepover``: with ``stepover`` every accuracy and order
+    assertion built on this helper silently depends on ``dt`` dividing ``tmax``
+    in FLOATING POINT, which dt=0.1 does not -- 10 * 0.1 is
+    0.9999999999999999, so an eleventh step runs and the reported error is the
+    overshoot to t = 1.1, not method error. Measured at dt=0.1/0.05 under
+    ``stepover``: order ratios 5.76 for imex_euler (design 1) and 215.8 for
+    ssprk2 (design 2); under ``matchstep``, 2.04 and 4.16. The old dt~1e-3
+    tunings hid this rather than avoiding it.
+    """
     u, u_t, v = scalar_problem()
     F = inner(u_t, v) * dx
     G = -inner(u, v) * dx
@@ -25,7 +35,7 @@ def _decay(tableau, dt=1e-3, tmax=1.0, extra=None):
         "ts_ark_ssp_type": tableau,
         "ts_adapt_type": "none",
         "ts_time_step": dt,
-        "ts_exact_final_time": "stepover",
+        "ts_exact_final_time": "matchstep",
     }
     parameters.update(extra or {})
     solver = firedrake_ts.DAESolver(
@@ -35,34 +45,35 @@ def _decay(tableau, dt=1e-3, tmax=1.0, extra=None):
     return solver, float(u.dat.data_ro[0])
 
 
-def test_stepper_is_selectable_and_sets_up():
-    """-ts_type python -ts_python_type must resolve and run setUp."""
-    from firedrake_ts.ark_ssp import ARKSSP
+def test_setup_resolves_the_stepper_and_rebuilds_a_stale_mass_ksp():
+    """``-ts_type python -ts_python_type`` resolves, and setUp is re-runnable.
 
-    solver, _ = _decay("imex_euler", dt=0.1)
-    ctx = solver.ts.getPythonContext()
-    assert isinstance(ctx, ARKSSP)
-    # Asserts setUp ran by an artifact only setUp produces, rather than by a
-    # call counter that existed solely to be read here.
-    assert ctx._mass_ksp is not None
-    assert ctx._P is not None and ctx._q is not None
+    setUp may run more than once against the same stepper instance (a TS may be
+    re-set-up, e.g. after an option change); the previous stage-0 mass ``KSP``
+    -- built fresh each call by _setup_stage0_mass_solve -- must be destroyed
+    rather than leaked.
 
+    A destroyed ``PETSc.KSP``'s handle reads back as 0; calling any method on it
+    beyond that would itself be unsafe (a destroyed PETSc object's methods are
+    not guaranteed to fail cleanly), so this checks the handle only, not further
+    behaviour of the stale object.
 
-def test_setup_rerun_destroys_the_stale_stage0_mass_ksp():
-    """setUp may run more than once against the same stepper instance (a TS
-    may be re-set-up, e.g. after an option change); the previous stage-0
-    mass ``KSP`` -- built fresh each call by _setup_stage0_mass_solve -- must
-    be destroyed rather than leaked.
-
-    A destroyed ``PETSc.KSP``'s handle reads back as 0; calling any method
-    on it beyond that would itself be unsafe (a destroyed PETSc object's
-    methods are not guaranteed to fail cleanly), so this checks the handle
-    only, not further behaviour of the stale object.
+    The first three assertions were a separate "the stepper is selectable and
+    sets up" test, running a second solve to reach the same point this one
+    already stands at. Selectability is in any case implied by every other test
+    in this file, all of which drive this stepper; asserting it once, here, is
+    what keeps the failure legible if -ts_python_type stops resolving.
     """
     from firedrake import dmhooks
 
+    from firedrake_ts.ark_ssp import ARKSSP
+
     solver, _ = _decay("esdirk_gamma5", dt=0.1)
     ctx = solver.ts.getPythonContext()
+    assert isinstance(ctx, ARKSSP)
+    # setUp ran, asserted by artifacts only setUp produces rather than by a call
+    # counter that existed solely to be read from a test.
+    assert ctx._P is not None and ctx._q is not None
     old_ksp = ctx._mass_ksp
     assert old_ksp is not None
     assert old_ksp.handle != 0
@@ -83,44 +94,74 @@ def test_setup_rerun_destroys_the_stale_stage0_mass_ksp():
     assert ctx._mass_ksp is not old_ksp
 
 
-def test_imex_euler_advances_and_converges():
-    """The explicit part must reach the state, and the answer must be right."""
-    _, value = _decay("imex_euler", dt=1e-3)
-    assert abs(value - 1.0) > 0.1, "solution never left its initial condition"
-    # First order: error ~ C h, so ~1e-3 at h=1e-3. Generous bound.
-    assert abs(value - EXACT) < 5e-3, f"u(1) = {value}, expected {EXACT}"
+def test_imex_euler_advances_and_is_first_order():
+    """Halving dt must halve the error, and the answer must be right.
 
+    Order plus magnitude at one dt pins the whole error curve, so the two were
+    one test's worth of claim run as two: a separate advances-and-converges
+    test made a third solve to assert exactly these two bounds on a value the
+    order test already had in hand.
 
-def test_imex_euler_is_first_order():
-    """Halving dt must halve the error."""
-    _, coarse = _decay("imex_euler", dt=2e-3)
-    _, fine = _decay("imex_euler", dt=1e-3)
+    dt=0.025/0.0125 rather than 2e-3/1e-3 -- 120 steps instead of 1500 -- with
+    every assertion below left as it was written. Measured: ratio 2.011, and
+    the fine run's error is 2.31e-3 against the abs=5e-3 this has always
+    asserted, a 2.2x margin.
+
+    That margin is why the step is not the 0.05/0.025 the ratio alone would
+    allow: the ratio there is a healthy 2.021, but first-order error is ~0.19h,
+    so the fine run lands at 4.65e-3 -- inside the 5e-3 bound by 8%, tight
+    enough that an unrelated change could trip it on accuracy while the order
+    it is really testing was never in question.
+    """
+    _, coarse = _decay("imex_euler", dt=0.025)
+    _, fine = _decay("imex_euler", dt=0.0125)
     ratio = abs(coarse - EXACT) / abs(fine - EXACT)
     assert 1.7 < ratio < 2.3, f"observed order ratio {ratio}, expected ~2"
+    assert abs(fine - 1.0) > 0.1, "solution never left its initial condition"
+    # First order: error ~ C h with C ~ 0.185 measured, so ~2.3e-3 at h=0.0125.
+    assert abs(fine - EXACT) < 5e-3, f"u(1) = {fine}, expected {EXACT}"
 
 
-def test_stage_solves_do_work():
-    """Stage solves must do real work; a null residual would converge in zero.
+@pytest.mark.parametrize(
+    "tableau,implicit",
+    [("imex_euler", True), ("ssprk2", False)],
+    ids=["implicit_part", "purely_explicit"],
+)
+def test_stage_solves_happen_only_when_the_tableau_has_an_implicit_part(
+    tableau, implicit
+):
+    """Real work in the SNES for a tableau with At != 0, none for At == 0.
 
-    Query the SNES directly rather than ts.getSNESIterations(): PETSc only
-    accumulates ts->snes_its inside its own step drivers, so a TSPYTHON type
-    that owns step() always reports zero there, and petsc4py binds no setter.
+    The positive and negative halves were two tests carrying the same
+    paragraph of rationale: query the SNES directly rather than
+    ``ts.getSNESIterations()``, because PETSc only accumulates ``ts->snes_its``
+    inside its OWN step drivers, so a TSPYTHON type that owns ``step()``
+    reports 0 there unconditionally and petsc4py binds no setter. Asserting
+    ``ts.getSNESIterations() == 0`` for ssprk2 therefore could not fail --
+    measured 0 for esdirk_gamma5 too, which solves a stage every step -- and
+    the stale query is exactly the mistake the pairing is here to prevent.
+
+    A converged-in-zero-iterations solve is what a residual that is
+    identically zero looks like, which is why the positive half checks the
+    iteration count and not merely the converged reason.
     """
-    solver, _ = _decay("imex_euler", dt=1e-2)
-    assert solver.snes.getIterationNumber() > 0
-    assert solver.snes.getConvergedReason() > 0
+    solver, _ = _decay(tableau, dt=1e-2)
+    if implicit:
+        assert solver.snes.getIterationNumber() > 0
+        assert solver.snes.getConvergedReason() > 0
+    else:
+        assert solver.snes.getIterationNumber() == 0
 
 
 # The ARKSSP-vs-PETSc cross-check lives in
 # test_shu_osher_matches_butcher_on_the_same_problem, which makes the same
 # comparison against the same arkimex-2c reference at a tighter tolerance
-# (1e-5 vs 1e-3) and a tenth of the step count. An imex_euler version of it
-# at dt=1e-4 cost 42s -- 37% of the whole suite, 20k timesteps across two
-# solves -- to assert a 1e-3 bound on a difference of ~2e-5. Its content is
-# already covered analytically against exp(-1) by
-# test_imex_euler_advances_and_converges and _is_first_order above; at
-# dt=1e-3 the imex_euler error is ~5e-4 against that 1e-3 bound, too close to
-# retune rather than drop.
+# (1e-5 vs 1e-3) and a fraction of the step count. An imex_euler version of it
+# at dt=1e-4 cost 42s -- 37% of the whole suite at the time, 20k timesteps
+# across two solves -- to assert a 1e-3 bound on a difference of ~2e-5. Its
+# content is already covered analytically against exp(-1) by
+# test_imex_euler_advances_and_is_first_order above; at dt=1e-3 the imex_euler
+# error is ~5e-4 against that 1e-3 bound, too close to retune rather than drop.
 
 
 def test_shu_osher_error_is_unwrapped_with_the_actionable_numbers():
@@ -148,25 +189,15 @@ def test_shu_osher_error_is_unwrapped_with_the_actionable_numbers():
 
 
 def test_ssprk2_is_second_order():
-    """Heun in Shu-Osher form must show design order 2."""
-    _, coarse = _decay("ssprk2", dt=4e-3)
-    _, fine = _decay("ssprk2", dt=2e-3)
+    """Heun in Shu-Osher form must show design order 2.
+
+    dt=0.05/0.025 rather than 4e-3/2e-3: 45 steps instead of 750, measured
+    ratio 4.077 against the same 3.4-4.6 band.
+    """
+    _, coarse = _decay("ssprk2", dt=0.05)
+    _, fine = _decay("ssprk2", dt=0.025)
     ratio = abs(coarse - EXACT) / abs(fine - EXACT)
     assert 3.4 < ratio < 4.6, f"observed order ratio {ratio}, expected ~4"
-
-
-def test_ssprk2_needs_no_implicit_solve():
-    """At is identically zero, so no stage may enter the SNES.
-
-    Queries the SNES directly, for the same reason
-    ``test_stage_solves_do_work`` does: ``ts.getSNESIterations()`` is
-    unconditionally 0 for a TSPYTHON type that owns ``step()`` (PETSc only
-    accumulates ``ts->snes_its`` inside its own step drivers), so asserting
-    it reads 0 here could not fail and did not test the claim -- measured 0
-    for esdirk_gamma5 too, which solves a stage at every step.
-    """
-    solver, _ = _decay("ssprk2", dt=1e-2)
-    assert solver.snes.getIterationNumber() == 0
 
 
 def _esdirk_converge(build_F, u0, dt, tmax=1.0):
@@ -190,8 +221,7 @@ def _esdirk_converge(build_F, u0, dt, tmax=1.0):
     firedrake_ts.DAESolver(
         problem,
         solver_parameters={
-            **ARK_SSP,
-            "ts_ark_ssp_type": "esdirk_gamma5",
+            **ARK_SSP_G5,
             "ts_adapt_type": "none",
             "ts_time_step": dt,
             "ts_exact_final_time": "matchstep",
@@ -279,7 +309,7 @@ _CONVERGENCE_CASES = [
 
 
 @pytest.mark.parametrize("build_F,u0,exact", _CONVERGENCE_CASES)
-def test_esdirk_gamma5_converges(build_F, u0, exact, request):
+def test_esdirk_gamma5_converges(build_F, u0, exact):
     """Design order 2 on each Ydot_0 defect case. See _CONVERGENCE_CASES above.
 
     Every one of these was flat in dt on the code that motivated it, so the
@@ -338,8 +368,7 @@ def test_esdirk_gamma5_refuses_f_nonlinear_in_udot():
     solver = firedrake_ts.DAESolver(
         problem,
         solver_parameters=dict(
-            ARK_SSP,
-            ts_ark_ssp_type="esdirk_gamma5",
+            ARK_SSP_G5,
             ts_adapt_type="none",
             ts_time_step=0.1,
             ts_exact_final_time="matchstep",
@@ -350,8 +379,17 @@ def test_esdirk_gamma5_refuses_f_nonlinear_in_udot():
         solver.solve()
 
 
+#: The message every induced divergence carries, so the tests below can assert
+#: the original cause survives into whatever error finally surfaces.
+_INDUCED = "induced stage divergence"
+
+
 def _flaky_stage_solver(ctx, n_failures):
     """Wrap ``ctx._solve_stage`` to raise on its first ``n_failures`` calls.
+
+    ``n_failures=None`` never stops failing, which is what the two
+    persistent-divergence tests need; each previously defined its own
+    identical always-raising stub inline.
 
     A reusable technique for exercising the SNES-divergence reject path
     without a pathological nonlinear problem (which tends to blow up
@@ -365,8 +403,8 @@ def _flaky_stage_solver(ctx, n_failures):
 
     def flaky(ts, tab, h, i):
         calls[0] += 1
-        if calls[0] <= n_failures:
-            raise ConvergenceError("induced stage divergence")
+        if n_failures is None or calls[0] <= n_failures:
+            raise ConvergenceError(_INDUCED)
         return original(ts, tab, h, i)
 
     return flaky, calls, original
@@ -380,8 +418,7 @@ def _diverging_problem(max_step_rejections, dt=0.5, extra=None):
     F = inner(u_t, v) * dx + inner(u, v) * dx
     problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, dt))
     parameters = dict(
-        ARK_SSP,
-        ts_ark_ssp_type="esdirk_gamma5",
+        ARK_SSP_G5,
         ts_adapt_type="none",
         ts_time_step=dt,
         ts_exact_final_time="matchstep",
@@ -418,78 +455,79 @@ def test_snes_divergence_is_retried_with_a_smaller_step():
     )
 
 
-def test_snes_divergence_exhausts_retries_and_raises_convergence_error():
-    """A persistent stage-SNES divergence must exhaust ts_max_step_rejections
-    and raise a clean ConvergenceError naming the cause -- not surface a raw
-    petsc4py.PETSc.Error, which is what PETSc's own TSStep() (ts.c) raises in
-    C, via TS_DIVERGED_STEP_REJECTED + errorifstepfailed, if step() merely
-    sets the converged reason and returns instead of raising itself.
+@pytest.mark.parametrize(
+    "max_step_rejections,extra,match",
+    [
+        pytest.param(2, {}, "rejected", id="rejections_exhausted"),
+        pytest.param(
+            -1, {"ts_adapt_dt_min": 1e-3}, "ts_adapt_dt_min", id="step_floor_reached"
+        ),
+    ],
+)
+def test_persistent_snes_divergence_raises_a_convergence_error(
+    max_step_rejections, extra, match
+):
+    """A stage that never converges must stop at one of the two limits, cleanly.
+
+    Either way it must be a ConvergenceError naming the original cause -- not a
+    raw ``petsc4py.PETSc.Error``, which is what PETSc's own ``TSStep()``
+    (``ts.c``) raises in C via TS_DIVERGED_STEP_REJECTED + errorifstepfailed if
+    ``step()`` merely sets the converged reason and returns instead of raising
+    itself. The two limits were two tests with the same body and the same pair
+    of assertions, differing only in which limit they armed:
+
+    ``rejections_exhausted`` -- ts_max_step_rejections=2 is hit first.
+
+    ``step_floor_reached`` -- with rejections unlimited (-1), h must stop at
+    ts_adapt_dt_min rather than grind all the way to 0.0, which would make
+    ``_solve_stage``'s ``self._shift = 1 / (h * tab.At[i, i])`` infinite and
+    fail in a way that has nothing to do with the original divergence.
+    ts_adapt_dt_min is set well above PETSc's own default floor (1e-20) purely
+    so the loop reaches it in a handful of *0.25 shrinks rather than ~60; the
+    mechanism does not depend on which floor.
     """
-    solver = _diverging_problem(max_step_rejections=2)
+    solver = _diverging_problem(max_step_rejections=max_step_rejections, extra=extra)
     ctx = solver.ts.getPythonContext()
-
-    def always_diverges(ts, tab, h, i):
-        raise ConvergenceError("induced persistent stage divergence")
-
-    original = ctx._solve_stage
-    ctx._solve_stage = always_diverges
+    always, _calls, original = _flaky_stage_solver(ctx, n_failures=None)
+    ctx._solve_stage = always
     try:
-        with pytest.raises(ConvergenceError, match="rejected") as excinfo:
+        with pytest.raises(ConvergenceError, match=match) as excinfo:
             solver.solve()
     finally:
         ctx._solve_stage = original
-    assert "induced persistent stage divergence" in str(excinfo.value), (
-        "the exhaustion error must name the cause of the last rejection"
-    )
-
-
-def test_snes_divergence_with_unlimited_rejections_stops_at_a_step_floor():
-    """A persistently diverging stage, with ts_max_step_rejections unlimited
-    (-1), must raise a clean ConvergenceError once h shrinks below
-    ts_adapt_dt_min -- not grind h all the way to 0.0, which would make
-    _solve_stage's self._shift = 1 / (h * tab.At[i, i]) infinite and fail in
-    a way that has nothing to do with the original divergence.
-
-    ts_adapt_dt_min is set well above PETSc's own default floor (1e-20)
-    purely so the loop hits it in a handful of *0.25 shrinks rather than
-    ~60, keeping the test fast; the mechanism being tested -- stop at the
-    floor rather than underflow to zero -- does not depend on which floor.
-    """
-    solver = _diverging_problem(max_step_rejections=-1, extra={"ts_adapt_dt_min": 1e-3})
-    ctx = solver.ts.getPythonContext()
-
-    def always_diverges(ts, tab, h, i):
-        raise ConvergenceError("induced persistent stage divergence")
-
-    original = ctx._solve_stage
-    ctx._solve_stage = always_diverges
-    try:
-        with pytest.raises(ConvergenceError, match="ts_adapt_dt_min") as excinfo:
-            solver.solve()
-    finally:
-        ctx._solve_stage = original
-    assert "induced persistent stage divergence" in str(excinfo.value), (
-        "the floor error must still name the original cause"
+    assert _INDUCED in str(excinfo.value), (
+        "the error that surfaces must name the cause of the last rejection"
     )
     assert solver.ts.getTimeStep() > 0.0, "h must not have underflowed to 0.0"
 
 
 def test_shu_osher_matches_butcher_on_the_same_problem():
-    """The Shu-Osher path and PETSc's Butcher-form TSRK must agree."""
-    _, ours = _decay("ssprk2", dt=1e-3)
+    """The Shu-Osher path and PETSc's Butcher-form TSRK must agree.
+
+    test_tableaux.py establishes algebraically, at machine precision, that P
+    and q reproduce the Butcher stage map. What is left for an end-to-end run
+    is that this STEPPER implements the recursion those coefficients describe,
+    against an independent implementation of an independent order-2 tableau.
+
+    dt=4e-3, not 1e-3: the difference scales like h^2, so cutting the step
+    count 4x raises it from 3.16e-8 to 5.07e-7 against the same 1e-5 bound --
+    16x tighter relative to the signal it is bounding, for a quarter of the
+    work. This was the most expensive test in the suite at 1.86s.
+    """
+    dt = 4e-3
+    _, ours = _decay("ssprk2", dt=dt)
     u, u_t, v = scalar_problem()
     problem = firedrake_ts.DAEProblem(
         inner(u_t, v) * dx, u, u_t, (0.0, 1.0), G=-inner(u, v) * dx
     )
     firedrake_ts.DAESolver(
         problem,
-        solver_parameters={
-            "ts_type": "arkimex",
-            "ts_arkimex_type": "2c",
-            "ts_adapt_type": "none",
-            "ts_time_step": 1e-3,
-            "ts_exact_final_time": "stepover",
-        },
+        solver_parameters=dict(
+            ARKIMEX_2C,
+            ts_adapt_type="none",
+            ts_time_step=dt,
+            ts_exact_final_time="matchstep",
+        ),
         options_prefix="",
     ).solve()
     assert abs(ours - float(u.dat.data_ro[0])) < 1e-5
@@ -509,8 +547,7 @@ def test_limiter_fires_once_per_stage():
     solver = firedrake_ts.DAESolver(
         problem,
         solver_parameters={
-            "ts_type": "python",
-            "ts_python_type": PYTHON_STEPPER,
+            **ARK_SSP,
             "ts_ark_ssp_type": "ssprk2",
             "ts_adapt_type": "none",
             "ts_time_step": 0.01,
@@ -600,8 +637,7 @@ def test_frozen_component_survives_the_implicit_solve():
     solver = firedrake_ts.DAESolver(
         problem,
         solver_parameters=dict(
-            ARK_SSP,
-            ts_ark_ssp_type="esdirk_gamma5",
+            ARK_SSP_G5,
             ts_adapt_type="none",
             ts_time_step=0.01,
             ts_exact_final_time="stepover",
@@ -638,78 +674,32 @@ def test_frozen_component_survives_the_implicit_solve():
     )
 
 
-def test_nothing_is_frozen_when_every_row_has_an_implicit_operator():
-    """A genuinely mixed space where every row has diffusion: the branch
-    the name describes. len(V) > 1 so _find_frozen_rows actually calls
-    explicitly_governed_fields, rather than returning early on a
-    single-field space where that call is never reached.
-    """
-    mesh = UnitIntervalMesh(4)
-    V = FunctionSpace(mesh, "P", 1)
-    W = V * V
-    w = Function(W)
-    wdot = Function(W)
-    a, b = split(w)
-    adot, bdot = split(wdot)
-    va, vb = TestFunctions(W)
-    w.sub(0).assign(1.0)
-    w.sub(1).assign(1.0)
-
-    F = (
-        inner(adot, va) * dx
-        + inner(grad(a), grad(va)) * dx
-        + inner(bdot, vb) * dx
-        + inner(grad(b), grad(vb)) * dx
-    )
-    G = -inner(a, va) * dx - inner(b, vb) * dx
-    problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, 0.02), G=G)
-    solver = firedrake_ts.DAESolver(
-        problem,
-        solver_parameters=dict(
-            ARK_SSP,
-            ts_ark_ssp_type="esdirk_gamma5",
-            ts_adapt_type="none",
-            ts_time_step=0.01,
-            ts_exact_final_time="stepover",
-        ),
-        options_prefix="",
-    )
-    solver.solve()
-    assert not solver.ts.getPythonContext()._frozen_rows
+# "Nothing is frozen when every row has an implicit operator" had its own
+# 35-line test, running a solve on a two-field all-diffusive problem to assert
+# `not ctx._frozen_rows`. Both halves of that are asserted elsewhere on the
+# same form: test_singular_mass.py's test_field_partitions[both_differential]
+# pins explicitly_governed_fields() == () on exactly this F, and
+# test_rung3_pde_with_multiplier_runs[arkssp] drives a two-field space with no
+# freezable row through a full ARKSSP solve -- so field_rows()'s empty-tuple
+# path is exercised end to end there, on a mixed space, which is the condition
+# the deleted test's docstring identified as its reason to exist.
 
 
-def test_limiter_on_an_implicit_component_is_rejected():
-    """Limiting a component with an implicit operator is unsound; say so."""
-    u, u_t, v = scalar_problem()
-    F = inner(u_t, v) * dx + inner(grad(u), grad(v)) * dx
-    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 0.02), G=-inner(u, v) * dx)
-    solver = firedrake_ts.DAESolver(
-        problem,
-        solver_parameters=dict(
-            ARK_SSP,
-            ts_ark_ssp_type="esdirk_gamma5",
-            ts_adapt_type="none",
-            ts_time_step=0.01,
-            ts_exact_final_time="stepover",
-        ),
-        options_prefix="",
-    )
-    solver.ts.getPythonContext().set_stage_limiter(lambda vec: None)
-    with pytest.raises(ValueError, match="implicit operator"):
-        solver.solve()
+@pytest.mark.parametrize("registered", ["before_setup", "after_setup"])
+def test_limiter_on_an_implicit_component_is_rejected(registered):
+    """Limiting a component with an implicit operator is unsound; say so.
 
+    Both registration orders, because they are two different call sites of
+    ``_check_limiter_soundness`` and only one of them fires from setUp:
 
-def test_limiter_registered_after_setup_is_still_rejected():
-    """The soundness guard must re-fire for a limiter registered late.
+    ``before_setup`` -- the limiter is registered on a stepper that has never
+    been set up, so the check runs from setUp's own call during solve().
 
-    set_stage_limiter re-runs _check_limiter_soundness itself (guarded on
-    self._tab already being set) specifically so a limiter registered
-    AFTER setUp has already run cannot silently bypass the check that
-    fires from setUp's own call to it. Every other limiter-rejection test
-    registers the limiter BEFORE the first solve() -- i.e. before setUp
-    has run at all -- so none of them exercises this second call site;
-    without a dedicated test, that guard could be deleted with nothing
-    failing.
+    ``after_setup`` -- ``set_stage_limiter`` re-runs the check itself (guarded
+    on ``self._tab`` already being set) specifically so a limiter registered
+    after setUp cannot bypass it. Nothing else in the suite registers a limiter
+    late, so without this case that guard could be deleted with the whole suite
+    still green.
     """
     u, u_t, v = scalar_problem()
     F = inner(u_t, v) * dx + inner(grad(u), grad(v)) * dx
@@ -717,17 +707,22 @@ def test_limiter_registered_after_setup_is_still_rejected():
     solver = firedrake_ts.DAESolver(
         problem,
         solver_parameters=dict(
-            ARK_SSP,
-            ts_ark_ssp_type="esdirk_gamma5",
+            ARK_SSP_G5,
             ts_adapt_type="none",
             ts_time_step=0.01,
             ts_exact_final_time="stepover",
         ),
         options_prefix="",
     )
+    ctx = solver.ts.getPythonContext()
+    if registered == "before_setup":
+        ctx.set_stage_limiter(lambda vec: None)
+        with pytest.raises(ValueError, match="implicit operator"):
+            solver.solve()
+        return
+
     # No limiter yet: setUp must complete cleanly.
     solver.solve()
-    ctx = solver.ts.getPythonContext()
     assert ctx._tab is not None, "setUp never ran; the post-setUp guard never fires"
     assert ctx._frozen_rows is None, "a freezable row was found; expected none here"
     with pytest.raises(ValueError, match="implicit operator"):
@@ -768,8 +763,7 @@ def _fsal_decay(fsal, mutate=False, tableau="esdirk_gamma5", dt=0.01, stiff=True
     solver = firedrake_ts.DAESolver(
         problem,
         solver_parameters={
-            "ts_type": "python",
-            "ts_python_type": PYTHON_STEPPER,
+            **ARK_SSP,
             "ts_ark_ssp_type": tableau,
             "ts_adapt_type": "none",
             "ts_time_step": dt,
