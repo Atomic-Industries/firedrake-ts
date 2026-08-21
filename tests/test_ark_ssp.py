@@ -586,13 +586,17 @@ def test_complete_refuses_when_neither_stiffly_accurate_nor_explicit():
         stepper._complete(bogus, None, None)
 
 
-def test_frozen_component_survives_the_implicit_solve():
-    """A limiter's change to an explicitly-governed row must not be undone.
+def _freezable_problem(make_limiter, extra=None):
+    """Two fields, one freezable, with a limiter registered on the stepper.
 
-    This is the defect COOL-193 measured: the implicit stage equation
-    Ydot_i = (Y_i - Z_i)/(h At_ii) has no slot for a modified value, so the
-    solve pulls Y_i back to Z_i and the correction re-enters later stages
-    scaled by At_ji/At_ii.
+    Row 0 is mass only, so ``explicitly_governed_fields`` certifies it and it
+    is freezable. Row 1 has mass plus diffusion, so the implicit operator acts
+    there and it is not.
+
+    ``make_limiter`` is called as ``make_limiter(W)`` with the mixed space, so
+    a limiter needing scratch storage on it can be built here rather than
+    having to reach back for a space this helper owns. Returns
+    ``(solver, ctx, w)`` with the limiter registered and nothing solved yet.
     """
     mesh = UnitIntervalMesh(4)
     V = FunctionSpace(mesh, "P", 1)
@@ -605,33 +609,8 @@ def test_frozen_component_survives_the_implicit_solve():
     w.sub(0).assign(1.0)
     w.sub(1).assign(1.0)
 
-    # Row 0: mass only -> explicitly governed, freezable.
-    # Row 1: mass + diffusion -> implicit acts, not freezable.
     F = inner(adot, va) * dx + inner(bdot, vb) * dx + inner(grad(b), grad(vb)) * dx
     G = -inner(a, va) * dx - inner(b, vb) * dx
-
-    # Dedicated scratch: w is also ctx._x, which the TS callbacks write into.
-    scratch = Function(W)
-    CLAMP = 0.5
-    drift = []
-    calls = [0]
-
-    def clamping_limiter(vec):
-        """Force the explicitly-governed row to a value that is different
-        on every call (CLAMP + 0.1 * call count), not the same constant
-        every stage. A stale pin left over from the wrong stage is
-        otherwise numerically indistinguishable from a correct one: this
-        is the exact blind spot that hid the aliasing bug this test was
-        originally written to catch (a corrupted warm-start guess that
-        reverted a frozen row to the *previous* stage's value survived
-        undetected as long as every stage clamped to the same number).
-        """
-        with scratch.dat.vec_wo as target:
-            vec.copy(target)
-        scratch.sub(0).assign(CLAMP + 0.1 * calls[0])
-        calls[0] += 1
-        with scratch.dat.vec_ro as source:
-            source.copy(vec)
 
     problem = firedrake_ts.DAEProblem(F, w, wdot, (0.0, 0.02), G=G)
     solver = firedrake_ts.DAESolver(
@@ -641,11 +620,229 @@ def test_frozen_component_survives_the_implicit_solve():
             ts_adapt_type="none",
             ts_time_step=0.01,
             ts_exact_final_time="stepover",
+            **(extra or {}),
         ),
         options_prefix="",
     )
     ctx = solver.ts.getPythonContext()
-    ctx.set_stage_limiter(clamping_limiter)
+    ctx.set_stage_limiter(make_limiter(W))
+    return solver, ctx, w
+
+
+def _frozen_local(ctx, vec):
+    """Ownership-relative indices of the frozen rows, as the stepper sees them."""
+    return ctx._frozen_rows - vec.getOwnershipRange()[0]
+
+
+def _row0_clamping_limiter(W, value_of_call):
+    """Force the freezable row to ``value_of_call(n)`` on substage ``n``.
+
+    A dedicated scratch Function, not the solution: ``w`` is also ``ctx._x``,
+    which the TS callbacks write into, so borrowing it would work only by
+    accident of ordering.
+    """
+    scratch = Function(W)
+    calls = [0]
+
+    def limiter(vec):
+        with scratch.dat.vec_wo as target:
+            vec.copy(target)
+        scratch.sub(0).assign(value_of_call(calls[0]))
+        calls[0] += 1
+        with scratch.dat.vec_ro as source:
+            source.copy(vec)
+
+    return limiter
+
+
+def test_frozen_rows_residual_constrains_the_stage_solve():
+    """The frozen rows' residual must be ``x - target``, with a REAL target.
+
+    ``_apply_freeze_residual`` used to read the target out of
+    ``self._Y[self._stage]`` -- the very vector SNES iterates on, and the same
+    vector handed to the callback as ``x``. So the residual it wrote was
+    ``x - x``: identically zero whatever the row held, carrying no information
+    and constraining nothing. The pin rested entirely on Newton's step also
+    being zero there (zero residual, identity Jacobian row) plus
+    ``_solve_stage``'s restore. That holds for plain Newton under an
+    identity-preserving preconditioner and silently does not for ``pc_type
+    fieldsplit`` solving the non-frozen block approximately, nor for
+    ``snes_type ngmres``, whose accepted iterate mixes past iterates -- and
+    SNES could not notice, because its own convergence test was reading a
+    residual that was zero there by construction.
+
+    This drives the callback the way SNES does, with ``x`` BEING
+    ``ctx._Y[ctx._stage]``, which is what makes the difference observable at
+    all: passing any other vector would show the perturbation even on the
+    broken code. Perturbing in place and reading the residual back is
+    therefore the whole test. On the unfixed code the second assertion reads
+    0.0 rather than DELTA.
+
+    Run after solve() rather than inside a wrapped ``_solve_stage``, so it
+    reads the state the last stage left instead of interfering with a live
+    solve: ``_stage``, ``_Z``, ``_shift``, ``_stage_time`` and
+    ``_frozen_target`` all still describe that stage.
+    """
+    from firedrake import dmhooks
+
+    solver, ctx, _w = _freezable_problem(lambda W: lambda vec: None)
+    solver.solve()
+
+    x = ctx._Y[ctx._stage]
+    f = x.duplicate()
+    local = _frozen_local(ctx, x)
+    assert len(local) > 0, "no row was frozen, so there is nothing to constrain"
+
+    def residual_at(vec):
+        # computeIFunction resolves the problem through
+        # dmhooks.get_appctx(dm), which is only populated inside the same
+        # add_hooks context DAESolver opens around its own solve(). Outside it
+        # the callback raises PETSc.Error 101 from TSComputeIFunction rather
+        # than evaluating anything -- see the note in
+        # test_setup_resolves_the_stepper_and_rebuilds_a_stale_mass_ksp.
+        with dmhooks.add_hooks(solver.ts.getDM(), solver, appctx=solver._ctx):
+            ctx.formSNESFunction((solver.snes, vec, f, solver.ts))
+        return f.getArray(readonly=True)[local].copy()
+
+    # At the pinned value the constraint is satisfied, so its residual is zero.
+    # Without this the assertion below could be met by a residual that is
+    # simply wrong everywhere rather than by one that measures the offset.
+    at_target = residual_at(x)
+    assert abs(at_target).max() < 1e-12, (
+        f"frozen residual is {at_target} at the pinned value itself, expected 0"
+    )
+
+    # Move the frozen rows off the target: the residual must report exactly
+    # how far, which is what makes Newton correct them and what lets SNES's
+    # convergence test see a broken pin.
+    DELTA = 0.25
+    x.getArray()[local] += DELTA
+    perturbed = residual_at(x)
+    assert np.allclose(perturbed, DELTA, atol=1e-12), (
+        f"frozen residual is {perturbed} for an iterate {DELTA} off the "
+        "pinned value, expected exactly that offset -- a residual of 0 means "
+        "the target is being read out of the vector SNES iterates on, so the "
+        "rows are unconstrained and the pin rests on the restore alone"
+    )
+
+
+def test_frozen_rows_are_pulled_back_by_a_solver_that_moves_them():
+    """The constraint must actually shrink the drift when a solver moves the row.
+
+    ``test_frozen_rows_residual_constrains_the_stage_solve`` establishes the
+    residual is a real constraint; this establishes it CHANGES THE SOLVE. The
+    two are not the same claim, and neither the default solver nor the final
+    answer can show the second: with ``newtonls`` the initial guess already
+    sits at the pinned value, so the row's residual starts at zero, Newton's
+    step there is zero, and the row never moves under either the fixed or the
+    broken residual. ``_solve_stage``'s restore then makes the final answer
+    bit-identical either way -- measured, row 0 is 1.200000 in all cases. That
+    is exactly why the defect survived a green suite.
+
+    ``snes_type qn`` is a solver that does move it: a quasi-Newton update is
+    not the exact identity-row step, so the pinned row drifts during the
+    iteration. Measured drift on the last stage, PETSc 3.25: 1.87e-06 with the
+    self-referential residual, 2.48e-08 with the real one -- a factor of 76.
+
+    The comparison is made in-test against a reimplementation of the old
+    residual rather than against an absolute threshold, deliberately. An
+    absolute bound would have to sit between those two numbers and would be
+    hostage to ``qn``'s internal tolerances in a future PETSc; measuring both
+    arms here calibrates against whatever this PETSc actually does.
+
+    The derived bound ``drift <= ||f||`` at the accepted iterate is NOT usable
+    as the test: it holds for the fixed code (0.446 of the norm) but is
+    satisfied vacuously by the broken one, whose reported ``||f||`` at
+    convergence is 16.96 -- ``qn`` converged on a relative criterion, and the
+    frozen rows contributed nothing to the norm it measured.
+
+    The clamp must VARY per substage, as it does below. With a constant clamp
+    ``qn`` leaves the pinned row alone and both arms measure zero drift: the
+    non-vacuity assertion at the bottom caught exactly that while this test was
+    being written, which is why it is there.
+    """
+
+    def drift_with(self_referential):
+        solver, ctx, _w = _freezable_problem(
+            lambda W: _row0_clamping_limiter(W, lambda n: 0.5 + 0.1 * n),
+            extra={"snes_type": "qn"},
+        )
+        if self_referential:
+            # The pre-fix residual, verbatim: target read out of the very
+            # vector SNES iterates on, making this x - x.
+            def old_residual(x, f):
+                if not ctx._freeze_active():
+                    return
+                local = ctx._frozen_local
+                ya = ctx._Y[ctx._stage].getArray(readonly=True)
+                f.getArray()[local] = x.getArray(readonly=True)[local] - ya[local]
+
+            ctx._apply_freeze_residual = old_residual
+        solver.solve()
+        # Residual gap left AFTER _solve_stage's restore, which must be zero
+        # bit-for-bit: that restore is what converts "pinned to the solver's
+        # tolerance" into "pinned exactly", and the boundedness result this
+        # freeze serves is a claim about the limited value surviving exactly.
+        # Non-vacuous only because qn moves the row at all -- with newtonls
+        # the drift is already 0 and the restore has nothing to close.
+        x = ctx._Y[ctx._stage]
+        residue = abs(
+            x.getArray(readonly=True)[_frozen_local(ctx, x)] - ctx._frozen_target
+        ).max()
+        return ctx._frozen_drift, float(residue)
+
+    constrained, residue = drift_with(False)
+    unconstrained, _ = drift_with(True)
+
+    assert residue == 0.0, (
+        f"the frozen rows ended {residue:.3e} off their pinned value; "
+        "_solve_stage's restore is what makes the pin exact rather than "
+        "merely converged, and this solver moved the rows far enough that "
+        "the difference is observable"
+    )
+
+    # Non-vacuity: if qn does not move the pinned row at all, there is nothing
+    # for the constraint to pull back and this test proves nothing.
+    assert unconstrained > 0.0, (
+        "snes_type qn left the pinned rows untouched even with an "
+        "unconstrained residual, so this test is not exercising the mechanism "
+        "-- pick a solver whose iterate does not respect the identity row"
+    )
+    assert constrained < 0.1 * unconstrained, (
+        f"the frozen-row constraint reduced the drift only from "
+        f"{unconstrained:.3e} to {constrained:.3e}; expected at least an order "
+        "of magnitude, so the residual is not pulling the pinned rows back"
+    )
+
+
+def test_frozen_component_survives_the_implicit_solve():
+    """A limiter's change to an explicitly-governed row must not be undone.
+
+    This is the defect COOL-193 measured: the implicit stage equation
+    Ydot_i = (Y_i - Z_i)/(h At_ii) has no slot for a modified value, so the
+    solve pulls Y_i back to Z_i and the correction re-enters later stages
+    scaled by At_ji/At_ii.
+
+    Also asserts ctx._frozen_drift, which is how far the SOLVE moved the
+    pinned rows before _solve_stage restored them exactly. The bit-for-bit
+    assertion below is satisfied by the restore alone and so says nothing
+    about whether the constraint was honoured; the drift is what distinguishes
+    "the solve held the pin" from "the solve broke it and the restore hid
+    that". Measured 0.0 here -- plain Newton against an identity Jacobian row
+    and a zero initial residual on those rows moves them not at all.
+    """
+    drift = []
+
+    # A value that DIFFERS on every call (0.5 + 0.1n), not the same constant
+    # every stage. A stale pin left over from the wrong stage is otherwise
+    # numerically indistinguishable from a correct one: that is the exact
+    # blind spot which hid the aliasing bug this test was written to catch (a
+    # corrupted warm-start guess reverting a frozen row to the PREVIOUS
+    # stage's value survived undetected as long as every stage clamped to the
+    # same number).
+    solver, ctx, _w = _freezable_problem(
+        lambda W: _row0_clamping_limiter(W, lambda n: 0.5 + 0.1 * n)
+    )
 
     # Wrap _solve_stage so we can compare Y_i across the implicit solve. This
     # is diagnostic item 3 of the M4 gate, made into a test.
@@ -671,6 +868,15 @@ def test_frozen_component_survives_the_implicit_solve():
         f"frozen rows moved by up to {max(drift):.3e} during the implicit "
         "solve -- the solve is dragging the limited value back toward the "
         "unlimited Z_i, which is the defect COOL-193 describes"
+    )
+    # And the SOLVE held the pin, not just the restore afterwards. The
+    # assertion above is measured across the whole of _solve_stage, so the
+    # restore alone satisfies it and it says nothing about whether the
+    # constraint was honoured. _frozen_drift is measured before that restore.
+    assert ctx._frozen_drift == 0.0, (
+        f"the stage solve moved the pinned rows by {ctx._frozen_drift:.3e} "
+        "before _solve_stage restored them; the residual constraint is not "
+        "holding and the restore is hiding it"
     )
 
 

@@ -81,6 +81,20 @@ class ARKSSP:
         self._error = None
         self._limiter = None
         self._frozen_rows = None
+        # Ownership-relative form of _frozen_rows, derived once in setUp.
+        self._frozen_local = None
+        # The values the frozen rows must hold through the stage currently
+        # being solved, captured by _solve_stage before its warm start
+        # overwrites them. This is the freeze's actual mechanism: it is what
+        # makes the residual on those rows a constraint rather than the
+        # identically-zero x - x it was when the target was read back out of
+        # the very vector SNES iterates on. See _apply_freeze_residual.
+        self._frozen_target = None
+        # max |Y_i[frozen] - target| observed across the last stage solve,
+        # BEFORE _solve_stage restores exactness. Nonzero means the solver
+        # moved a pinned row and the residual constraint had to pull it back;
+        # large means it did not manage to. Read by the freeze tests.
+        self._frozen_drift = 0.0
         self._tab = None
         self._P = None
         self._q = None
@@ -201,6 +215,22 @@ class ARKSSP:
 
             self._check_stage_pattern_is_supported(tab)
             self._frozen_rows = self._find_frozen_rows(ts)
+            # Ownership-relative indices, derived once here rather than per
+            # residual evaluation. Safe to precompute -- unlike the operator
+            # values this stepper has repeatedly been burned by caching --
+            # because both inputs are fixed for the life of this setUp: the
+            # row set is what was just detected, and the ownership range
+            # belongs to the layout every work vector was duplicated from.
+            self._frozen_local = (
+                None
+                if self._frozen_rows is None
+                else self._frozen_rows - sol.getOwnershipRange()[0]
+            )
+            # No stage is in flight, so there is no pinned value yet. Left
+            # None rather than stale: _apply_freeze_residual refuses to run
+            # without one instead of silently pinning to a previous solve's.
+            self._frozen_target = None
+            self._frozen_drift = 0.0
             # Read by _reassemble_stage0_mass, so computed before it runs.
             self._algebraic_rows = self._find_algebraic_rows(ts)
             self._check_limiter_soundness()
@@ -392,16 +422,54 @@ class ARKSSP:
         return self._frozen_rows is not None and self._limiter is not None
 
     def _apply_freeze_residual(self, x, f):
-        """Replace frozen rows of the residual with ``x - Y_i``."""
+        """Replace frozen rows of the residual with ``x - target``.
+
+        ``target`` is ``self._frozen_target``, the snapshot ``_solve_stage``
+        took before its warm start, NOT ``self._Y[self._stage]``. That
+        distinction is the whole content of this method.
+
+        ``self._Y[self._stage]`` is the very vector SNES iterates on -- it is
+        the ``x`` handed to this callback -- so reading the target out of it
+        made this ``x - x``: identically zero for whatever value the row
+        happened to hold, carrying no information and constraining nothing.
+        The pin then rested entirely on Newton's step being zero there too
+        (zero residual, identity Jacobian row) plus ``_solve_stage``'s
+        restore, which holds for plain Newton with an identity-preserving
+        preconditioner and quietly does not for ``pc_type fieldsplit``
+        solving the non-frozen block approximately, or for ``snes_type
+        ngmres``/``anderson``, whose accepted iterate mixes past iterates.
+        In those cases the row could drift by roughly the inner-solve
+        tolerance with nothing raising, because SNES's own convergence test
+        was looking at a residual that was zero there BY CONSTRUCTION.
+
+        Against a real target the row's residual entry IS its drift, and two
+        things follow with no new tolerance to pick. Newton's step on that row
+        becomes ``delta = target - x``, so the solve actively corrects the row
+        instead of passively leaving it alone -- measured under ``snes_type
+        qn``, which does move it, the drift falls from 1.87e-06 to 2.48e-08.
+        And the drift stops being invisible: the frozen entries are part of
+        the residual vector SNES measures, so ``|drift| <= ||f||`` at the
+        accepted iterate.
+
+        That bound is worth stating carefully rather than overstating. It
+        constrains the drift directly under an absolute tolerance, but only
+        relative to the initial residual under a relative one -- the same
+        ``qn`` run reports ``||f|| = 16.96`` at convergence with the OLD
+        residual, so "SNES converged" was never on its own a bound on
+        anything. What changed is that the frozen rows now contribute to the
+        norm SNES tests at all, where before they contributed zero by
+        construction.
+        """
         if not self._freeze_active():
             return
-        target = self._Y[self._stage]
-        xa = x.getArray(readonly=True)
-        ya = target.getArray(readonly=True)
-        fa = f.getArray()
-        lo, _ = x.getOwnershipRange()
-        local = self._frozen_rows - lo
-        fa[local] = xa[local] - ya[local]
+        if self._frozen_target is None:
+            raise ValueError(
+                "the stage residual was evaluated with a live freeze but no "
+                "pinned value; _apply_freeze_residual must only run inside "
+                "_solve_stage, which captures self._frozen_target"
+            )
+        local = self._frozen_local
+        f.getArray()[local] = x.getArray(readonly=True)[local] - self._frozen_target
 
     def _setup_stage0_mass_solve(self, ts):
         """Set up whatever an explicit first stage needs for ``Ẏ_0``.
@@ -1111,24 +1179,21 @@ class ARKSSP:
         self._shift = 1.0 / (h * tab.At[i, i])
         self._stage_time = ts.getTime() + tab.ct[i] * h
         snes = ts.getSNES()
-        # _apply_freeze_residual reads self._Y[self._stage] itself as the
-        # frozen target -- it is the same vector SNES iterates on, so the
-        # residual it builds is self-referentially zero on those rows.
-        # That only pins the *right* value if the vector already holds it
-        # before the solve starts: with a zero residual and an identity
-        # Jacobian row, Newton's own step contributes exactly zero there
-        # every iteration, so whatever the frozen rows hold going in is
-        # what comes out. Snapshot them before the warm-start overwrite
-        # below replaces the whole vector with the previous stage's value
-        # (or x^n), which would otherwise silently discard the predictor's
-        # -- and any limiter's -- value on exactly the rows the freeze
-        # exists to protect.
+        # Capture the value the frozen rows must keep, BEFORE the warm start
+        # below replaces the whole vector with the previous stage's value (or
+        # x^n) and discards the predictor's -- and any limiter's -- value on
+        # exactly the rows the freeze exists to protect.
+        #
+        # This snapshot is the freeze's mechanism, not merely its bookkeeping:
+        # _apply_freeze_residual builds the frozen rows' residual against it,
+        # which is what makes those rows a real constraint on the solve. See
+        # that method for why reading the target back out of self._Y[i]
+        # instead made the residual identically zero.
         freeze = self._freeze_active()
         if freeze:
-            lo, _ = self._Y[i].getOwnershipRange()
-            local = self._frozen_rows - lo
+            local = self._frozen_local
             # No .copy(): numpy advanced indexing already returns a new array.
-            frozen_values = self._Y[i].getArray(readonly=True)[local]
+            self._frozen_target = self._Y[i].getArray(readonly=True)[local]
         # Initial guess: the previous stage value, or x^n for the first
         # implicit stage -- matching PETSc's own ARKIMEX. Guessing Z_i itself
         # would make Ydot_i identically zero already for any tableau whose
@@ -1148,22 +1213,44 @@ class ARKSSP:
         else:
             ts.getSolution().copy(self._Y[i])
         if freeze:
-            self._Y[i].getArray()[local] = frozen_values
+            # Start the frozen rows AT the target, so their residual is zero
+            # to begin with and the solve has nothing to correct there unless
+            # it moves them itself. Without this the warm start would hand
+            # SNES an initial residual equal to the whole limiter correction,
+            # which is a real constraint now but a needless one to impose.
+            self._Y[i].getArray()[local] = self._frozen_target
         snes.solve(None, self._Y[i])
-        # The residual on frozen rows is self-referential (x - Y_i, the same
-        # vector SNES is iterating on) so it cannot itself enforce the pin --
-        # it is identically zero regardless of what value the row holds.
-        # That only *looks* like a pin because Newton's own step happens to
-        # contribute zero there too, for a plain Newton/KSP iteration with a
-        # preconditioner that preserves the identity row. It does not hold
-        # for a fieldsplit that solves the non-frozen block approximately,
-        # nor for ngmres/anderson, whose iterate mixes past iterates -- there
-        # the row can drift by roughly the inner-solve tolerance with
-        # nothing raising, since SNES's own convergence test also sees a
-        # zero residual there by construction. Restoring the snapshot here,
-        # unconditionally, is what actually holds the pin.
+        # Record how far the solve moved the pinned rows, then restore them
+        # exactly.
+        #
+        # The residual built in _apply_freeze_residual is what enforces the
+        # pin; this restore is no longer that mechanism. What it still buys is
+        # EXACTNESS: a converged solve holds the pin only to whatever residual
+        # norm SNES accepted, and the boundedness result this freeze serves is
+        # a claim about the limited value surviving bit-for-bit, not to
+        # 1e-8. So the row is written back rather than left at "close".
+        #
+        # What the drift actually threatens is worth being precise about, and
+        # it is NOT the pinned rows: those are restored, so the boundedness
+        # claim holds whatever the solver did to them. It is the OTHER rows.
+        # If the solve moved a frozen row and the non-frozen rows equilibrated
+        # against the moved value, writing the row back leaves those rows
+        # inconsistent by the drift -- so _frozen_drift is the size of the
+        # inconsistency this restore introduces, bounded by the residual norm
+        # SNES accepted. Benign at solver tolerance, which is why this records
+        # the number rather than raising on it: any threshold to raise at would
+        # be invented, and the answer is correct either way. It is exposed so a
+        # solver that fights the pin can be diagnosed instead of hidden, which
+        # is what the old self-referential residual made impossible.
         if freeze:
-            self._Y[i].getArray()[local] = frozen_values
+            ya = self._Y[i].getArray()
+            # abs() rather than numpy.abs: the builtin dispatches elementwise
+            # on the array, so this needs no import. len(local) can be 0 on a
+            # rank owning none of the field's dofs, where .max() would raise.
+            self._frozen_drift = (
+                float(abs(ya[local] - self._frozen_target).max()) if len(local) else 0.0
+            )
+            ya[local] = self._frozen_target
         reason = snes.getConvergedReason()
         if reason < 0:
             # petsc4py exposes no PETSc.ERR_* constants, so signal with
