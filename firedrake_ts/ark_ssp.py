@@ -378,7 +378,7 @@ class ARKSSP:
 
         Built unconditionally whenever the first stage is explicit --
         NOT gated on whether ``dF/du`` is structurally zero, and NOT gated
-        on whether ``M`` itself depends on the state. 
+        on whether ``M`` itself depends on the state.
 
         Builds a bare ``PETSc.KSP`` on the assembled mass matrix, following
         ``_TSContext._rhs_projection_solver``'s idiom in

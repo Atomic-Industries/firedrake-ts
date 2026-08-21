@@ -229,6 +229,7 @@ def test_G_vanishes_on_algebraic_rows(which_row, extra):
     with pytest.raises(ValueError, match="G is nonzero on algebraic"):
         solver.solve()
 
+
 def test_project_rhs_false_is_rejected_when_G_is_supplied():
     """An unprojected G is a raw dual vector, wrong by a factor of the mass
     matrix once a TS treats it as a state-space derivative .

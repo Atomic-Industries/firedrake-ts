@@ -164,9 +164,7 @@ def test_shu_osher_form_holds_bounds_with_no_post_step_clamp():
         conditional(And(x > 0.45, x < 0.95), 1.0, 0.0)
     )
     l1_error = assemble(abs(f - exact) * dx)
-    assert l1_error < 0.06, (
-        f"L1 error against the exact translate = {l1_error}."
-    )
+    assert l1_error < 0.06, f"L1 error against the exact translate = {l1_error}."
     assert clipped[0] > 0, (
         "the limiter never actually scaled a cell (theta < 1 never "
         "occurred) -- consistent with a solution that never left the "
