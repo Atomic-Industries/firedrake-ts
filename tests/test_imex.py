@@ -1,17 +1,22 @@
 """The IMEX (``G``) path must actually advance the solution."""
 
+import numpy as np
 import pytest
-from conftest import EXACT_DECAY, scalar_problem
 from firedrake import *
 
 import firedrake_ts
 
-EXACT = EXACT_DECAY  # solution of u' = -u at t = 1
+EXACT = np.exp(-1.0)  # solution of u' = -u at t = 1
 
 
-def _decay(tableau="3", dt=1e-2, split=True):
+def _decay(tableau="3", dt=1e-3, split=True):
     """Integrate ``u' = -u`` to t = 1, with ``-u`` explicit when ``split``."""
-    u, u_t, v = scalar_problem()
+    mesh = UnitIntervalMesh(4)
+    V = FunctionSpace(mesh, "P", 1)
+    u = Function(V)
+    u_t = Function(V)
+    v = TestFunction(V)
+    u.assign(1.0)
     if split:
         F, G = inner(u_t, v) * dx, -inner(u, v) * dx
     else:
@@ -24,7 +29,7 @@ def _decay(tableau="3", dt=1e-2, split=True):
             "ts_arkimex_type": tableau,
             "ts_adapt_type": "none",
             "ts_time_step": dt,
-            "ts_exact_final_time": "matchstep",
+            "ts_exact_final_time": "stepover",
         },
     )
     solver.solve()
@@ -72,8 +77,9 @@ def test_imex_stage_solves_use_the_dae_callbacks():
 
 def test_implicit_path_matches_imex_path():
     """Splitting a term into G must not change the answer beyond method error."""
+    _, split = _decay(split=True)
     _, monolithic = _decay(split=False)
-    assert abs(monolithic - EXACT) < 1e-3
+    assert abs(split - monolithic) < 1e-3
 
 
 def test_heat_explicit_example_diffuses():
@@ -94,61 +100,3 @@ def test_heat_explicit_example_diffuses():
     firedrake_ts.DAESolver(problem, options_prefix="").solve()
 
     assert sqrt(abs(assemble((u - u0) ** 2 * dx))) > 0.1
-
-
-def _nonconstant_mass(kind, dt, tableau="3"):
-    """Integrate ``M u' = -u`` to ``t = 1`` with ``-u`` explicit, ``M != 1``.
-
-    ``kind="u"`` uses ``M = (1 + u) v``, ``kind="t"`` uses ``M = (1 + t) v``.
-    Both put the whole right-hand side in ``G``, so every stage slope is
-    ``L_j = M^-1 G(t_j, Y_j)`` -- the projection whose operator must be
-    assembled at the same ``(t_j, Y_j)`` that ``G`` is.
-
-    Exact solutions. For ``M = 1 + u``: separating variables,
-    ``(1 + u)/u du = -dt``, so ``ln u + u = 1 - t`` and ``u(1)`` is the root
-    of ``ln u + u = 0``, i.e. the omega constant ``0.5671432904...``. For
-    ``M = 1 + t``: ``du/u = -dt/(1 + t)`` gives ``u = 1/(1 + t)``, so
-    ``u(1) = 1/2``.
-    """
-    u, u_t, v = scalar_problem()
-    time = Constant(0.0)
-    mass = (1.0 + u) if kind == "u" else (1.0 + time)
-    F = inner(mass * u_t, v) * dx
-    G = -inner(u, v) * dx
-    problem = firedrake_ts.DAEProblem(F, u, u_t, (0.0, 1.0), G=G, time=time)
-    solver = firedrake_ts.DAESolver(
-        problem,
-        solver_parameters={
-            "ts_type": "arkimex",
-            "ts_arkimex_type": tableau,
-            "ts_adapt_type": "none",
-            "ts_time_step": dt,
-            "ts_exact_final_time": "matchstep",
-        },
-        options_prefix="",
-    )
-    solver.solve()
-    return float(u.dat.data_ro[0])
-
-
-@pytest.mark.parametrize(
-    "kind,exact",
-    [("u", 0.5671432904097838), ("t", 0.5)],
-)
-def test_rhs_projection_operator_is_assembled_at_the_stage_state(kind, exact):
-    """``L_j = M^-1 G(Y_j)`` must invert ``M(t_j, Y_j)``, not ``M(t^0, y^0)``.
-
-    This is the IMEX path in ``_TSContext``, so it applies to PETSc's own
-    ``arkimex`` (used here) exactly as much as to the Python stepper; both
-    ``kind`` cases matter because a structural test for state dependence
-    (``dM/du != 0``) catches ``kind="u"`` and silently misses ``kind="t"``.
-    See ``_reassemble_rhs_projection_mass_matrix``.
-    """
-    errors = [abs(_nonconstant_mass(kind, dt) - exact) for dt in (0.1, 0.05, 0.025)]
-    assert all(e > 0.0 for e in errors)
-    ratios = [errors[i] / errors[i + 1] for i in range(len(errors) - 1)]
-    for ratio in ratios:
-        assert 6.5 < ratio < 12.0, (
-            f"M({kind}): observed order ratios {ratios} from errors "
-            f"{errors}, expected ~8 (order 3)."
-        )

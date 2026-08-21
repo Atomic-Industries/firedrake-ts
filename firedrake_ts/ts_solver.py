@@ -10,10 +10,6 @@ from petsctools import OptionsManager
 
 from firedrake_ts.solving_utils import _TSContext, check_ts_convergence
 
-# PETSC_ERR_PYTHON, include/petscsystypes.h. libpetsc4py wraps any exception
-# raised inside a Python callback with this code.
-_PETSC_ERR_PYTHON = 101
-
 
 def check_pde_args(F, G, J, Jp):
     if not isinstance(F, (ufl.BaseForm, slate.TensorBase)):
@@ -83,14 +79,10 @@ class DAEProblem:
         :param tspan: the tuple for start time and end time
         :param time: the :class:`.Constant` for time-dependent weak forms
         :param bcs: the boundary conditions (optional)
-        :param J: the Jacobian ``J = sigma*dF/du̇ + dF/du`` (optional).
-                 Either a form, or a callable taking the shift ``sigma`` and
-                 returning the form, e.g.
-                 ``J=lambda sigma: sigma * mass + stiffness``.
+        :param J: the Jacobian J = sigma*dF/du̇ + dF/du (optional)
         :param Jp: a form used for preconditioning the linear system,
                  optional, if not supplied then the Jacobian itself
-                 will be used. Accepts the same callable-of-``sigma`` form
-                 as ``J``.
+                 will be used.
         :param dict form_compiler_parameters: parameters to pass to the form
             compiler (optional)
         :is_linear: internally used to check if all domain/bc forms
@@ -113,6 +105,7 @@ class DAEProblem:
         self.tspan = tspan
         self.F = F
         self.G = G
+        self.Jp = Jp
 
         if not isinstance(self.u_restrict, function.Function):
             raise TypeError(
@@ -130,13 +123,11 @@ class DAEProblem:
         # timeshift value provided by the solver
         self.shift = Constant(1.0)
 
-        self.J = self._resolve_jacobian(
-            J,
-            default=lambda: (
-                self.shift * ufl_expr.derivative(F, udot) + ufl_expr.derivative(F, u)
-            ),
+        # Use the user-provided Jacobian. If none is provided, derive
+        # the Jacobian from the residual.
+        self.J = self.shift * ufl_expr.derivative(F, udot) + (
+            J or ufl_expr.derivative(F, u)
         )
-        self.Jp = self._resolve_jacobian(Jp)
 
         # Derive the Jacobian for the G residual
         self.dGdu = ufl_expr.derivative(G, u) if G is not None else None
@@ -148,16 +139,6 @@ class DAEProblem:
         self.form_compiler_parameters = form_compiler_parameters
         self._constant_jacobian = False
         self._constant_rhs_jacobian = False
-
-    def _resolve_jacobian(self, J, default=None):
-        """A supplied Jacobian, calling it with the shift if it is a factory."""
-        if J is None:
-            return default() if default is not None else None
-        if isinstance(J, (ufl.BaseForm, slate.TensorBase)):
-            return J
-        if callable(J):
-            return J(self.shift)
-        return J
 
     def dirichlet_bcs(self):
         for bc in self.bcs:
@@ -204,9 +185,7 @@ class DAESolver(OptionsManager):
                be used at every timestep to display the iteration's progress.
         :kwarg project_rhs: If True (the default) the right-hand-side term
                ``G`` is projected through a mass matrix solve. Only meaningful
-               when the problem supplies a ``G``; not supported as False in
-               that case, since an unprojected ``G`` is a raw dual vector
-               while a TS's ``RHSFunction`` is a state-space derivative.
+               when the problem supplies a ``G``.
         :kwarg rhs_projection_parameters: Solver parameters for that mass
                matrix solve, as a dict mapping PETSc options to values.
                Defaults to a direct solve. These may equivalently be set from
@@ -366,29 +345,6 @@ class DAESolver(OptionsManager):
         ctx._nullspace_T = nullspace_T
         ctx._near_nullspace = near_nullspace
 
-    def set_stage_limiter(self, limiter):
-        r"""Register a limiter fired on each explicit substage value.
-
-        PETSc constructs the stepper itself from ``-ts_python_type``, so the
-        caller never holds a reference to it; this forwards to that instance.
-
-        :arg limiter: a callable taking the stage-value ``Vec`` and modifying
-            it in place. It is called before anything consumes the value.
-        """
-        if self.ts.getType() != PETSc.TS.Type.PYTHON:
-            raise ValueError(
-                f"a stage limiter requires ts_type 'python' with "
-                f"ts_python_type set to a Shu-Osher stepper; this TS is "
-                f"'{self.ts.getType()}', whose stage values are not "
-                f"available in a form a limiter can soundly act on"
-            )
-        context = self.ts.getPythonContext()
-        if not hasattr(context, "set_stage_limiter"):
-            raise ValueError(
-                f"{type(context).__name__} does not support stage limiters"
-            )
-        context.set_stage_limiter(limiter)
-
     def set_transfer_manager(self, manager):
         r"""Set the object that manages transfer between grid levels.
         Typically a :class:`~.TransferManager` object.
@@ -407,8 +363,6 @@ class DAESolver(OptionsManager):
            If bounds are provided the ``snes_type`` must be set to
            ``vinewtonssls`` or ``vinewtonrsls``.
         """
-        with self.inserted_options():
-            self._ctx._check_G_vanishes_on_algebraic_rows()
 
         self._set_problem_eval_funcs(
             self._ctx,
@@ -441,48 +395,10 @@ class DAESolver(OptionsManager):
                     self._transfer_operators,
                 ):
                     stack.enter_context(ctx)
-                self._clear_python_stepper_error()
-                try:
-                    self.ts.solve(work)
-                except PETSc.Error as exc:
-                    # A Python exception raised inside a TSPYTHON callback
-                    # cannot be recovered from exc.__cause__: PETSc's default
-                    # error handler prints as the error unwinds through C,
-                    # and under captured output that print clears the
-                    # thread's pending exception before it can be attached.
-                    # So the stepper records its own exception and we
-                    # re-raise that, which keeps PETSc's printed C-stack
-                    # diagnostics intact.
-                    original = (
-                        self._python_stepper_error()
-                        if exc.ierr == _PETSC_ERR_PYTHON
-                        else None
-                    )
-                    if original is not None:
-                        raise original from exc
-                    raise
+                self.ts.solve(work)
             work.copy(u)
         self._setup = True
         check_ts_convergence(self.ts)
-
-    def _python_stepper_context(self):
-        """The Python context of a ``TSPYTHON`` stepper, or ``None``."""
-        if self.ts.getType() != PETSc.TS.Type.PYTHON:
-            return None
-        try:
-            return self.ts.getPythonContext()
-        except PETSc.Error:
-            return None
-
-    def _python_stepper_error(self):
-        """The exception a TSPYTHON stepper recorded, if any."""
-        return getattr(self._python_stepper_context(), "_error", None)
-
-    def _clear_python_stepper_error(self):
-        """Drop any stashed exception before a solve."""
-        context = self._python_stepper_context()
-        if getattr(context, "_error", None) is not None:
-            context._error = None
 
     def adjoint_solve(self):
         r"""Solve the adjoint problem."""
