@@ -50,12 +50,7 @@ def _classify_rows(F, u, udot, nfields):
 
     A component whose test function never appears in ``F`` at all has no
     equation of its own -- the DAE is underdetermined for that component --
-    so it is a hard error rather than a silent omission from every
-    predicate. Left silent, an absent row would look identical to an
-    algebraic row to every caller downstream, including code that gives
-    algebraic rows a unit diagonal to make a projection invertible: that
-    repair would not apply here, and the projection would hit a zero pivot
-    with no clue why.
+    so it is a hard error.
     """
     splitter = ExtractSubBlock()
     rows = {i: splitter.split(F, argument_indices=(i,)) for i in range(nfields)}
@@ -91,26 +86,14 @@ def explicitly_governed_fields(F, u, udot, nfields):
 
     ``dF/du`` is structurally zero on these rows, so the implicit stage
     equation reduces to ``Y_i = Z_i``: the stage value is fully determined by
-    the explicit recursion and can be limited soundly. This is exactly the
-    condition under which a limiter preserves monotonicity.
+    the explicit recursion and can be limited to preserve monotonicity.
     """
     rows = _classify_rows(F, u, udot, nfields)
     return tuple(i for i, (_, has_implicit) in rows.items() if not has_implicit)
 
 
 def field_rows(problem, fields):
-    """Global row indices of the given component indices of a mixed space.
-
-    The single implementation of an idiom that had been written out three
-    times -- here, and twice in ``ark_ssp`` -- with each copy carrying a
-    comment pointing at the other two and repeating the same caveat.
-
-    Rows come from ``J``'s test space, matching ``form_rhs_jacobian``'s
-    existing idiom rather than reading ``F`` directly. That is correct
-    because ``J`` is derived from ``F`` when the caller does not supply one,
-    but it assumes a user-supplied ``J`` shares ``F``'s test-function space.
-    Fixing that assumption is now a change in one place instead of three.
-    """
+    """Global row indices of the given component indices of a mixed space."""
     if not len(fields):
         return None
     ises = problem.J.arguments()[0].function_space()._ises
@@ -119,24 +102,6 @@ def field_rows(problem, fields):
 
 
 def resolve_fields(option, prefix, detected, nfields=None):
-    """``detected``, unless the options database overrides it.
-
-    Structural default plus runtime override, following PETSc's own idiom --
-    ``-pc_fieldsplit_detect_saddle_point`` detects the algebraic block from
-    zero diagonals but does not force the choice. Set e.g.
-    ``-ts_algebraic_fields 1,3`` to declare the partition instead.
-
-    Parsed with ``PETSc.Options.getIntArray`` rather than by hand, so this
-    option accepts the same syntax as every other integer-array option in the
-    database -- including PETSc's ``a-b`` ranges, which a ``split(",")`` of
-    our own silently rejected -- and reports malformed input with PETSc's
-    diagnostic instead of a bare ``int()`` ``ValueError``.
-
-    ``nfields`` is validated here, where the option name is still in hand: an
-    out-of-range index otherwise surfaced as ``IndexError: tuple index out of
-    range`` from inside ``_apply_algebraic_unit_diagonal``, and a negative one
-    quietly selected a field from the end.
-    """
     # int() per element, not just tuple(): getIntArray hands back numpy
     # integers, which index correctly but make this path's return type differ
     # from the structural detection it overrides -- and render in the error
@@ -264,10 +229,7 @@ class _TSContext(_SNESContext):
             if not project_rhs:
                 raise ValueError(
                     "project_rhs=False hands PETSc the raw dual G, but a TS "
-                    "treats RHSFunction as a state-space derivative, so the "
-                    "result is wrong by a factor of the mass matrix (measured "
-                    "u(1) = 0.884765 against 0.367879 exact on u' = -u). No "
-                    "supported TS type wants an unprojected G."
+                    "treats RHSFunction as a state-space derivative."
                 )
             self._assemble_rhs_residual = get_assembler(
                 self.G,
@@ -626,13 +588,9 @@ class _TSContext(_SNESContext):
 
     @cached_property
     def _row_classification(self):
-        """``{row: (has time derivative, has implicit operator)}``, computed once.
+        """Structural characteristics per row, cached:
 
-        Both halves come out of one pass. Previously ``algebraic_fields`` and
-        ``explicitly_governed_fields`` each called ``_classify_rows``
-        independently and discarded the half they did not want, so an ARKSSP
-        setUp did every ``ExtractSubBlock`` split and all ``2 * nfields``
-        derivative expansions twice.
+        ``{row: (has time derivative, has implicit operator)}``
         """
         return _classify_rows(
             self._problem.F,
@@ -709,15 +667,6 @@ class _TSContext(_SNESContext):
     def _rhs_projection_mass_assembler(self):
         r"""The assembler for ``dF/du_t``, built once and called per stage.
 
-        Built once for the same reason the form is: the top-level
-        ``assemble`` entry point re-runs form preprocessing -- signature
-        hashing, ``ExtractSubBlock``, function-space reconstruction, pyop2
-        cache probes -- on every call, measured at 365us against 27.5us for
-        a prebuilt assembler, independent of problem size. Since this
-        operator is reassembled once per stage per step, that fixed Python
-        cost dominated: it was 55% of ``computeRHSFunction`` and 45% of the
-        test suite's wall time.
-
         This caches no value of the operator. ``get_assembler`` caches the
         compiled kernel and parloop wiring for a fixed form; each
         ``assemble`` call re-reads the coefficients' current ``dat`` values
@@ -727,7 +676,7 @@ class _TSContext(_SNESContext):
         fixed for the solve, which ``_rhs_projection_mass_form`` being a
         ``cached_property`` already commits to. Contrast
         ``_reassemble_rhs_projection_mass_matrix``, which must stay
-        unconditional -- see the defect history in its docstring.
+        unconditional.
         """
         return get_assembler(self._rhs_projection_mass_form, bcs=self.bcs_F)
 
@@ -786,19 +735,7 @@ class _TSContext(_SNESContext):
         up exactly that ``(t_j, Y_j)``.
 
         Called unconditionally, NOT gated on any structural test of whether
-        ``M`` actually varies. An earlier version of this operator was a
-        plain ``@cached_property`` -- "assembled once" -- which silently
-        inverted ``M(t^0, y^0)`` for every stage of every step. On
-        ``(1 + u) u_t = -u`` that held the error flat at ``3.9e-2`` across
-        ``dt = 0.1, 0.05, 0.025`` (ratios 1.001, 1.000) where reassembly
-        recovers the design order (ratios 4.041, 4.021). Two sibling
-        narrowings of the same operator in ``ark_ssp`` failed the same way:
-        skipping reassembly unless ``dM/du`` was structurally nonzero misses
-        ``M``'s dependence on ``t`` (``M = (1 + t) v``) or on any other
-        mutable coefficient the form closes over, and no structural predicate
-        on the UFL form can rule that out in general. The cost is one
-        assembly and one refactorisation per stage; buy it back with a
-        measured cache keyed on state, never with a guess about the form.
+        ``M`` actually varies.
 
         Reassembles into the existing tensor rather than allocating a fresh
         one: same sparsity, and the same PETSc handle the ``KSP`` already

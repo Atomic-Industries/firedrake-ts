@@ -5,7 +5,6 @@ Selected with ``-ts_type python -ts_python_type firedrake_ts.ark_ssp.ARKSSP``.
 The explicit part is advanced in canonical Shu-Osher form so that a limiter
 applied to a stage value is mathematically sound: each stage is a convex
 combination of forward-Euler steps taken from previously-limited stage values.
-See ``docs/superpowers/specs/2026-08-04-shu-osher-tspython-stepper-design.md``.
 
 Known limitation: PETSc only accumulates ``ts->snes_its`` and ``ts->ksp_its``
 inside its own step drivers (``TSStep_ARKIMEX``, ``TSStep_Python_default``,
@@ -86,9 +85,7 @@ class ARKSSP:
         # The values the frozen rows must hold through the stage currently
         # being solved, captured by _solve_stage before its warm start
         # overwrites them. This is the freeze's actual mechanism: it is what
-        # makes the residual on those rows a constraint rather than the
-        # identically-zero x - x it was when the target was read back out of
-        # the very vector SNES iterates on. See _apply_freeze_residual.
+        # makes the residual on those rows a constraint rather.
         self._frozen_target = None
         # max |Y_i[frozen] - target| observed across the last stage solve,
         # BEFORE _solve_stage restores exactness. Nonzero means the solver
@@ -113,8 +110,7 @@ class ARKSSP:
         # first stage needs none of this, since _solve_stage populates
         # Ydot[0] itself in _take_stages. Whether the first stage is
         # explicit is read directly off tab.At[0, 0] wherever it matters
-        # (_setup_stage0_mass_solve, _prepare_stage0_ydot) rather than
-        # cached in a separate flag.
+        # (_setup_stage0_mass_solve, _prepare_stage0_ydot).
         self._mass_ksp = None
         self._mass_options = None
         self._mass_tensor = None
@@ -256,21 +252,7 @@ class ARKSSP:
         )
 
     def set_stage_limiter(self, limiter):
-        """Register a callable fired on each explicit substage value.
-
-        Known limitation: the soundness guard below is all-or-nothing at
-        problem level, not per component. It refuses a limiter outright
-        when NO component is freezable, but once at least one component
-        IS freezable (``self._frozen_rows`` is not ``None``), it raises
-        nothing further -- even if the limiter's callable also modifies a
-        DIFFERENT, non-frozen component that has an implicit operator
-        acting on it. That component's implicit stage solve silently
-        reverts the limiter's change on exactly that row, reproducing the
-        original COOL-193 defect this whole stepper exists to fix, with no
-        error and no warning. Enforcing this per component would need to
-        know, for an arbitrary callable, which sub-block(s) of the stage
-        vector it actually touches -- real design work, out of scope here.
-        """
+        """Register a callable fired on each explicit substage value."""
         self._limiter = limiter
         # setUp runs this same check once the tableau and frozen rows are
         # known; re-run it here too, since a caller may register a limiter
@@ -287,7 +269,7 @@ class ARKSSP:
         ``_take_stages`` calls ``_solve_stage`` only when ``At[i, i] > 0``,
         and otherwise takes the stage value straight from the Shu-Osher
         predictor -- which encodes ``A`` alone. So for a stage with a zero
-        diagonal but a nonzero row, two things go wrong silently:
+        diagonal but a nonzero row, two things go wrong:
 
         * ``Y_i`` is missing its ``h sum_{j<i} At_ij Ydot_j`` offset, so the
           stage value is simply wrong; and
@@ -295,12 +277,6 @@ class ARKSSP:
           whenever ``At[k, i] != 0``, ``evaluatestep`` whenever
           ``bt[i] != 0`` and ``interpolate`` whenever ``d[i] != 0`` -- so
           those read whatever ``VecDuplicate`` left in the vector.
-
-        This pattern (an explicit first stage followed by a zero-diagonal
-        row that still couples to earlier stages) is common in published
-        ARK-IMEX tableaux, and ``TABLEAUX`` is the documented extension
-        point for ``-ts_ark_ssp_type``. Every other structural precondition
-        here is checked at ``setUp``; this one was assumed.
 
         Stage 0 is exempt: ``At[0, 0] == 0`` with an all-zero row is the
         normal explicit-first-stage case that ``_prepare_stage0_ydot``
@@ -324,14 +300,7 @@ class ARKSSP:
             )
 
     def _check_limiter_soundness(self):
-        """Refuse a limiter that a stage solve could undo without a trace.
-
-        The soundness hazard only exists where an implicit stage actually
-        runs (tab.At[i, i] > 0.0, matching step()'s own guard on
-        _solve_stage): a purely-explicit tableau such as ssprk2 never
-        solves a stage, so there is nothing for the limiter's change to be
-        undone by, regardless of whether any component was found freezable.
-        """
+        """Refuse a limiter that a stage solve could undo without a trace."""
         has_implicit_stage = self._tab.has_implicit_stage
         if (
             self._limiter is not None
@@ -353,21 +322,6 @@ class ARKSSP:
         Those rows' stage equation reduces to Y_i = Z_i, so their value comes
         entirely from the explicit Shu-Osher recursion. Pinning them during
         the implicit solve is what stops the solve from undoing the limiter.
-
-        A non-mixed space is one field (``nfields = 1``), not a structural
-        exemption: ``explicitly_governed_fields`` answers correctly for it
-        too (e.g. a scalar DG field advanced purely through G, whose F is a
-        bare mass form with no dependence on the state at all -- exactly the
-        DG1 bounds test in ``tests/test_bounds.py``). Detection is therefore
-        unconditional and structural. Whether the freeze actually PINS
-        anything during a solve is a separate question, gated in the
-        application sites (``_apply_freeze_residual``, ``formSNESJacobian``,
-        ``_solve_stage``) on a limiter being registered: with no limiter
-        there is nothing for the implicit solve to undo, and for a
-        single-field problem freezing every row would make the stage solve
-        self-referentially trivial (zero Newton iterations) even though the
-        real linear mass-matrix solve is doing legitimate work -- see
-        ``test_stage_solves_do_work``.
         """
         # Both halves of the partition are owned and cached by the context
         # (_algebraic_fields / _explicitly_governed_fields), which also spares
@@ -385,16 +339,6 @@ class ARKSSP:
         ``_frozen_rows``, which is the rows with no ``dF/du``: one is about
         the mass operator, the other about the implicit operator, and a
         component can be in either, both or neither.
-
-        ``_reassemble_stage0_mass`` gives these rows a unit diagonal so the
-        mass matrix is invertible, which means the stage-0 solve returns
-        ``-F_alg(t^n, y^n, 0)`` on them rather than a derivative. That value
-        is meaningless -- there is no ``u_t`` in those equations -- and it
-        does not stay put: ``_build_offset`` propagates it into every later
-        stage as ``h At_ij Ydot_j``. ``_prepare_stage0_ydot`` therefore zeroes
-        it, matching PETSc, which does exactly this immediately after the
-        solve that produces its own ``Ydot0``
-        (``VecISSet(Ydot0, ark->alg_is, 0.0)``, ``arkimex.c:1389``).
         """
         ctx = dmhooks.get_appctx(ts.getDM())
         return field_rows(ctx._problem, ctx._algebraic_fields)
@@ -408,17 +352,7 @@ class ARKSSP:
         vec.getArray()[rows - lo] = 0.0
 
     def _freeze_active(self):
-        """Whether the freeze should actually pin rows this solve.
-
-        Detection in ``_find_frozen_rows`` is unconditional and structural;
-        application is gated on a limiter being registered, since freezing
-        exists only to protect a limiter's correction from the implicit
-        solve. Applying it with no limiter would be harmless where some
-        other field remains for SNES to solve, but for a single, wholly
-        explicitly-governed field it would make the stage solve trivial
-        (see ``_find_frozen_rows``'s docstring), silently changing behaviour
-        no limiter asked for.
-        """
+        """Whether the freeze should actually pin rows this solve."""
         return self._frozen_rows is not None and self._limiter is not None
 
     def _apply_freeze_residual(self, x, f):
@@ -427,38 +361,6 @@ class ARKSSP:
         ``target`` is ``self._frozen_target``, the snapshot ``_solve_stage``
         took before its warm start, NOT ``self._Y[self._stage]``. That
         distinction is the whole content of this method.
-
-        ``self._Y[self._stage]`` is the very vector SNES iterates on -- it is
-        the ``x`` handed to this callback -- so reading the target out of it
-        made this ``x - x``: identically zero for whatever value the row
-        happened to hold, carrying no information and constraining nothing.
-        The pin then rested entirely on Newton's step being zero there too
-        (zero residual, identity Jacobian row) plus ``_solve_stage``'s
-        restore, which holds for plain Newton with an identity-preserving
-        preconditioner and quietly does not for ``pc_type fieldsplit``
-        solving the non-frozen block approximately, or for ``snes_type
-        ngmres``/``anderson``, whose accepted iterate mixes past iterates.
-        In those cases the row could drift by roughly the inner-solve
-        tolerance with nothing raising, because SNES's own convergence test
-        was looking at a residual that was zero there BY CONSTRUCTION.
-
-        Against a real target the row's residual entry IS its drift, and two
-        things follow with no new tolerance to pick. Newton's step on that row
-        becomes ``delta = target - x``, so the solve actively corrects the row
-        instead of passively leaving it alone -- measured under ``snes_type
-        qn``, which does move it, the drift falls from 1.87e-06 to 2.48e-08.
-        And the drift stops being invisible: the frozen entries are part of
-        the residual vector SNES measures, so ``|drift| <= ||f||`` at the
-        accepted iterate.
-
-        That bound is worth stating carefully rather than overstating. It
-        constrains the drift directly under an absolute tolerance, but only
-        relative to the initial residual under a relative one -- the same
-        ``qn`` run reports ``||f|| = 16.96`` at convergence with the OLD
-        residual, so "SNES converged" was never on its own a bound on
-        anything. What changed is that the frozen rows now contribute to the
-        norm SNES tests at all, where before they contributed zero by
-        construction.
         """
         if not self._freeze_active():
             return
@@ -474,44 +376,9 @@ class ARKSSP:
     def _setup_stage0_mass_solve(self, ts):
         """Set up whatever an explicit first stage needs for ``Ẏ_0``.
 
-        For an explicit first stage (``tab.At[0, 0] == 0``), ``Y_0 = y^n``
-        and the implicit residual must still be satisfied there:
-        ``F(t^n, y^n, Ẏ_0) = 0``. This is EXACT, not an approximation, when
-        ``F`` is affine in ``u̇`` -- which is the overwhelmingly common
-        case (any ``F`` built from a mass term plus terms with no ``u̇``
-        dependence): solving the one linear equation
-        ``M Ẏ_0 = -F(t^n, y^n, 0)`` with the mass matrix ``M = dF/du̇``
-        (constant on that row precisely because ``F`` is affine in ``u̇``)
-        gives ``Ẏ_0 = -M^-1 F(t^n, y^n, 0)`` as the unique root, not a
-        linearisation of it. See ``_prepare_stage0_ydot``, which solves that
-        every ``step()``. When ``F`` is NONLINEAR in ``u̇`` instead (a
-        nonzero ``d^2F/du̇^2``), that same formula is only the first Newton
-        step away from ``Ẏ_0 = 0``, not the true root -- silently wrong,
-        with no exception -- so this refuses such a problem outright below
-        rather than return a plausible-looking, wrong answer. That refusal
-        is checked unconditionally, for every tableau, NOT only when the
-        first stage is explicit: ``M^-1 G``
-        (``_TSContext._rhs_projection_solver``, used whenever ``G`` is not
-        ``None``) rests on exactly the same affine-in-``u̇`` assumption, for
-        every tableau, whether or not its first stage is explicit.
-
         Built unconditionally whenever the first stage is explicit --
         NOT gated on whether ``dF/du`` is structurally zero, and NOT gated
-        on whether ``M`` itself depends on the state. Two previous versions
-        each narrowed this on a structural predicate that looked sufficient
-        and was not: skipping the solve when ``dF/du`` was structurally
-        zero (false -- ``dF/du == 0`` says nothing about ``F(t^n, y^n, 0)``
-        itself, e.g. a purely time-dependent or constant source), and
-        reusing a single assembly of ``M`` across the whole solve unless
-        ``dM/du`` was structurally nonzero (also false -- a structurally
-        zero ``dM/du`` says nothing about ``M``'s dependence on ``t``, e.g.
-        ``M = (1 + t) v``, or on some other mutable coefficient the form
-        closes over; no structural predicate on the UFL form can rule that
-        out in general). ``_prepare_stage0_ydot`` therefore reassembles
-        ``M`` at the current ``(t^n, y^n)`` every ``step()``,
-        unconditionally -- one extra assembly per step, not per stage,
-        alongside the ``IFunction`` evaluation and mass solve that path
-        already performs every step.
+        on whether ``M`` itself depends on the state. 
 
         Builds a bare ``PETSc.KSP`` on the assembled mass matrix, following
         ``_TSContext._rhs_projection_solver``'s idiom in
@@ -560,16 +427,12 @@ class ARKSSP:
         # -M^-1 F(t^n, y^n, 0) to be the exact root rather than one Newton
         # step from zero (only relevant when the first stage is explicit),
         # and for M^-1 G to mean anything at all for ANY tableau whenever G
-        # is not None -- see this method's docstring. Refuse rather than
-        # hand back a plausible, silently wrong answer.
+        # is not None -- see this method's docstring.
         if not is_zero_form(ufl_expr.derivative(mass_form, ctx._xdot)):
             # The Ẏ_0 half of this only applies when the first stage is
             # actually explicit; the M^-1 G half applies to every tableau,
             # which is why the check itself is unconditional (it runs before
-            # the At[0, 0] > 0.0 early return below). Naming both as though
-            # both were in play -- as this message used to -- asserts
-            # tab.At[0, 0] == 0.0 as a fact even for a tableau where it is
-            # false.
+            # the At[0, 0] > 0.0 early return below).
             affected = ["M^-1 G (whenever G is not None)"]
             if tab.At[0, 0] == 0.0:
                 affected.insert(
@@ -583,8 +446,7 @@ class ARKSSP:
                 "well-defined constant operator, so "
                 + " and ".join(affected)
                 + (" are" if len(affected) > 1 else " is")
-                + " one Newton step away from the true root rather than an "
-                "exact answer, with no exception raised otherwise. Rewrite "
+                + " one Newton step away from the true root. Rewrite "
                 "F to be affine in u̇."
             )
 
@@ -616,7 +478,7 @@ class ARKSSP:
                     "terms would be silently dropped from every step, "
                     "integrating M u̇ = G rather than the F = G you posed. "
                     "Move them into G, or choose a tableau with an implicit "
-                    "part (e.g. esdirk_gamma5)."
+                    "part."
                 )
 
         if tab.At[0, 0] > 0.0:
@@ -635,48 +497,12 @@ class ARKSSP:
         self._mass_ksp = ksp
 
     def _reassemble_stage0_mass(self, ctx):
-        """(Re)assemble ``self._mass_tensor`` at the current state.
-
-        Called from ``_setup_stage0_mass_solve`` (``self._mass_tensor`` is
-        ``None`` there, so this performs the first, allocating assembly)
-        and, unconditionally, from ``_prepare_stage0_ydot`` on every
-        ``step()`` (``self._mass_tensor`` already exists there, so this
-        reassembles in place). ``ctx._x`` (== ``ctx._problem.u_restrict``,
-        the same coefficient ``self._mass_form`` is built from) already
-        holds the state this must be assembled at: the initial condition on
-        the first call, and ``y^n`` on every later call, because
-        ``_prepare_stage0_ydot`` calls ``ts.computeIFunction`` first, and
-        that callback (``_TSContext.form_function``) copies the incoming
-        state into ``ctx._x`` itself.
-
-        ``tensor=self._mass_tensor`` reassembles into the existing
-        ``Matrix``/``Mat`` in place once it exists, rather than allocating a
-        fresh one each step: same sparsity, same PETSc handle the ``KSP``
-        already has as its operator, so no ``setOperators`` call is needed
-        after this -- PETSc's own assembly bumps the ``Mat``'s state
-        counter, which is what tells the ``KSP`` its factorisation is
-        stale.
-
-        The assembler is built once for the same reason the form is, and
-        caches only compiled-kernel and parloop wiring, never a value of the
-        operator -- see the comment at the call below.
-
-        Mirrors ``_TSContext._rhs_projection_mass_matrix``'s algebraic-row
-        handling (unit diagonal on any row with a structurally zero
-        ``dF/du̇``), since a fresh assembly would otherwise zero those rows
-        out again and reintroduce the singular pivot that property exists
-        to avoid.
-        """
+        """(Re)assemble ``self._mass_tensor`` at the current state."""
         if self._mass_assembler is None:
             # Built once, then called per step: the top-level ``assemble``
             # entry point re-runs form preprocessing (signature hashing,
             # function-space reconstruction, pyop2 cache probes) on every
-            # call -- 365us against 27.5us for a prebuilt assembler, and
-            # flat in problem size. This caches no value of the operator:
-            # each ``assemble`` re-reads the coefficients' current ``dat``
-            # values and re-executes the parloop, so the reassembly below
-            # stays exactly as unconditional as it was. Mirrors
-            # ``_TSContext._rhs_projection_mass_assembler``.
+            # call.
             self._mass_assembler = get_assembler(self._mass_form, bcs=ctx.bcs_F)
             self._mass_tensor = self._mass_assembler.allocate()
         self._mass_assembler.assemble(tensor=self._mass_tensor)
@@ -688,52 +514,11 @@ class ARKSSP:
 
         FSAL ("first same as last"): for a stiffly accurate tableau with
         ``ct[-1] == 1``, the last stage solve of step ``n`` already produced a
-        derivative satisfying ``F(t^{n+1}, y^{n+1}, Ẏ) = 0`` -- which is
-        exactly the equation ``Ẏ_0`` is defined by at step ``n+1``. So the
-        value is reusable, and reusing it skips a mass assembly, an LU
-        refactorisation and a solve. PETSc's own ARKIMEX does this
-        (``arkimex.c:1356-1359``, ``FSAL_implicit``), recomputing only when
-        ``ts->steprestart`` or ``ts->stepresize`` is set. Measured share of
-        solve time for the path this replaces: 13-16% on a 2D reaction-
-        diffusion problem with a state-dependent mass matrix, over
-        2.4k-26k dofs.
-
-        VERIFIED, not assumed. The reuse is accepted only if the candidate
-        actually satisfies its defining equation: one ``IFunction``
-        evaluation -- a vector assembly, no matrix assembly and no
-        factorisation -- compared against ``reference``, the norm of
-        ``F(t^n, y^n, 0)``, which is the right-hand side the fresh solve
-        would have used and so the natural scale for this residual.
-
-        Checking rather than enumerating preconditions is the point. A guard
-        on ``(t, x)`` equality -- cache the end-of-step state, compare with
-        ``VecEqual`` -- looks sufficient and is not: it establishes that the
-        STATE is unchanged, not that the FORM is. ``DAEProblem`` explicitly
-        supports a callback that mutates coefficients the form closes over
-        between steps (``ts_solver.py``'s ``update_diffusivity`` example), and
-        after such a mutation ``t`` and ``x`` are both unchanged while ``M``
-        and ``F`` are not, so a state guard would reuse a stale derivative
-        with nothing raising. That is the same shape as the five staleness
-        defects this stepper has already had, every one of them a narrowing
-        resting on an unverifiable claim about the form. The residual test
-        has no such claim in it: it is robust against any reason the reuse
-        could be invalid, including reasons not enumerated here, because the
-        residual IS the definition. It also subsumes the state guard
-        entirely, so no end-of-step copy of the solution is kept -- the reuse
-        costs no additional memory, since ``_Ydot[-1]`` persists anyway.
-
-        A miss costs one extra vector assembly and falls through to the fresh
-        path. The candidate's residual goes into ``self._fsal_residual``
-        rather than reusing ``self._rhs``, so ``F(t^n, y^n, 0)`` -- which the
-        caller assembled to get ``reference``, and which is the right-hand
-        side of the fresh path's mass solve -- survives a miss intact. It
-        used to be reassembled, making a miss cost two assemblies where the
-        docstring claimed one; nothing between the two calls can change the
-        value, since neither touches a coefficient the form closes over.
+        derivative satisfying ``F(t^{n+1}, y^{n+1}, Ẏ) = 0``.
 
         ``reference == 0.0`` (i.e. ``F(t^n, y^n, 0) == 0``, so ``Ẏ_0 = 0``)
         makes the test unsatisfiable for any nonzero candidate and it falls
-        through -- correct, and the fresh path is trivial in that case.
+        through.
         """
         if not (self.fsal and self._fsal_possible and self._fsal_valid):
             return False
@@ -748,31 +533,19 @@ class ARKSSP:
         # (Y - Z) * shift, which is no more meaningful on an algebraic row
         # than the fresh path's -F_alg is, so it does need applying here too
         # -- but hoisting it makes the two paths' postconditions identical by
-        # construction rather than by two blocks agreeing.
+        # construction.
         return True
 
     def _prepare_stage0_ydot(self, ts, t, x):
-        """Populate ``Ẏ_0`` once per ``step()``, before the retry loop.
-
-        ``Ẏ_0 = -M(t^n, y^n)^-1 F(t^n, y^n, 0)`` depends only on
-        ``(t^n, y^n)``, i.e. on ``(t, x)`` as passed in here -- neither of
-        which changes across retries of the same step inside ``step()``'s
-        reject loop (only ``h`` does). So this runs exactly once per
-        ``step()`` call, not once per attempt inside ``_take_stages``, and
-        it must be called with THIS step's ``t^n``/``y^n``: ``step()``
-        calls it right after recording ``self._last_x``, before entering
-        the retry loop.
-        """
+        """Populate ``Ẏ_0`` once per ``step()``, before the retry loop."""
         if self._tab.At[0, 0] > 0.0:
             return  # _solve_stage populates _Ydot[0] normally, in _take_stages.
         # _setup_stage0_mass_solve builds this KSP unconditionally whenever
-        # the first stage is explicit -- see that method's docstring for
-        # why skipping it based on dF/du alone is unsound.
+        # the first stage is explicit.
         ts.computeIFunction(t, x, self._zero_xdot, self._rhs, True)
         # F(t^n, y^n, 0) is the right-hand side of the mass solve below, so
         # its norm is already the natural scale for the residual test in
-        # _try_fsal_stage0_ydot -- computed here, before that call, because
-        # that call overwrites self._rhs.
+        # _try_fsal_stage0_ydot.
         if not self._try_fsal_stage0_ydot(ts, t, x, self._rhs.norm()):
             # Reassemble M at THIS step's (t^n, y^n), unconditionally -- see
             # _setup_stage0_mass_solve's docstring for why no structural
@@ -792,7 +565,7 @@ class ARKSSP:
         # makes the fresh solve return -F_alg(t^n, y^n, 0) rather than a
         # derivative, and the FSAL copy carries _solve_stage's (Y - Z) * shift,
         # which is no more meaningful there. See _find_algebraic_rows; PETSc
-        # does the same at arkimex.c:1389.
+        # does the same.
         #
         # Frozen rows: a frozen row's implicit function is the mass term
         # alone, so M Ẏ = 0 there and the correct derivative is exactly zero,
@@ -822,50 +595,14 @@ class ARKSSP:
             self._prepare_stage0_ydot(ts, t, self._last_x)
 
             # petsc4py binds setMaxStepRejections but NOT a getter, so read
-            # the option directly. Two traps, both verified against the
-            # installed PETSc:
-            #   * ts.c:133 does PetscOptionsDeprecated("-ts_max_reject",
-            #     "-ts_max_step_rejections", "3.25", NULL), which REMOVES the
-            #     old key from the database during TSSetFromOptions -- long
-            #     before this runs. Reading "ts_max_reject" therefore always
-            #     returns the default, silently ignoring both spellings. Read
-            #     the new name, keeping the old one only as a legacy
-            #     fallback (relevant only if TSSetFromOptions is somehow
-            #     skipped for this TS).
-            #   * PETSc's "no bound" sentinel is PETSC_UNLIMITED == -3
-            #     (petscsys.h:367), not -1. Treated naively, max(1, n + 1)
-            #     would turn a request for unlimited retries into exactly one
-            #     attempt.
+            # the option directly.
             opts = PETSc.Options(ts.getOptionsPrefix() or "")
             max_reject = opts.getInt(
                 "ts_max_step_rejections", opts.getInt("ts_max_reject", 10)
             )
             attempts = 1 << 30 if max_reject < 0 else max(1, max_reject + 1)
             adapt = ts_get_adapt(ts)
-            # Both kinds of rejection -- LTE-based (TSAdaptChoose declines
-            # the completed candidate) and SNES-divergence-based (caught
-            # below) -- share this one counter and its ts_max_step_rejections
-            # cap. PETSc's own arkimex.c tracks stage-solve failures
-            # separately against ts_max_snes_failures (TSAdaptCheckStage,
-            # tsadapt.c), stopping with TS_DIVERGED_NONLINEAR_SOLVE once that
-            # second cap is hit even if step rejections are unlimited. This
-            # stepper does not reproduce that second counter: a single
-            # attempts budget governs every retry regardless of which check
-            # rejected it, so ts_max_snes_failures (DAESolver sets it to -1,
-            # i.e. unlimited, at ts_solver.py:271) has no effect here -- the
-            # reject loop's own cap is what actually bounds retries.
-            # Named cause of the most recent rejection, for the exhaustion
-            # message below -- there are two independent rejection sources
-            # sharing this loop (SNES divergence, and TSAdaptChoose declining
-            # a completed candidate), and once retries run out the caller
-            # needs to know which one kept firing, not just that "some"
-            # rejection happened `attempts` times.
             last_reject_cause = None
-            # IN/OUT for TSAdaptChoose: whether the PREVIOUS attempt at this
-            # step was accepted. PETSc's TSStep_ARKIMEX declares the same
-            # thing once per step (accept = PETSC_TRUE, arkimex.c:1343) and
-            # clears it at its reject_step label (:1529), which both of this
-            # loop's rejection paths correspond to. See ts_adapt_choose.
             last_accepted = True
             for _ in range(attempts):
                 self._last_h = h
@@ -874,18 +611,7 @@ class ARKSSP:
                 except ConvergenceError as exc:
                     # A stage's SNES diverged (_solve_stage). Reject this
                     # attempt to the adapt loop and retry with a smaller h,
-                    # mirroring PETSc's own TSAdaptCheckStage (tsadapt.c
-                    # reject_stage: dt *= adapt->scale_solve_failed, default
-                    # 0.25) -- called from arkimex.c's own stage loop right
-                    # after SNESSolve, at arkimex.c:1474-1479, before falling
-                    # to reject_step. TSAdaptGetScaleSolveFailed has no
-                    # petsc4py binding, so read the option directly, exactly
-                    # as ts_max_step_rejections is read above. No completed
-                    # candidate exists yet at this point (not every stage
-                    # ran), so there is nothing to hand TSAdaptChoose; unlike
-                    # a normal rejection this path chooses next_h itself
-                    # rather than asking the adapt loop's error-based
-                    # controller for one.
+                    # mirroring PETSc's own TSAdaptCheckStage.
                     last_reject_cause = str(exc)
                     # Reaches PETSc's reject_step, which clears accept -- so
                     # the next TSAdaptChoose in this step must see false even
@@ -894,46 +620,7 @@ class ARKSSP:
                     scale_solve_failed = opts.getReal(
                         "ts_adapt_scale_solve_failed", 0.25
                     )
-                    # x (ts->vec_sol) is never written by _take_stages --
-                    # only self._Y/_L/_Ydot are -- so this copy is a no-op
-                    # today. Restoring it anyway keeps this path visibly
-                    # symmetric with the completion-through-choose block's
-                    # own restore-on-rejection/restore-on-exception below,
-                    # so a future change to _take_stages that DOES touch x
-                    # does not silently fall outside that guarantee.
                     self._last_x.copy(x)
-                    # dt_min's magic number (1e-20) matches PETSc's own
-                    # TSAdapt default floor (tsadapt.c:1155,
-                    # adapt->dt_min = 1e-20) when ts_adapt_dt_min is not
-                    # set, so a caller who already relies on that PETSc
-                    # default for a real TSADAPT gets the same floor here.
-                    # The floor is NOT applied the way PETSc's own reject
-                    # path applies it, though: TSAdaptCheckStage's
-                    # reject_stage (tsadapt.c:1110-1116) multiplies by
-                    # scale_solve_failed unconditionally, with no floor at
-                    # all in that path -- PETSc clamps to dt_min separately,
-                    # inside TSAdaptChoose, not here. This loop clamps h
-                    # itself (below) because, unlike PETSc's C code, a
-                    # persistently diverging stage with
-                    # ts_max_step_rejections unlimited (attempts ==
-                    # 1 << 30) would otherwise shrink h by
-                    # scale_solve_failed every attempt with nothing to stop
-                    # it, underflowing past dt_min and eventually to
-                    # exactly 0.0 -- at which point _solve_stage's
-                    # self._shift = 1 / (h * tab.At[i, i]) raises a plain
-                    # ZeroDivisionError (h is a Python float here, not a
-                    # PETSc real with an IEEE infinity to fall back on),
-                    # and the next stage solve fails in a way that has
-                    # nothing to do with the original divergence.
-                    #
-                    # Checked BEFORE shrinking, and h clamped to the floor
-                    # rather than left below it: checking only after
-                    # shrinking, as a previous version did, raised with
-                    # ZERO retries at the floor for any h already within
-                    # one shrink of dt_min (h < dt_min / scale_solve_failed,
-                    # e.g. h < 4 * dt_min at the default 0.25) -- the very
-                    # case a floor should still get one last attempt at,
-                    # not skip.
                     dt_min = opts.getReal("ts_adapt_dt_min", 1e-20)
                     if h <= dt_min:
                         ts.setConvergedReason(
@@ -948,17 +635,6 @@ class ARKSSP:
                     h = max(h * scale_solve_failed, dt_min)
                     ts.setTimeStep(h)
                     continue
-                # TSAdaptChoose reads ts->vec_sol as the completed, order-p
-                # solution (TSErrorWeightedNorm's own docstring: "usually
-                # ts->vec_sol"; PETSc's own TSStep_ARKIMEX writes the
-                # completion into vec_sol before calling TSAdaptChoose, at
-                # ts/impls/arkimex/arkimex.c, and restores a saved pre-step
-                # copy on rejection). x IS ts->vec_sol here. Guard the whole
-                # completion-through-choose block: if any of _complete,
-                # ts_adapt_candidates_clear, ts_adapt_candidate_add or
-                # ts_adapt_choose raises, x must still be restored to the
-                # pre-step value before the exception propagates, or the TS
-                # is left holding an unaccepted, never-validated candidate.
                 try:
                     self._complete(tab, x, h)
                     ts_adapt_candidates_clear(adapt)
@@ -973,20 +649,13 @@ class ARKSSP:
                     ts.setTime(t + h)
                     ts.setTimeStep(next_h)
                     # _Ydot[-1] now belongs to the accepted attempt, so it is
-                    # a candidate for the next step's Ydot_0. Set here rather
-                    # than anywhere earlier because a rejected attempt's
-                    # _Ydot[-1] is not a derivative at the state the next
-                    # step starts from. Whether the candidate is actually
-                    # usable is still decided by _try_fsal_stage0_ydot's
-                    # residual test, not by this flag.
+                    # a candidate for the next step's Ydot_0.
                     self._fsal_valid = True
                     return
                 # Rejected: restore x (ts->vec_sol) to the pre-step value
-                # before retrying with the smaller next_h -- _complete's
-                # non-stiffly-accurate branch reads x as the step's starting
-                # point, and would otherwise read back the just-rejected
-                # candidate. self._last_x itself is untouched, so the retried
-                # _take_stages still predicts from the correct x^n.
+                # before retrying with the smaller next_h. self._last_x itself
+                # is untouched, so the retried _take_stages still predicts from
+                # the correct x^n.
                 last_reject_cause = (
                     f"the adapt controller declined the completed step "
                     f"(h {h:.6g} -> {next_h:.6g})"
@@ -995,27 +664,7 @@ class ARKSSP:
                 self._last_x.copy(x)
                 h = next_h
                 ts.setTimeStep(h)
-            # Retries exhausted. Setting the converged reason alone is NOT
-            # enough to reach check_ts_convergence's clean ConvergenceError:
-            # PETSc's own TSStep() (ts.c) checks `ts->reason < 0` itself,
-            # right after (*ts->ops->step)(ts) returns, and -- because
-            # TSSetErrorIfStepFails defaults to true -- immediately does its
-            # own SETERRQ(PETSC_ERR_NOT_CONVERGED, "TSStep has failed due to
-            # %s", ...) in C, before returning to TSSolve(), before
-            # DAESolver.solve() ever gets to call check_ts_convergence.
-            # That SETERRQ happens outside this method's Python frame (it
-            # runs after TSStep_Python's call to step(ts) has already
-            # returned success), so it is never caught by step()'s own
-            # try/except above and self._error is never populated -- the
-            # caller then sees a raw, unwrapped PETSc.Error(91) instead of
-            # this stepper's usual clean exception. Raising here, instead of
-            # just setting the reason and returning, is what actually routes
-            # through the recorded-error path: this exception is caught by
-            # step()'s own enclosing try/except (self._error = exc; raise),
-            # surfaces to libpetsc4py as PETSC_ERR_PYTHON, and
-            # DAESolver.solve() unwraps that back to this ConvergenceError --
-            # the same mechanism test_shu_osher_error_is_unwrapped_with_the_
-            # actionable_numbers already exercises for a setUp()-time error.
+            # Retries exhausted.
             ts.setConvergedReason(PETSc.TS.ConvergedReason.DIVERGED_STEP_REJECTED)
             raise ConvergenceError(
                 f"step rejected {attempts} time(s) in a row "
@@ -1034,16 +683,7 @@ class ARKSSP:
             # Limiter fires BEFORE _solve_stage, on rows the implicit
             # solve has not yet touched -- correct ordering, since a
             # limiter must act on the Shu-Osher predictor value, not on
-            # whatever the stage solve does to it afterward. This ordering
-            # is untested against a MIXED problem where the limiter acts
-            # on a partially-frozen state: test_bounds.py's F is mass-only,
-            # so every row there is frozen and the stage solve is a no-op
-            # on pinned rows regardless of ordering -- moving the limiter
-            # after _solve_stage would still pass that test with nothing
-            # to distinguish the two. A test that actually exercises this
-            # ordering needs a mixed problem with a limiter on a partially
-            # frozen state (some rows implicit, some frozen), which is more
-            # than this round takes on -- recorded here, not fixed.
+            # whatever the stage solve does to it afterward.
             if self._limiter is not None:
                 self._limiter(self._Y[i])
             self._build_offset(tab, x, h, i)
@@ -1055,28 +695,7 @@ class ARKSSP:
             ts.computeRHSFunction(t + tab.c[i] * h, self._Y[i], self._L[i])
 
     def evaluatestep(self, ts, order, U):
-        """Write the order-``order`` completion into ``U``.
-
-        ``TSADAPTBASIC`` gets its lower-order solution through
-        ``TSEvaluateStep``, which routes here. The error estimate
-        ``|h sum (b - bhat)_j L(Y_j)|`` reuses the ``L(Y_j)`` the step
-        computed anyway, so error control costs no extra evaluations.
-
-        ``tab.bhat`` is a single embedded-weight array, not a pair -- there
-        is no separate "implicit bhat". For a tableau with a genuine
-        implicit part (``bt`` not identically zero, e.g. esdirk_gamma5),
-        that one array is understood as embedding BOTH the implicit and
-        explicit completions simultaneously, and reusing it for
-        ``weights_i`` below is correct. For a purely explicit tableau
-        (``bt`` identically zero, e.g. ssprk2), there is no implicit part
-        to embed at all -- the embedded weight there must be zero too, not
-        ``bhat``. Getting this wrong is currently invisible for ssprk2 only
-        because its ``F`` in every existing test is mass-only, giving
-        ``Ẏ_0 ≡ 0`` identically regardless of which weight multiplies it;
-        the stage-0 fix above makes ``Ẏ_0`` non-zero for any ``F`` with a
-        state-independent term, at which point a spurious ``h Ẏ_0``
-        embedded-error contribution would appear from nowhere.
-        """
+        """Write the order-``order`` completion into ``U``."""
         tab = self._tab
         h = self._last_h
         if h is None:
@@ -1106,29 +725,13 @@ class ARKSSP:
         with w = bt for the implicit part and w = b for the explicit part.
         The coefficients d are chosen so that d . g = 0 for the null
         direction g of the singular At, which is what keeps the stiff
-        limit bounded -- a naive d = (1, 0, 0, 0) has d . g != 0 and makes
-        X(theta) diverge like z theta(theta - 1) as z -> -infinity.
+        limit bounded.
         """
         tab = self._tab
         h = self._last_h
         if h is None:
             raise ValueError("interpolate called before any step was taken")
         theta = (t - (ts.getTime() - h)) / h
-        # Same guard evaluatestep carries, for the same reason. A purely
-        # explicit tableau (bt identically zero) has no implicit part, so the
-        # interpolant must have no Ydot term: the implicit dense-output
-        # coefficient collapses to d_i theta + (0 - d_i) theta^2 =
-        # d_i theta (1 - theta), which is NOT zero inside the step even
-        # though it vanishes at both ends. For ssprk2 (d = [1, 0]) that puts
-        # a spurious 0.25 h Ydot_0 at theta = 0.5. Consistency is unaffected:
-        # at theta = 1 the explicit coefficient is already b_i on its own, so
-        # X(1) = y^n + h sum b_i L_i is still the completion.
-        #
-        # Dropping the term also stops this reading _Ydot[i] for i >= 1 at
-        # all, which for such a tableau _solve_stage never writes -- those
-        # Vecs hold whatever VecDuplicate left in them. ssprk2 escapes that
-        # today only because its d[1] is 0.0, i.e. by accident of one
-        # coefficient rather than by construction.
         has_implicit = tab.has_implicit_part
         self._last_x.copy(U)
         for i in range(len(tab.b)):
@@ -1151,8 +754,7 @@ class ARKSSP:
 
         Every row of ``[P | q]`` is a nonnegative partition of unity, so this
         is a convex combination of forward-Euler steps taken from stage values
-        the limiter has already seen. That is the whole reason for the
-        stepper.
+        the limiter has already seen.
         """
         self._Y[i].set(0.0)
         if self._q[i] != 0.0:
@@ -1181,33 +783,15 @@ class ARKSSP:
         snes = ts.getSNES()
         # Capture the value the frozen rows must keep, BEFORE the warm start
         # below replaces the whole vector with the previous stage's value (or
-        # x^n) and discards the predictor's -- and any limiter's -- value on
-        # exactly the rows the freeze exists to protect.
-        #
-        # This snapshot is the freeze's mechanism, not merely its bookkeeping:
-        # _apply_freeze_residual builds the frozen rows' residual against it,
-        # which is what makes those rows a real constraint on the solve. See
-        # that method for why reading the target back out of self._Y[i]
-        # instead made the residual identically zero.
+        # x^n) and discards the predictor's value on the rows the freeze exists
+        # to protect.
         freeze = self._freeze_active()
         if freeze:
             local = self._frozen_local
             # No .copy(): numpy advanced indexing already returns a new array.
             self._frozen_target = self._Y[i].getArray(readonly=True)[local]
         # Initial guess: the previous stage value, or x^n for the first
-        # implicit stage -- matching PETSc's own ARKIMEX. Guessing Z_i itself
-        # would make Ydot_i identically zero already for any tableau whose
-        # implicit form has no dependence on the state (as in this task's
-        # decay shakedown), so SNES would report zero iterations even with
-        # the callbacks wired correctly.
-        #
-        # The i == 0 branch is unreachable for every tableau in TABLEAUX
-        # today: this method only runs when tab.At[i, i] > 0.0 (_take_stages'
-        # own guard), and every registry tableau has an explicit first stage
-        # (At[0, 0] == 0.0). It is retained rather than removed because it
-        # is what a fully-implicit tableau (At[0, 0] > 0.0, none of which
-        # exist in TABLEAUX yet) would need, and it matches PETSc's own
-        # ARKIMEX, which carries the identical case for the same reason.
+        # implicit stage -- matching PETSc's own ARKIMEX.
         if i > 0:
             self._Y[i - 1].copy(self._Y[i])
         else:
@@ -1215,38 +799,13 @@ class ARKSSP:
         if freeze:
             # Start the frozen rows AT the target, so their residual is zero
             # to begin with and the solve has nothing to correct there unless
-            # it moves them itself. Without this the warm start would hand
-            # SNES an initial residual equal to the whole limiter correction,
-            # which is a real constraint now but a needless one to impose.
+            # it moves them itself.
             self._Y[i].getArray()[local] = self._frozen_target
         snes.solve(None, self._Y[i])
         # Record how far the solve moved the pinned rows, then restore them
         # exactly.
-        #
-        # The residual built in _apply_freeze_residual is what enforces the
-        # pin; this restore is no longer that mechanism. What it still buys is
-        # EXACTNESS: a converged solve holds the pin only to whatever residual
-        # norm SNES accepted, and the boundedness result this freeze serves is
-        # a claim about the limited value surviving bit-for-bit, not to
-        # 1e-8. So the row is written back rather than left at "close".
-        #
-        # What the drift actually threatens is worth being precise about, and
-        # it is NOT the pinned rows: those are restored, so the boundedness
-        # claim holds whatever the solver did to them. It is the OTHER rows.
-        # If the solve moved a frozen row and the non-frozen rows equilibrated
-        # against the moved value, writing the row back leaves those rows
-        # inconsistent by the drift -- so _frozen_drift is the size of the
-        # inconsistency this restore introduces, bounded by the residual norm
-        # SNES accepted. Benign at solver tolerance, which is why this records
-        # the number rather than raising on it: any threshold to raise at would
-        # be invented, and the answer is correct either way. It is exposed so a
-        # solver that fights the pin can be diagnosed instead of hidden, which
-        # is what the old self-referential residual made impossible.
         if freeze:
             ya = self._Y[i].getArray()
-            # abs() rather than numpy.abs: the builtin dispatches elementwise
-            # on the array, so this needs no import. len(local) can be 0 on a
-            # rank owning none of the field's dofs, where .max() would raise.
             self._frozen_drift = (
                 float(abs(ya[local] - self._frozen_target).max()) if len(local) else 0.0
             )
@@ -1254,12 +813,7 @@ class ARKSSP:
         reason = snes.getConvergedReason()
         if reason < 0:
             # petsc4py exposes no PETSc.ERR_* constants, so signal with
-            # Firedrake's own exception. step()'s attempt loop catches this
-            # specific exception around _take_stages, rejects the attempt
-            # to the adapt loop (shrinking h by ts_adapt_scale_solve_failed)
-            # and retries, only letting it propagate once retries are
-            # exhausted -- see the comment there for the PETSc mechanism
-            # this mirrors.
+            # Firedrake's own exception.
             raise ConvergenceError(f"stage {i} SNES diverged, reason {reason}")
         self._Y[i].copy(self._Ydot[i])
         self._Ydot[i].axpy(-1.0, self._Z)
@@ -1268,18 +822,13 @@ class ARKSSP:
             # A frozen row's implicit function is M_k Ydot_k alone (that is
             # what explicitly_governed_fields certifies), so its stage
             # equation is M_k Ydot_k = 0 and the correct derivative is
-            # exactly zero. The generic (Y_i - Z_i) * shift formula above
-            # instead gives the discarded limiter correction amplified by
-            # 1/h -- the same At_ji/At_ii-style amplification this project
-            # exists to eliminate, re-entering through Ydot rather than Y.
-            # It would otherwise reach other rows' dF/du_t dependence on
-            # this field via xdot in formSNESFunction/formSNESJacobian.
+            # exactly zero.
             self._Ydot[i].getArray()[local] = 0.0
 
     def _complete(self, tab, x, h):
         """x^{n+1}.
 
-        Three cases, and the distinction is not cosmetic:
+        Three cases:
 
         * Stiffly accurate (b == A[-1] and bt == At[-1]): the completion IS the
           last stage value, which already carries the implicit contribution.
@@ -1291,7 +840,7 @@ class ARKSSP:
           is manifestly a convex combination.
         * Neither: a non-stiffly-accurate tableau WITH an implicit part would
           need the Butcher implicit completion, which the Shu-Osher form cannot
-          express. Refuse rather than silently drop it.
+          express.
         """
         s = len(tab.b)
         if tab.stiffly_accurate:
@@ -1314,7 +863,7 @@ class ARKSSP:
             f"tableau {tab.name!r} is neither stiffly accurate nor purely "
             "explicit. Its completion needs the implicit weights bt, which the "
             "Shu-Osher form cannot express, so the implicit contribution would "
-            "be silently dropped. Use a stiffly accurate tableau."
+            "be dropped. Use a stiffly accurate tableau."
         )
 
     # -- SNES callbacks -------------------------------------------------------
@@ -1343,13 +892,7 @@ class ARKSSP:
         if self._freeze_active():
             # zeroRows clears the row but leaves the column alone -- correct
             # here, since other (non-frozen) rows must still see the pinned
-            # unknown's coefficient; zeroing the column too would silently
-            # change the equations those rows solve. But it does break
-            # symmetry even where the caller's un-frozen operator was
-            # symmetric, and there is no check for that: a caller running
-            # -ksp_type cg against a problem that was symmetric before this
-            # freeze applied gets an asymmetric operator with no error, just
-            # a solver that may stagnate or converge to the wrong answer.
+            # unknown's coefficient.
             A.zeroRows(self._frozen_rows, diag=1.0)
             if B is not None and B.handle != A.handle:
                 B.zeroRows(self._frozen_rows, diag=1.0)

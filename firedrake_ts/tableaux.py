@@ -45,21 +45,12 @@ def butcher_to_K(A, b):
     return K
 
 
-# Tolerance on the monotonicity coefficients ``M^-1 K`` and ``M^-1 e``. At
-# ``r == R(A, b)`` some coefficient is mathematically exactly zero, so this
-# absorbs the rounding of that zero; measured worst case across all four
-# registered tableaux is -1e-13. Applied to ``M^-1 K`` and NOT to
-# ``P = r M^-1 K``, so that ``shu_osher`` tests exactly the quantity
-# ``kraaijevanger_radius`` bisected on -- see the note in ``shu_osher``.
+# Tolerance on the monotonicity coefficients ``M^-1 K`` and ``M^-1 e``.
 _MONOTONE_TOL = 1e-13
 
 
 def _shu_osher_raw(K, r):
     """``(M^-1 K, M^-1 e)`` for ``M = I + rK``, or ``None`` if ``M`` is singular.
-
-    The single implementation behind both ``_monotone_at`` and ``shu_osher``,
-    so the predicate that chooses a radius and the predicate that enforces it
-    cannot drift apart.
 
     Solves rather than inverting (as ``stability_function`` already does),
     and tests conditioning rather than ``|det|``: the determinant scales as
@@ -124,14 +115,6 @@ def shu_osher(A, b, r):
         raise ShuOsherError(f"I + rK is singular at r = {r!r}")
     MinvK, q = raw
     P = r * MinvK
-    # Tested on ``M^-1 K``, not on ``P = r M^-1 K``. The default radius is
-    # ``kraaijevanger_radius``'s bisection result (ark_ssp.py:165-172), which
-    # bisects on ``M^-1 K >= -tol``; testing ``P`` against the same absolute
-    # tolerance is a test r times stricter, so for the two r = 2 tableaux this
-    # function could reject the radius the bisection had just chosen, raising
-    # "r = 2.0 exceeds the radius of absolute monotonicity R(A,b) = 2.0". The
-    # margin was 8e-17: all four registered tableaux sit at min = -9.992e-14
-    # against a -1e-13 threshold, so a different BLAS or CPU was enough.
     if MinvK.min() < -_MONOTONE_TOL or q.min() < -_MONOTONE_TOL:
         radius = kraaijevanger_radius(A, b)
         raise ShuOsherError(
@@ -149,17 +132,6 @@ class ARKTableau:
     ``A, b, bhat`` are the explicit tableau, its completion weights and its
     embedded weights; ``At, bt`` the implicit tableau and completion; ``c, ct``
     the abscissae; ``d`` the dense-output theta-coefficients.
-
-    ``eq=False`` because ``==`` on ndarray fields is ambiguous; lookup is by
-    ``name`` via ``TABLEAUX``, so content equality is never needed.
-
-    The predicates below live here, rather than being spelled out at each use
-    site, because the stepper *branches* on them (``_complete`` raises when a
-    tableau is neither stiffly accurate nor purely explicit) while
-    ``acceptance_report`` *asserts* on them -- so two open-coded copies could
-    disagree, letting a tableau pass its acceptance test and then hit the raise.
-    ``has_implicit_part`` and ``has_implicit_stage`` are genuinely different
-    questions and had been used interchangeably; they are named apart here.
     """
 
     name: str
@@ -252,7 +224,7 @@ def _t(name, A, b, bhat, At, bt, c, ct, d, order):
     )
 
 
-# Shakedown tableau: explicit Euler on G, backward Euler on F. Two stages so the
+# Explicit Euler on G, backward Euler on F. Two stages so the
 # explicit part stays strictly lower triangular while the implicit part is
 # stiffly accurate. Stage 0 is x^n exactly (c_0 = 0, both rows zero).
 _IMEX_EULER = _t(
@@ -268,7 +240,7 @@ _IMEX_EULER = _t(
     order=1,
 )
 
-# Shakedown tableau: Heun / SSPRK(2,2), explicit only. At is identically zero,
+# Heun / SSPRK(2,2), explicit only. At is identically zero,
 # so no stage requires an implicit solve.
 _SSPRK2 = _t(
     "ssprk2",
@@ -283,10 +255,10 @@ _SSPRK2 = _t(
     order=2,
 )
 
-# Production tableau: Explicit part is Ketcheson's optimal SSPRK(3,2) in
-# stiffly accurate form; implicit part a stiffly accurate, L-stable ESDIRK with
-# uniform diagonal gamma = 1/5, so PETSc passes a single shift and the shifted
-# operator is reusable across all three implicit solves. SSP radius R(A,b) = 2.
+# Explicit part is Ketcheson's optimal SSPRK(3,2) in stiffly accurate form; implicit
+# part a stiffly accurate, L-stable ESDIRK with uniform diagonal gamma = 1/5, so PETSc
+# passes a single shift and the shifted operator is reusable across all three implicit
+# solves. SSP radius R(A,b) = 2.
 _ESDIRK_GAMMA5 = _t(
     "esdirk_gamma5",
     A=[
@@ -310,7 +282,7 @@ _ESDIRK_GAMMA5 = _t(
     order=2,
 )
 
-# Production tableau: Same explicit part as esdirk_gamma5; implicit diagonals
+# Same explicit part as esdirk_gamma5; implicit diagonals
 # are distinct (1/6, 1/5, 1/4), so there is no operator reuse across stages.
 # Larger joint region (1.200 vs 1.050) but smaller explicit-axis radius. Kept
 # as fallback if the uniform-gamma variant conditions badly in practice.

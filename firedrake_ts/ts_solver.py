@@ -83,16 +83,10 @@ class DAEProblem:
         :param tspan: the tuple for start time and end time
         :param time: the :class:`.Constant` for time-dependent weak forms
         :param bcs: the boundary conditions (optional)
-        :param J: the complete Jacobian ``J = sigma*dF/du̇ + dF/du``
-                 (optional). Either a form, or -- preferably -- a callable
-                 taking the shift ``sigma`` and returning the form, e.g.
-                 ``J=lambda sigma: sigma * mass + stiffness``. ``sigma`` is a
-                 :class:`.Constant` this class owns and reassigns before every
-                 Jacobian evaluation, so a plain form has no way to depend on
-                 it: passing ``derivative(F, u)`` gives a Newton matrix with
-                 no mass term, which is singular for a pure ODE. Use the
-                 callable form unless the Jacobian genuinely has no
-                 ``dF/du̇`` part.
+        :param J: the Jacobian ``J = sigma*dF/du̇ + dF/du`` (optional).
+                 Either a form, or a callable taking the shift ``sigma`` and
+                 returning the form, e.g.
+                 ``J=lambda sigma: sigma * mass + stiffness``.
         :param Jp: a form used for preconditioning the linear system,
                  optional, if not supplied then the Jacobian itself
                  will be used. Accepts the same callable-of-``sigma`` form
@@ -136,17 +130,6 @@ class DAEProblem:
         # timeshift value provided by the solver
         self.shift = Constant(1.0)
 
-        # A supplied J is already the complete Jacobian
-        # sigma*dF/du_t + dF/du, per the docstring above -- re-adding the
-        # shift*dF/du_t term here would double the mass contribution. Only
-        # derive it from the residual when the caller didn't supply one.
-        #
-        # The shift is this Constant, created here and reassigned before every
-        # Jacobian evaluation, so a caller passing a bare form has no way to
-        # reference it and can only ever supply a J with the wrong (or no)
-        # mass term -- which for a pure ODE, where dF/du is zero, is singular.
-        # Hence the callable form: J may be a function of the shift, which
-        # makes the dependency expressible and impossible to forget.
         self.J = self._resolve_jacobian(
             J,
             default=lambda: (
@@ -167,14 +150,7 @@ class DAEProblem:
         self._constant_rhs_jacobian = False
 
     def _resolve_jacobian(self, J, default=None):
-        """A supplied Jacobian, calling it with the shift if it is a factory.
-
-        The already-a-Jacobian check comes FIRST, and covers the same types
-        ``check_pde_args`` accepts. Both are callable in their own right --
-        ``ufl.Form.__call__`` does argument substitution, and
-        ``slate.TensorBase`` defines ``__call__`` too -- so a bare
-        ``callable(J)`` test would invoke the form instead of using it.
-        """
+        """A supplied Jacobian, calling it with the shift if it is a factory."""
         if J is None:
             return default() if default is not None else None
         if isinstance(J, (ufl.BaseForm, slate.TensorBase)):
@@ -230,9 +206,7 @@ class DAESolver(OptionsManager):
                ``G`` is projected through a mass matrix solve. Only meaningful
                when the problem supplies a ``G``; not supported as False in
                that case, since an unprojected ``G`` is a raw dual vector
-               while a TS's ``RHSFunction`` is a state-space derivative, so
-               the result would be silently wrong by a factor of the mass
-               matrix.
+               while a TS's ``RHSFunction`` is a state-space derivative.
         :kwarg rhs_projection_parameters: Solver parameters for that mass
                matrix solve, as a dict mapping PETSc options to values.
                Defaults to a direct solve. These may equivalently be set from
@@ -433,23 +407,6 @@ class DAESolver(OptionsManager):
            If bounds are provided the ``snes_type`` must be set to
            ``vinewtonssls`` or ``vinewtonrsls``.
         """
-        # Checked eagerly, in plain Python, rather than left to fire the
-        # first time the RHS callback runs: a Python exception raised
-        # inside a TS callback reaches ``self.ts.solve()`` as a generic
-        # ``PETSc.Error`` (see the recovery comment below), not as itself,
-        # for any TS type but the ``TSPYTHON`` stepper that stashes its own.
-        # ``arkimex`` is a builtin type, so that recovery does not apply,
-        # and this check needs to raise before the callback boundary.
-        #
-        # Inside inserted_options(), because the check forces the
-        # _algebraic_fields cached_property, which reads
-        # -ts_algebraic_fields from the options database via resolve_fields.
-        # Options passed in solver_parameters only enter that database here,
-        # and OptionsManager deletes them again on exit -- so running the
-        # check outside meant the documented override was silently ignored
-        # AND cached wrong for the rest of the solve, stamping unit
-        # diagonals on the wrong rows of dF/du_t. It worked from the command
-        # line only, which is not a distinction any caller would expect.
         with self.inserted_options():
             self._ctx._check_G_vanishes_on_algebraic_rows()
 
@@ -496,9 +453,6 @@ class DAESolver(OptionsManager):
                     # So the stepper records its own exception and we
                     # re-raise that, which keeps PETSc's printed C-stack
                     # diagnostics intact.
-                    # Only PETSC_ERR_PYTHON can be a stashed Python exception.
-                    # Without this gate, any C-level PETSc failure would be
-                    # reported as whatever the stepper last stashed.
                     original = (
                         self._python_stepper_error()
                         if exc.ierr == _PETSC_ERR_PYTHON
@@ -521,25 +475,11 @@ class DAESolver(OptionsManager):
             return None
 
     def _python_stepper_error(self):
-        """The exception a TSPYTHON stepper recorded, if any.
-
-        Only ``TSPYTHON``-type steppers stash their own exceptions (see
-        ``ARKSSP._error``); anything else -- including a non-Python TS, or
-        a Python context that doesn't record errors -- yields ``None``.
-        """
+        """The exception a TSPYTHON stepper recorded, if any."""
         return getattr(self._python_stepper_context(), "_error", None)
 
     def _clear_python_stepper_error(self):
-        """Drop any stashed exception before a solve.
-
-        ``ARKSSP`` clears ``_error`` at the top of ``setUp`` and ``step``, but
-        neither runs again on a second ``solve()`` of an already-set-up TS. A
-        failure raised outside ``step()`` on that second solve -- from a
-        raising ``monitor_callback``, an event handler or ``TSTrajectory`` --
-        would otherwise be reported as the FIRST solve's exception, with a
-        misleading ``from`` chain. Cleared by the caller so this does not
-        depend on the callee's own housekeeping.
-        """
+        """Drop any stashed exception before a solve."""
         context = self._python_stepper_context()
         if getattr(context, "_error", None) is not None:
             context._error = None
