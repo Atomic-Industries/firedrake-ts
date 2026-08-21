@@ -2,7 +2,8 @@ from functools import cached_property
 from itertools import chain
 
 import numpy
-from firedrake import cofunction, dmhooks, function
+import ufl
+from firedrake import cofunction, dmhooks, function, ufl_expr
 from firedrake.assemble import get_assembler
 from firedrake.exceptions import ConvergenceError
 from firedrake.formmanipulation import ExtractSubBlock
@@ -10,8 +11,113 @@ from firedrake.petsc import DEFAULT_KSP_PARAMETERS, PETSc
 from firedrake.solving_utils import _make_reasons, _SNESContext
 from petsctools import OptionsManager
 from pyop2 import op2
+from ufl.algorithms import expand_derivatives
 
 TSReasons = _make_reasons(PETSc.TS.ConvergedReason())
+
+
+def is_zero_form(form):
+    """Is ``form`` structurally zero?
+
+    ``derivative()`` applied to a form with no dependence on the coefficient
+    returns a ``Form`` carrying one symbolically-zero integral, so ``empty()``
+    is False until ``expand_derivatives`` has folded it away. Skipping the
+    expansion makes every predicate below report "non-zero" for everything.
+
+    Structural, not numerical: a coefficient that happens to vanish at t = 0
+    must not be mistaken for an absent operator.
+    """
+    if form is None or isinstance(form, ufl.ZeroBaseForm):
+        return True
+    expanded = expand_derivatives(form)
+    if isinstance(expanded, ufl.ZeroBaseForm):
+        return True
+    return bool(expanded.empty())
+
+
+def nonzero_rows(form, nfields):
+    """Which test-function components of ``form`` carry any integral."""
+    splitter = ExtractSubBlock()
+    return tuple(
+        i
+        for i in range(nfields)
+        if not is_zero_form(splitter.split(form, argument_indices=(i,)))
+    )
+
+
+def _classify_rows(F, u, udot, nfields):
+    """Per row: (has time derivative, has implicit operator).
+
+    A component whose test function never appears in ``F`` at all has no
+    equation of its own -- the DAE is underdetermined for that component --
+    so it is a hard error.
+    """
+    splitter = ExtractSubBlock()
+    rows = {i: splitter.split(F, argument_indices=(i,)) for i in range(nfields)}
+    missing = [i for i, row in rows.items() if is_zero_form(row)]
+    if missing:
+        raise ValueError(
+            f"component(s) {missing} have no residual row: their test "
+            f"functions do not appear in F at all, so the problem is "
+            f"underdetermined. Every component of a mixed space being "
+            f"solved for needs an equation."
+        )
+    return {
+        i: (
+            not is_zero_form(ufl_expr.derivative(row, udot)),
+            not is_zero_form(ufl_expr.derivative(row, u)),
+        )
+        for i, row in rows.items()
+    }
+
+
+def algebraic_fields(F, u, udot, nfields):
+    """Components whose residual row has no time derivative.
+
+    The mass matrix ``dF/du_t`` is structurally zero on these rows, so the
+    right-hand-side projection is undefined there. ``G`` must vanish on them.
+    """
+    rows = _classify_rows(F, u, udot, nfields)
+    return tuple(i for i, (has_dot, _) in rows.items() if not has_dot)
+
+
+def explicitly_governed_fields(F, u, udot, nfields):
+    """Components with no implicit operator acting on them.
+
+    ``dF/du`` is structurally zero on these rows, so the implicit stage
+    equation reduces to ``Y_i = Z_i``: the stage value is fully determined by
+    the explicit recursion and can be limited to preserve monotonicity.
+    """
+    rows = _classify_rows(F, u, udot, nfields)
+    return tuple(i for i, (_, has_implicit) in rows.items() if not has_implicit)
+
+
+def field_rows(problem, fields):
+    """Global row indices of the given component indices of a mixed space."""
+    if not len(fields):
+        return None
+    ises = problem.J.arguments()[0].function_space()._ises
+    rows = numpy.concatenate([ises[i].getIndices() for i in fields])
+    return rows.astype(PETSc.IntType)
+
+
+def resolve_fields(option, prefix, detected, nfields=None):
+    # int() per element, not just tuple(): getIntArray hands back numpy
+    # integers, which index correctly but make this path's return type differ
+    # from the structural detection it overrides -- and render in the error
+    # below as "[np.int32(2)]" rather than "[2]".
+    values = tuple(
+        int(i) for i in PETSc.Options(prefix or "").getIntArray(option, list(detected))
+    )
+    if nfields is not None:
+        bad = [i for i in values if not 0 <= i < nfields]
+        if bad:
+            raise ValueError(
+                f"-{prefix or ''}{option} names component(s) {bad}, which are "
+                f"outside the {nfields} component(s) of this problem. Valid "
+                f"indices are 0..{nfields - 1}."
+            )
+    return values
 
 
 def check_ts_convergence(ts):
@@ -59,7 +165,11 @@ class _TSContext(_SNESContext):
         after residual assembly
     :arg options_prefix: The options prefix of the TS.
     :arg project_rhs: If True the right-hand-side term is projected using a
-        mass matrix solver.
+        mass matrix solver. Not supported as False when ``G`` is supplied:
+        an unprojected ``G`` is a raw dual vector, but a TS treats
+        ``RHSFunction`` as a state-space derivative, so the result would be
+        silently wrong by a factor of the mass matrix. Meaningful only
+        (and inert) when ``G`` is ``None``.
     :arg rhs_projection_parameters: Solver parameters of the right-hand-side
         projection solver.
     :arg transfer_manager: Object that can transfer functions between
@@ -116,6 +226,11 @@ class _TSContext(_SNESContext):
         self.bcs_dGdu = tuple(bc.extract_form("J") for bc in problem.bcs)
 
         if self.G is not None:
+            if not project_rhs:
+                raise ValueError(
+                    "project_rhs=False hands PETSc the raw dual G, but a TS "
+                    "treats RHSFunction as a state-space derivative."
+                )
             self._assemble_rhs_residual = get_assembler(
                 self.G,
                 bcs=self.bcs_G,
@@ -182,7 +297,7 @@ class _TSContext(_SNESContext):
         for field in fields:
             F = splitter.split(problem.F, argument_indices=(field,))
             J = splitter.split(problem.J, argument_indices=(field, field))
-            us = problem.u.subfunctions
+            us = problem.u_restrict.subfunctions
             V = F.arguments()[0].function_space()
             # Exposition:
             # We are going to make a new solution Function on the sub
@@ -226,16 +341,16 @@ class _TSContext(_SNESContext):
             # solving for, and some spaces that have just become
             # coefficients in the new form.
             u = as_vector(vec)
-            F = replace(F, {problem.u: u})
-            J = replace(J, {problem.u: u})
+            F = replace(F, {problem.u_restrict: u})
+            J = replace(J, {problem.u_restrict: u})
             if problem.Jp is not None:
                 Jp = splitter.split(problem.Jp, argument_indices=(field, field))
-                Jp = replace(Jp, {problem.u: u})
+                Jp = replace(Jp, {problem.u_restrict: u})
             else:
                 Jp = None
             if problem.G is not None:
                 G = splitter.split(problem.G, argument_indices=(field,))
-                G = replace(G, {problem.u: u})
+                G = replace(G, {problem.u_restrict: u})
             else:
                 G = None
             bcs = []
@@ -467,15 +582,171 @@ class _TSContext(_SNESContext):
         return function.Function(self.G.arguments()[0].function_space())
 
     @cached_property
-    def _rhs_projection_mass_matrix(self):
-        r"""The mass matrix ``dF/du_t``, assembled once.
+    def _nfields(self):
+        V = self._problem.u_restrict.function_space()
+        return len(V) if len(V) > 1 else 1
 
-        Held on the context so it outlives the ``KSP`` that takes it as an
-        operator.
+    @cached_property
+    def _row_classification(self):
+        """Structural characteristics per row, cached:
+
+        ``{row: (has time derivative, has implicit operator)}``
         """
-        from firedrake import assemble, ufl_expr
+        return _classify_rows(
+            self._problem.F,
+            self._problem.u_restrict,
+            self._xdot,
+            self._nfields,
+        )
 
-        return assemble(ufl_expr.derivative(self.F, self._xdot), bcs=self.bcs_F)
+    @cached_property
+    def _algebraic_fields(self):
+        """Components with no time derivative, so no invertible mass block."""
+        if self._nfields == 1:
+            return ()
+        detected = tuple(
+            i for i, (has_dot, _) in self._row_classification.items() if not has_dot
+        )
+        return resolve_fields(
+            "ts_algebraic_fields", self.options_prefix, detected, self._nfields
+        )
+
+    @cached_property
+    def _explicitly_governed_fields(self):
+        """Components with no implicit operator, so limitable stage values.
+
+        The sibling of ``_algebraic_fields``, held here rather than derived in
+        the stepper so both halves of the partition have one owner and one
+        cache -- see ``_row_classification``.
+
+        Unlike ``_algebraic_fields`` this has NO ``nfields == 1`` shortcut. A
+        single-field problem whose ``F`` is mass-only is explicitly governed on
+        its one row, and that is the central case: it is what ``test_bounds``
+        runs, and returning ``()`` there disables the freeze and makes
+        ``_check_limiter_soundness`` reject every limiter.
+        """
+        detected = tuple(
+            i
+            for i, (_, has_implicit) in self._row_classification.items()
+            if not has_implicit
+        )
+        return resolve_fields(
+            "ts_explicitly_governed_fields",
+            self.options_prefix,
+            detected,
+            self._nfields,
+        )
+
+    def _check_G_vanishes_on_algebraic_rows(self):
+        if self.G is None or not self._algebraic_fields:
+            return
+        offending = set(nonzero_rows(self.G, self._nfields)) & set(
+            self._algebraic_fields
+        )
+        if offending:
+            raise ValueError(
+                f"G is nonzero on algebraic component(s) {sorted(offending)}, "
+                f"whose rows of dF/du_t are structurally zero. The mass "
+                f"projection M^-1 G is undefined there. Move those terms into "
+                f"the implicit residual F, or give those components a time "
+                f"derivative."
+            )
+
+    @cached_property
+    def _rhs_projection_mass_form(self):
+        r"""The form ``dF/du_t``, built once and assembled repeatedly.
+
+        Separated from the tensor it assembles into so that
+        ``_reassemble_rhs_projection_mass_matrix`` does not rebuild the UFL
+        every call: the form is fixed, only the coefficient values it closes
+        over change.
+        """
+        return ufl_expr.derivative(self.F, self._xdot)
+
+    @cached_property
+    def _rhs_projection_mass_assembler(self):
+        r"""The assembler for ``dF/du_t``, built once and called per stage.
+
+        This caches no value of the operator. ``get_assembler`` caches the
+        compiled kernel and parloop wiring for a fixed form; each
+        ``assemble`` call re-reads the coefficients' current ``dat`` values
+        and re-executes the parloop, which is what
+        ``_SNESContext._assemble_residual`` does for every Newton residual.
+        The only invariant required is that the form object and ``bcs_F`` are
+        fixed for the solve, which ``_rhs_projection_mass_form`` being a
+        ``cached_property`` already commits to. Contrast
+        ``_reassemble_rhs_projection_mass_matrix``, which must stay
+        unconditional.
+        """
+        return get_assembler(self._rhs_projection_mass_form, bcs=self.bcs_F)
+
+    def _apply_algebraic_unit_diagonal(self, mass):
+        """Give algebraic rows of ``mass`` a unit diagonal, in place.
+
+        On algebraic components ``dF/du_t`` is structurally zero, so a plain
+        solve would hit a zero pivot. ``G`` is guaranteed zero on those rows
+        (``_check_G_vanishes_on_algebraic_rows``), so the projected result is
+        zero on them either way and a unit diagonal simply makes the operator
+        invertible. Must be re-applied after every assembly, since a fresh
+        assembly zeroes those rows out again.
+        """
+        if self._algebraic_rows is None:
+            return
+        mass.petscmat.zeroRows(self._algebraic_rows, diag=1.0)
+
+    @cached_property
+    def _algebraic_rows(self):
+        """Global rows of the algebraic components, or ``None`` if there are none.
+
+        Cached: the row set is fixed once the space is, and
+        ``_apply_algebraic_unit_diagonal`` runs once per stage per step, where
+        it had been rebuilding the concatenation from ``_ises`` every time.
+        """
+        return field_rows(self._problem, self._algebraic_fields)
+
+    @cached_property
+    def _rhs_projection_mass_matrix(self):
+        r"""The tensor holding the mass matrix ``dF/du_t``.
+
+        This property performs only the FIRST, allocating assembly. The
+        operator is NOT constant in general, and is reassembled in place at
+        the current ``(t, u)`` before every projection solve -- see
+        ``_reassemble_rhs_projection_mass_matrix``, which
+        ``_assemble_projected_rhs_residual`` calls unconditionally.
+
+        Held on the context so the tensor outlives the ``KSP`` that takes it
+        as an operator, and so that in-place reassembly reaches that ``KSP``
+        without a further ``setOperators``.
+        """
+        self._check_G_vanishes_on_algebraic_rows()
+        mass = self._rhs_projection_mass_assembler.allocate()
+        self._rhs_projection_mass_assembler.assemble(tensor=mass)
+        self._apply_algebraic_unit_diagonal(mass)
+        return mass
+
+    def _reassemble_rhs_projection_mass_matrix(self):
+        r"""Reassemble the projection operator ``M = dF/du_t`` at ``(t, u)``.
+
+        ``M^-1 G`` is only the intended projection when ``M`` is evaluated at
+        the same state ``G`` is: the explicit slope wanted at stage ``j`` is
+        ``M(t_j, Y_j)^-1 G(t_j, Y_j)``. ``form_rhs_function`` copies the
+        incoming stage state into ``ctx._x`` and assigns ``ctx._time`` before
+        calling ``_assemble_projected_rhs_residual``, so assembling here picks
+        up exactly that ``(t_j, Y_j)``.
+
+        Called unconditionally, NOT gated on any structural test of whether
+        ``M`` actually varies.
+
+        Reassembles into the existing tensor rather than allocating a fresh
+        one: same sparsity, and the same PETSc handle the ``KSP`` already
+        holds as its operator, so no ``setOperators`` is needed -- PETSc's
+        assembly bumps the ``Mat``'s state counter, which is what tells the
+        ``KSP`` its factorisation is stale.
+        """
+        mass = self._rhs_projection_mass_matrix
+        self._rhs_projection_mass_assembler.assemble(tensor=mass)
+        self._apply_algebraic_unit_diagonal(mass)
+        return mass
 
     @cached_property
     def _rhs_projection_options(self):
@@ -522,6 +793,9 @@ class _TSContext(_SNESContext):
             if self.project_rhs:
                 # TODO maybe the riesz_repre is the correct way?
                 # assign(self._projected_G, self._G.riesz_representation())
+                # Before the solve, not once: M is state- and time-dependent
+                # in general, and this is the operator the KSP inverts.
+                self._reassemble_rhs_projection_mass_matrix()
                 ksp = self._rhs_projection_solver
                 with (
                     self._rhs_projection_options.inserted_options(),
