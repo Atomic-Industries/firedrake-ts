@@ -2,6 +2,9 @@ repos:
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.1
     hooks:
+    # types_or overrides the hooks' default of Python files only
     - id: ruff-check
       args: [--fix]
+      types_or: [python, pyi, jupyter, markdown]
     - id: ruff-format
+      types_or: [python, pyi, jupyter, markdown]
