@@ -27,16 +27,6 @@ def _decay(extra, dt=1e-2):
     return solver, float(u.dat.data_ro[0])
 
 
-# "The shim resolves the TSAdapt symbols" had its own test, asserting
-# ts_get_adapt(ts) is not None on a solver it built for the purpose. Every
-# adaptive test below reaches that symbol first: ark_ssp.py:776 calls
-# ts_get_adapt at the top of the adaptive branch, before the
-# candidates_clear/candidate_add/choose sequence, so an unresolved symbol
-# fails test_adapt_basic_selects_steps and
-# test_adapt_choose_is_told_whether_the_last_attempt_failed -- the latter of
-# which additionally asserts ts_adapt_choose was called at all.
-
-
 def test_evaluatestep_gives_the_embedded_solution():
     """Order p and order p-1 completions must differ, and both be sane."""
     solver, _ = _decay({"ts_adapt_type": "none"}, dt=0.1)
@@ -79,23 +69,6 @@ def test_exhausted_rejections_raises_convergence_error():
     sized to fail its only attempt (an oversized initial guess against a
     tight tolerance) must surface as a clean ConvergenceError rather than
     silently continuing or hanging.
-
-    ts_error_if_step_fails=False is needed for this to route through
-    firedrake_ts's own check_ts_convergence (the ConvergenceError this
-    checks for): PETSc's own default is to raise a bare PETSc.Error out of
-    TSStep() itself as soon as the converged reason goes negative, before
-    firedrake_ts ever gets a look at it.
-
-    The try/finally cleans up -ts_max_step_rejections from PETSc's global
-    options database. -ts_max_reject is deprecated (ts.c:133) and its
-    TSSetFromOptions handler migrates it to -ts_max_step_rejections *in the
-    global database itself* via PetscOptionsSetValue, one level outside
-    whatever scope DAESolver's own OptionsManager pops on exit -- verified
-    empirically: every other key this test sets is gone from
-    PETSc.Options() once _decay() returns, but -ts_max_step_rejections=0
-    alone survives, and left in place it starves the very next unrelated
-    adaptive TS's own first legitimate step rejection, elsewhere in this
-    suite.
     """
     from firedrake.petsc import PETSc
 
@@ -134,42 +107,6 @@ def test_adapt_choose_is_told_whether_the_last_attempt_failed():
 
         if (enorm > 1) {
           if (!*accept) safety *= adapt->reject_safety;
-
-    (``adaptbasic.c:41-42``; ``reject_safety`` defaults to 0.5,
-    ``tsadapt.c:1152``.) ``safety`` then scales the returned step through
-    ``hfac_lte = safety * enorm^(-1/order)``, so seeding it wrong changes the
-    answer -- but only on a step that is actually being rejected, which is
-    why this needs a tolerance tight enough to force one.
-
-    The shim passed a fresh zero-initialised ``c_int`` every call, i.e.
-    PETSC_FALSE, so PETSc always believed the previous attempt had failed and
-    applied the extra factor on FIRST rejections too. PETSc's own loop
-    declares ``accept = PETSC_TRUE`` once per step (``arkimex.c:1343``) and
-    clears it at ``reject_step`` (``:1529``).
-
-    SCOPE, measured: the effect is often absorbed entirely. ``hfac_lte`` is
-    clipped to ``adapt->clip``, default ``[0.1, 10]``, so the extra factor
-    only reaches ``next_h`` while ``safety * reject_safety *
-    enorm^(-1/order)`` stays above 0.1 -- for order 3 and the defaults
-    ``safety = 0.9``, ``reject_safety = 0.5`` (``tsadapt.c:1150-1153``) that
-    means ``enorm`` below roughly 91. A badly oversized step has ``enorm``
-    far above that and both seedings clip to the same floor: with the default
-    clip this test measures ratios ``[1.0, 1.0, 1.0, 0.654]`` across four
-    rejections -- no difference at all on the first three, and a partly
-    clipped 0.654 rather than 0.5 on the last. So this is a real but narrow
-    step-size inefficiency on mildly rejected steps, NOT a systematic
-    halving of every first rejection.
-
-    ``ts_adapt_clip`` is widened below purely to take the clip out of the
-    measurement, so the assertion can pin the exact factor rather than
-    whatever the clip leaves of it.
-
-    Both halves are checked: that the stepper threads True into the first
-    call of a step and False into a retry, and that PETSc's answer actually
-    differs between the two seedings by the reject_safety factor. Calling
-    TSAdaptChoose twice per rejection is side-effect-free here -- the only
-    state it mutates is ``timestepjustdecreased``, which this stepper never
-    sets, since it bypasses TSAdaptCheckStage.
     """
     from firedrake_ts import ark_ssp
 

@@ -66,24 +66,7 @@ def test_fieldsplit_solve_runs(with_G):
 
 
 def test_supplied_jacobian_is_not_doubled():
-    r"""A ``DAEProblem`` given an explicit ``J`` must use it as-is.
-
-    ``DAEProblem.__init__`` documents ``J`` as the *complete* Jacobian
-    ``sigma*dF/du_t + dF/du`` (see its ``:param J:`` docstring). A prior bug
-    re-added ``shift*dF/du_t`` unconditionally even when ``J`` was supplied.
-    Note this does NOT produce a doubled ``6*M + K`` from a supplied
-    ``J = 3*M + K``: the stray term the old code added was
-    ``supplied.shift * M``, where ``supplied.shift`` is a *fresh*, unassigned
-    ``Constant(1.0)`` on the second ``DAEProblem`` below -- a different
-    ``Constant`` from ``reference.shift`` (set to 3.0 to bake ``3*M + K``
-    into ``reference.J`` in the first place). Reverting the fix on this
-    exact test reproduces ``4*M + K``, not ``6*M + K``. ``_TSContext.split()``
-    always supplies a ``J`` for its per-field sub-problems, so this
-    corrupted the mass block of every fieldsplit sub-block Jacobian -- with
-    no exception and no visible failure, just a preconditioner built from
-    the wrong matrix. Regressing this fix would reintroduce that silent
-    corruption.
-    """
+    r"""A ``DAEProblem`` given an explicit ``J`` must use it as-is."""
     u, udot, v = scalar_problem(cells=8)
     du = TrialFunction(u.function_space())
 
@@ -104,22 +87,12 @@ def test_supplied_jacobian_is_not_doubled():
     expected = assemble(3.0 * mass + stiffness).petscmat
     actual = assemble(supplied.J).petscmat
 
-    # THE assertion: a supplied J must survive unmodified. Discriminating on
-    # its own -- the pre-fix code gave 4*M + K here, not 3*M + K -- so no
-    # second assertion against an (inaccurate) doubled value is needed.
+    # THE assertion: a supplied J must survive unmodified.
     assert (actual - expected).norm() < 1e-10
 
 
 def test_supplied_jacobian_of_the_shift_solves_a_pure_ode():
-    """A caller-supplied J must be usable on a problem where dF/du is zero.
-
-    u' = -u with the whole operator in G: dF/du is structurally zero, so the
-    only Newton matrix that works is sigma*M. Passing a bare form -- the only
-    thing the API accepted before -- could not reference the shift, so the
-    best a caller could do was ``derivative(F, u)``, i.e. the zero matrix,
-    and the stage solve had nothing to invert. This is the case that proves
-    the callable route is not merely tidier but necessary.
-    """
+    """A caller-supplied J must be usable on a problem where dF/du is zero."""
     u, udot, v = scalar_problem()
     du = TrialFunction(u.function_space())
 

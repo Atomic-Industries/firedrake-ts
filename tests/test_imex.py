@@ -10,20 +10,7 @@ EXACT = EXACT_DECAY  # solution of u' = -u at t = 1
 
 
 def _decay(tableau="3", dt=1e-2, split=True):
-    """Integrate ``u' = -u`` to t = 1, with ``-u`` explicit when ``split``.
-
-    dt=1e-2 rather than 1e-3: measured errors against EXACT are 4.8e-9 ("3"),
-    3.0e-6 ("2c"), 6.2e-6 ("a2") and 3.1e-6 ("prssp2"), i.e. 16x to 20000x
-    inside the abs=1e-4 that test_imex_advances_solution asserts, for a tenth
-    of the steps.
-
-    ``matchstep``, not ``stepover``: with ``stepover`` the accuracy assertions
-    silently depend on dt dividing tmax exactly. At dt=3e-3 all four tableaux
-    report err=7.35e-4 identically -- that is the overshoot to t=1.002, not
-    method error, and it would read as a method regression. 1e-2 and 1e-3 both
-    divide 1.0, so this changes nothing today; it stops the next dt change
-    from having to know that.
-    """
+    """Integrate ``u' = -u`` to t = 1, with ``-u`` explicit when ``split``."""
     u, u_t, v = scalar_problem()
     if split:
         F, G = inner(u_t, v) * dx, -inner(u, v) * dx
@@ -84,13 +71,7 @@ def test_imex_stage_solves_use_the_dae_callbacks():
 
 
 def test_implicit_path_matches_imex_path():
-    """Splitting a term into G must not change the answer beyond method error.
-
-    Only the monolithic solve runs here. The split one is
-    test_imex_advances_solution["3"], which already pins it to within 1e-4 of
-    EXACT, so anchoring the monolithic result to EXACT gives the same claim by
-    transitivity instead of running the split path a third time.
-    """
+    """Splitting a term into G must not change the answer beyond method error."""
     _, monolithic = _decay(split=False)
     assert abs(monolithic - EXACT) < 1e-3
 
@@ -128,12 +109,6 @@ def _nonconstant_mass(kind, dt, tableau="3"):
     of ``ln u + u = 0``, i.e. the omega constant ``0.5671432904...``. For
     ``M = 1 + t``: ``du/u = -dt/(1 + t)`` gives ``u = 1/(1 + t)``, so
     ``u(1) = 1/2``.
-
-    ``matchstep`` rather than ``stepover``: ten steps of 0.1 overshoot 1.0 by
-    one rounding, and ``stepover`` then takes a whole extra step to t = 1.1,
-    which shows up as a spurious dt-dependent error (``|1/2.1 - 1/2|`` =
-    2.4e-2 for ``kind="t"``) that swamps the discretisation error being
-    measured.
     """
     u, u_t, v = scalar_problem()
     time = Constant(0.0)
@@ -163,19 +138,6 @@ def _nonconstant_mass(kind, dt, tableau="3"):
 def test_rhs_projection_operator_is_assembled_at_the_stage_state(kind, exact):
     """``L_j = M^-1 G(Y_j)`` must invert ``M(t_j, Y_j)``, not ``M(t^0, y^0)``.
 
-    ``_TSContext._rhs_projection_mass_matrix`` used to be a plain
-    ``@cached_property`` -- "the mass matrix dF/du_t, assembled once" -- while
-    being the operator behind the explicit slope at every stage of every step.
-    For any mass matrix that is not constant (variable density, porosity,
-    saturation, a time-dependent coefficient) that inverts the operator
-    evaluated at the initial condition forever, which does not converge at
-    all: measured with the reassembly disabled, the error is flat to three
-    figures at 3.939e-02 (``kind="u"``) and 1.321e-01 (``kind="t"``) across
-    dt = 0.1, 0.05, 0.025, 0.0125 -- ratios 1.00, 1.00, 1.00 -- where
-    reassembling per stage gives the tableau's design order 3 (ratios 7.99,
-    9.73 and 8.15, 8.08). Flat, converging to the WRONG limit, with no error
-    raised.
-
     This is the IMEX path in ``_TSContext``, so it applies to PETSc's own
     ``arkimex`` (used here) exactly as much as to the Python stepper; both
     ``kind`` cases matter because a structural test for state dependence
@@ -188,6 +150,5 @@ def test_rhs_projection_operator_is_assembled_at_the_stage_state(kind, exact):
     for ratio in ratios:
         assert 6.5 < ratio < 12.0, (
             f"M({kind}): observed order ratios {ratios} from errors "
-            f"{errors}, expected ~8 (order 3); ratios near 1 mean the "
-            "projection operator is stale"
+            f"{errors}, expected ~8 (order 3)."
         )

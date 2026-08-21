@@ -90,15 +90,7 @@ def test_nonzero_rows_locates_G():
 
 
 def test_absent_residual_row_raises():
-    """A component with no equation at all is an error, not an algebraic row.
-
-    If this were silently folded into ``algebraic_fields`` it would be
-    indistinguishable downstream from a genuine algebraic row -- including
-    to code that gives algebraic rows a unit diagonal to make a projection
-    invertible. That repair does not apply to a row that plain does not
-    exist, and the failure would resurface later, further from the cause,
-    as a zero pivot with no clue why.
-    """
+    """A component with no equation at all is an error, not an algebraic row."""
     mesh = UnitIntervalMesh(4)
     V = FunctionSpace(mesh, "P", 1)
     W = V * V
@@ -116,17 +108,6 @@ def test_resolve_fields_prefers_an_explicit_override():
 
     Same pattern as -pc_fieldsplit_detect_saddle_point: detection is the
     default, not the only option.
-
-    The out-of-range rejection is checked here and nowhere else. That
-    validation exists because an index past the end otherwise surfaced as
-    ``IndexError: tuple index out of range`` from inside
-    ``_apply_algebraic_unit_diagonal`` -- far from the option that caused it --
-    and a NEGATIVE index quietly selected a field from the end instead of
-    failing, which is the dangerous half: ``-ts_algebraic_fields -1`` on a
-    three-field problem would stamp a unit diagonal on row 2 and report
-    nothing. That half cannot be reached through
-    ``test_G_vanishes_on_algebraic_rows[declared]`` below, which exercises the
-    honoured-override path.
     """
     from firedrake.petsc import PETSc
 
@@ -183,12 +164,6 @@ def _rung1(stepper, dt=1e-2, tmax=1.0):
 
     M = diag(1, 0) is genuinely singular and G vanishes on the algebraic row.
     No spatial discretisation error, so observed order is the tableau's alone.
-
-    dt=1e-2 rather than 1e-3: this helper's callers assert abs=1e-3, and the
-    measured errors at 1e-2 are 5.7e-6 (arkimex) and 3.1e-6 (arkssp) -- 176x
-    and 325x inside that -- for a tenth of the steps. It divides tmax exactly,
-    so stepover lands on 1.0 with no overshoot. No order test uses this
-    default; the convergence runs pass dt explicitly.
     """
     mesh = UnitIntervalMesh(1)
     R = FunctionSpace(mesh, "DG", 0)  # NOT "R": see the note in the brief
@@ -212,12 +187,6 @@ def _rung1(stepper, dt=1e-2, tmax=1.0):
     return float(w.sub(0).dat.data_ro[0]), float(w.sub(1).dat.data_ro[0])
 
 
-# "A singular mass matrix must not break the RHS projection" under arkimex is
-# test_rung1_dual_path[arkimex] below -- same helper, same tableau, same two
-# abs=1e-3 assertions. A standalone copy of it here was a second 1000-step run
-# of exactly that.
-
-
 @pytest.mark.parametrize(
     "which_row,extra",
     [
@@ -235,19 +204,7 @@ def test_G_vanishes_on_algebraic_rows(which_row, extra):
     detects structurally. The straightforward case.
 
     ``declared`` -- ``G`` is nonzero on row 0, which is DIFFERENTIAL, and
-    ``ts_algebraic_fields`` declares rows 0 and 1 algebraic anyway. Declaring
-    row 0 is deliberately wrong for this problem, because a correct override is
-    indistinguishable from the detected default: if the option is honoured the
-    check must reject, and if it is dropped the solve proceeds happily -- which
-    is the bug this case was written for. ``_algebraic_fields`` is a
-    ``cached_property`` reading the option out of PETSc's database via
-    ``resolve_fields``, forced eagerly by ``solve()``'s
-    ``_check_G_vanishes_on_algebraic_rows``; options from
-    ``solver_parameters`` are only in that database inside
-    ``inserted_options()``, so forcing the property outside it resolved to the
-    structural default AND cached that for the rest of the solve, silently
-    ignoring the documented override and stamping unit diagonals on the wrong
-    rows of ``dF/du_t``.
+    ``ts_algebraic_fields`` declares rows 0 and 1 algebraic anyway.
     """
     mesh = UnitIntervalMesh(1)
     R = FunctionSpace(mesh, "DG", 0)  # NOT "R": see the note in the brief
@@ -272,18 +229,9 @@ def test_G_vanishes_on_algebraic_rows(which_row, extra):
     with pytest.raises(ValueError, match="G is nonzero on algebraic"):
         solver.solve()
 
-
-# "The existing non-mixed path must be unchanged" is test_imex.py's
-# test_imex_advances_solution[2c]: same form, same tableau, same dt, same
-# abs=1e-4 tolerance, and it additionally asserts liveness and covers three
-# more tableaux. A copy of it here was strictly the weaker of the two.
-
-
 def test_project_rhs_false_is_rejected_when_G_is_supplied():
     """An unprojected G is a raw dual vector, wrong by a factor of the mass
-    matrix once a TS treats it as a state-space derivative -- no supported
-    TS type wants that, so it is rejected outright rather than left as a
-    live (and silently wrong) option.
+    matrix once a TS treats it as a state-space derivative .
     """
     mesh = UnitIntervalMesh(4)
     V = FunctionSpace(mesh, "P", 1)
@@ -335,12 +283,6 @@ def test_two_algebraic_fields_drive_the_concatenated_zero_rows():
     assert float(w.sub(2).dat.data_ro[0]) == pytest.approx(-exact_y, abs=1e-3)
 
 
-# "ts_algebraic_fields must be read from solver_parameters, not just the
-# command line" is test_G_vanishes_on_algebraic_rows[declared] above: same
-# override, same deliberately-wrong row 0, same rejection, and it reuses the
-# G-check setup instead of repeating 25 lines of it.
-
-
 @pytest.mark.parametrize("stepper", [ARKIMEX_2C, ARK_SSP_G5], ids=["arkimex", "arkssp"])
 def test_rung1_dual_path(stepper):
     """Index 1, singular mass, exact solution. Both steppers must agree."""
@@ -353,8 +295,7 @@ def _rung2(stepper, dt=1e-3, tmax=1.0):
     """Index 2, the multiplier case: ydot = z - y, 0 = y - g(t), G = -y.
 
     g(t) = exp(-t), so z = gdot + g = 0 exactly and y = exp(-t). Returns
-    (y, z, constraint_defect). The defect is what R3 stiff accuracy buys:
-    near 1e-16 with b == A[s-1,:], near 1e-3 without.
+    (y, z, constraint_defect).
     """
     mesh = UnitIntervalMesh(1)
     R = FunctionSpace(mesh, "DG", 0)  # NOT "R": see the note below
@@ -384,17 +325,6 @@ def test_stiff_accuracy_is_what_buys_the_constraint_defect():
     """R3 -- b == A[s-1,:] and bt == At[s-1,:] -- makes the completion the
     last stage value, so the constraint holds to machine precision instead
     of to O(h^p).
-
-    Asserted as a CONTRAST, not as a uniform bound, because no tableau
-    PETSc ships satisfies R3: its b = NULL default collapses the explicit b
-    onto the implicit bt, so the explicit forcing never collapses to the
-    last stage. Demanding machine precision from a built-in would be asking
-    for something the tableau cannot deliver. The gap between the two is the
-    measurable value of R3, and the reason this project registers its own
-    tableau rather than using a shipped one.
-
-    Measured at dt = 1e-2: esdirk_gamma5 at machine precision, PETSc's 2c
-    at 7.7e-06 -- about ten orders of magnitude apart.
     """
     _, _, stiffly_accurate = _rung2(ARK_SSP_G5, dt=1e-2)
     _, _, shipped = _rung2(ARKIMEX_2C, dt=1e-2)
@@ -448,17 +378,7 @@ def _rung3(stepper, dt=2e-3, tmax=0.1, n=8):
 
 @pytest.mark.parametrize("stepper", [ARKIMEX_2C, ARK_SSP_G5], ids=["arkimex", "arkssp"])
 def test_rung3_pde_with_multiplier_runs(stepper):
-    """The PDE-scale rung: real accuracy, not just liveness.
-
-    The constraint row (``u - target = 0``) pins ``u`` to ``target(x)``
-    exactly at every stage -- it is algebraic, solved by the nonlinear
-    solver's own tolerance, not subject to any O(h^p) truncation error.
-    So ``u`` must match ``target`` to close to machine precision, not
-    merely be finite and nonzero. Measured: max|u - target| ~ 1.3e-14
-    (arkimex), ~2.2e-16 (arkssp); 1e-8 leaves ample margin against SNES's
-    own default tolerances without demanding an exact discretisation
-    result the test does not otherwise control.
-    """
+    """The PDE-scale rung: real accuracy, not just liveness."""
     w, target = _rung3(stepper)
     assert np.all(np.isfinite(w.sub(0).dat.data_ro))
     assert np.all(np.isfinite(w.sub(1).dat.data_ro))
@@ -471,24 +391,7 @@ def test_rung3_pde_with_multiplier_runs(stepper):
 
 
 def test_stage0_ydot_is_zero_on_algebraic_rows():
-    """Ẏ_0 must be zero where dF/du_t is, not -F_alg(t^n, y^n, 0).
-
-    _reassemble_stage0_mass gives the algebraic rows a unit diagonal so the
-    mass matrix is invertible at all. That makes the stage-0 solve return
-    -F_alg(t^n, y^n, 0) on those rows -- not a derivative, since there is no
-    u_t in those equations -- and _build_offset then propagates it into every
-    later stage as h At_ij Ydot_j. PETSc zeroes the same rows immediately
-    after the solve that produces its own Ydot0
-    (VecISSet(Ydot0, ark->alg_is, 0.0), arkimex.c:1389).
-
-    The initial condition here is deliberately INCONSISTENT -- z(0) = 0 with
-    y(0) = 1 violates the constraint 0 = z + y by exactly 1 -- because a
-    consistent one makes the whole defect invisible: F_alg(t^0, y^0, 0) is
-    then already zero and the unfixed code writes a zero it did not mean.
-    _rung1's own y(0) = 1, z(0) = -1 is consistent, which is why no existing
-    test caught this. The assembled residual is checked below so the test
-    cannot pass vacuously.
-    """
+    """Ẏ_0 must be zero where dF/du_t is, not -F_alg(t^n, y^n, 0)."""
     from firedrake import ufl_expr  # noqa: F401
 
     mesh = UnitIntervalMesh(1)
@@ -512,13 +415,6 @@ def test_stage0_ydot_is_zero_on_algebraic_rows():
     )
     stepper = solver.ts.getPythonContext()
 
-    # Non-vacuity, ASSEMBLED before the solve advances w: F(t^0, y^0, 0)
-    # really is nonzero on the algebraic row, so the unfixed code wrote
-    # -1.0 there rather than a zero it would have got for free. Assembling
-    # after solve() would read the final state, where the constraint is
-    # satisfied and the check would pass for the wrong reason. The row
-    # indices only exist once setUp has run, so the values are read out
-    # below; this Cofunction is unaffected by the solve.
     residual = assemble(replace(F, {wdot: Function(W)}))
 
     first = []

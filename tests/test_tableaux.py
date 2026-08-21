@@ -106,15 +106,6 @@ def test_shu_osher_reproduces_the_butcher_map(A, b, r):
         )
 
 
-# "The completion row equals the last stage row under stiff accuracy" -- i.e.
-# P[-1] == P[-2] and q[-1] == q[-2] for SSPRK32 at r = 2 -- had its own test,
-# which could not fail: test_ssprk32_gives_the_textbook_form above pins those
-# five rows to exact values in which P[3, 2] == P[4, 2] == 2/3 and
-# q[3] == q[4] == 1/3, so the equality is a consequence of assertions already
-# made on the same call. The general property (b == A[s-1,:] in the tableau
-# itself) is asserted directly by test_stiff_accuracy_r3 below.
-
-
 def test_kraaijevanger_radius():
     """R(A, b) for the two reference tableaux and for imex_euler.
 
@@ -133,30 +124,13 @@ def test_kraaijevanger_radius():
 
 
 def test_radius_is_sharp():
-    """Just above the radius the conversion must be rejected, not silently wrong.
-
-    ``pytest.raises(match=r"2\\.0")`` alone is not discriminating here: it is
-    already satisfied by the "2.0" *inside* "r = 2.0001", the offending r
-    value, regardless of whether R(A,b) is reported correctly at all. The
-    actual radius is 2.0000000000002, which the error message formats with
-    ``:.10g`` as bare "2" (trailing zeros stripped) -- so checking for both
-    numbers separately, with the radius's real (non-".0"-suffixed) form,
-    is what actually exercises the message rather than being satisfied by
-    the r value alone.
-    """
+    """Just above the radius the conversion must be rejected."""
     shu_osher(SSPRK32_A, SSPRK32_B, 2.0)  # must not raise
     with pytest.raises(ShuOsherError) as excinfo:
         shu_osher(SSPRK32_A, SSPRK32_B, 2.0001)
     message = str(excinfo.value)
     assert "r = 2.0001" in message
     assert "R(A,b) = 2" in message
-
-
-# butcher_to_K's shape and placement are not asserted directly: transcribing
-# its six lines with Heun's numbers restates the implementation, and any
-# misplacement (a transpose, b in the wrong row) breaks
-# test_shu_osher_reproduces_the_butcher_map, which checks the stage map the
-# folded completion row is there to produce.
 
 
 def test_module_does_not_import_firedrake():
@@ -304,13 +278,6 @@ def test_acceptance_report_reproduces_the_spec_table(name):
             assert report[key] is expected, key
         else:
             assert report[key] == pytest.approx(expected, abs=1e-12), key
-
-
-# ARKTableau's eq=False is not asserted. It was justified as "essential for
-# registry lookups", but TABLEAUX is {t.name: t} -- keyed by strings -- and
-# nothing in the package hashes or compares an ARKTableau, so the test pinned
-# a dataclass option no caller depends on, and its set-of-four assertion was a
-# second inventory pin that a fifth tableau would break.
 
 
 @pytest.mark.parametrize(

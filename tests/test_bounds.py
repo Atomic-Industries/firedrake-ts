@@ -1,47 +1,10 @@
-"""The boundedness result that motivates COOL-193.
+"""The boundedness result that motivates the Shu-Osher timestepper.
 
 DG1 square-wave advection with a Zhang-Shu scaling limiter on every explicit
 substage must hold 0 <= f <= 1 to machine precision. The reference
 Butcher-form implementation gives -0.0099 / +1.0100, so the negative control
 below must FAIL to bound -- otherwise this problem is not challenging and the
 test proves nothing.
-
-Two things here are load-bearing, and getting either wrong silently
-manufactures a passing test.
-
-The element must place its dofs at the cell ends. A nodal limiter can only
-bound the polynomial where its nodes sit, and the cell mean is a positive-
-weight combination of exactly those nodal values (this is what makes scaling
-about the mean preserve it). If the nodes stay strictly inside the cell,
-forcing the polynomial in range there says nothing about its value at the
-cell endpoints -- and the endpoint traces are exactly what the upwind flux
-samples. Firedrake's default ``FunctionSpace(mesh, "DG", 1)`` places its
-dofs at the interior Gauss-Legendre points (in-cell fractions 0.2113/0.7887),
-not the cell ends: a linear function held inside [0, 1] at those points can
-still reach -0.366/+1.366 at the endpoints, and those traces can carry the
-cell mean out of [0, 1] regardless of what the limiter did.
-``variant="equispaced"`` places the dofs at fractions 0/1 -- the cell
-vertices -- closing that gap: the traces the flux sees are precisely the
-values the limiter bounds.
-
-The mean must not be clamped. Writing ``m = min(max(mean, 0, 1))`` forces
-every cell into [0, 1] regardless of what the stepper did, so the bounds
-test passes while the means underneath are out of range. That is a
-post-step clamp in per-stage clothing -- precisely what this design claims
-to be unnecessary. Scale about the *true* mean; if it is out of range the
-limiter cannot help, and the test should say so.
-
-A third thing is load-bearing for a different reason: every bounds
-assertion below is also satisfied by a solution that never moved (a
-stationary square wave has cell means and a mass that are trivially in
-range and conserved) and by a solution collapsed to first-order upwind
-(clamping every cell to its mean is even more trivially bounded). Neither
-is the claim under test. The bounds test therefore also asserts liveness --
-that the wave actually advected close to its exact translate, and that the
-limiter genuinely scaled at least one cell -- so a regression that silently
-zeroes the stage residual or the update (the plan's own warning about a
-DM-scoped SNESSetFunction, or a bug in the freeze zeroing every Ydot row)
-fails loudly instead of passing by accident.
 """
 
 from collections import namedtuple
@@ -68,19 +31,6 @@ def _zhang_shu(V, V0, mean_range=None, clipped=None):
     Zhang-Shu is a scaling limiter: it cannot repair an out-of-range cell
     MEAN, which is exactly why the stage value it acts on must already be a
     convex combination.
-
-    Owns a dedicated scratch Function rather than borrowing the solution.
-    The solution Function is also ``ctx._x``, which the TS callbacks write
-    into; reusing it here would work only by accident of ordering.
-
-    DG dof storage is cell-contiguous, so ``reshape(ncell, per_cell)`` gives
-    one row per cell -- and the ``np.allclose`` check inside pins that
-    assumption together with the equispaced/vertex placement: for a linear
-    function the arithmetic mean of its two nodal values equals its true
-    cell mean only if the two rows genuinely correspond to one cell each. If
-    the reshape ever paired the wrong dofs, or the element quit placing them
-    where this relies on, that check fails immediately instead of quietly
-    producing a wrong ``theta``.
 
     :arg mean_range: optional list appended with ``(min, max)`` of the cell
         means seen on every call. Zhang-Shu can only scale a cell TOWARD its
@@ -138,15 +88,6 @@ def _advect(stepper_parameters, limited, mean_range=None, clipped=None):
     Returns an ``Advection``: the trace bounds, the solution Function itself
     (so a caller can check it against the exact translate), the solver (so a
     caller can check the accepted step count), and the pre-solve mass.
-
-    A ``velocity`` override used to hang off this signature, for the "would
-    this test actually detect a stalled advection" sanity check -- set the
-    physical velocity to zero, leave the CFL-derived dt alone, and you have
-    "transport silently absent, everything else identical." No test ever
-    passed it, and its answer is recorded permanently in the L1 assertion
-    below, which names the ~0.4 a stationary solution produces against the
-    ~0.016 of a real run. Keeping an unused parameter so the experiment can be
-    re-run is not worth it once the number is written down.
     """
     mesh = PeriodicUnitIntervalMesh(N)
     # variant="equispaced" is REQUIRED, not cosmetic: see the module docstring.
@@ -190,25 +131,7 @@ def _advect(stepper_parameters, limited, mean_range=None, clipped=None):
 
 
 def test_shu_osher_form_holds_bounds_with_no_post_step_clamp():
-    """The strong claim: bounds from the Shu-Osher induction alone.
-
-    Boundedness alone is a weak claim: a solution that never left its
-    initial condition, or one collapsed to first-order upwind by clamping
-    every cell to its mean, would satisfy every bounds assertion below just
-    as trivially. So this also asserts liveness -- that the wave actually
-    advected close to its exact translate, and that the limiter genuinely
-    scaled at least one cell -- which a stationary or over-limited solution
-    would fail. See the module docstring.
-
-    Mass conservation is checked here too, on this run. It had a test of its
-    own, which re-ran the identical 126-step limited solve behind a
-    forty-line copy of ``_advect``'s body -- the second most expensive test in
-    the suite, for two lines of assertion about a solve already performed.
-    Both claims are about the same limiter on the same trajectory, and the
-    module docstring already ties them together: if the limiter is not
-    scaling about the mean, the bounds result would be meaningless even if it
-    passed.
-    """
+    """The strong claim: bounds from the Shu-Osher induction alone."""
     mean_range = []
     clipped = [0]
     run = _advect(ARK_SSP_G5, limited=True, mean_range=mean_range, clipped=clipped)
@@ -242,12 +165,7 @@ def test_shu_osher_form_holds_bounds_with_no_post_step_clamp():
     )
     l1_error = assemble(abs(f - exact) * dx)
     assert l1_error < 0.06, (
-        f"L1 error against the exact translate = {l1_error}, expected a "
-        "modest O(h) error (measured ~0.016 for a correctly-advected run) "
-        "-- a stationary solution gives ~0.4 here and a limiter forced to "
-        "theta=0 (collapsing every cell to first-order upwind) gives ~0.09, "
-        "so this threshold catches a silently-frozen stepper as loudly as "
-        "an over-limited one, while leaving room for genuine numerical error"
+        f"L1 error against the exact translate = {l1_error}."
     )
     assert clipped[0] > 0, (
         "the limiter never actually scaled a cell (theta < 1 never "
@@ -255,11 +173,6 @@ def test_shu_osher_form_holds_bounds_with_no_post_step_clamp():
         "range the stepper handed it, which proves nothing about the "
         "Shu-Osher induction"
     )
-    # A range, not == 126: the exact count is an artifact of stepover's final
-    # overshoot (0.2/0.0016 landing one rounding past the last whole step), so
-    # pinning it made any unrelated change to step accounting fail here with a
-    # message pointing at the wrong thing. The L1-vs-exact-translate bound
-    # above is what actually establishes the run advanced.
     steps = solver.ts.getStepNumber()
     assert 120 <= steps <= 130, (
         f"expected ~126 accepted steps, got {steps} -- the run did not "
@@ -267,10 +180,7 @@ def test_shu_osher_form_holds_bounds_with_no_post_step_clamp():
     )
 
     # Mass neutrality. Zhang-Shu scales about the cell mean, so the limiter
-    # must not move the mass at all: COOL-193 measured it exact to 2e-16 with
-    # the limiter active, the defect it describes being purely in boundedness.
-    # Measured drift here is ~2.3e-16; 1e-13 is generous but four orders
-    # tighter than the 1e-12 it replaced, which constrained nothing.
+    # must not move the mass at all
     assert run.initial_mass > 0.0
     final_mass = float(assemble(f * dx))
     assert abs(final_mass - run.initial_mass) < 1e-13 * abs(run.initial_mass), (
