@@ -489,6 +489,64 @@ class DAESolver(OptionsManager):
         self._setup = True
         check_ts_convergence(self.ts)
 
+    def step(self):
+        r"""Advance to the next *accepted* PETSc ``TS`` step.
+
+        Wraps one call to ``TS.step()`` (PETSc's ``TSStep()``): PETSc
+        retries internally on a rejected attempt and only returns once a
+        step has been accepted or its retry budget is exhausted -- there
+        is no partial-attempt state this method could expose even if it
+        wanted to. Callable repeatedly in place of :meth:`solve`, to drive
+        the integrator one accepted step at a time, e.g.::
+
+            while solver.ts.getTime() < t_end:
+                if not solver.step():
+                    break
+
+        ``TSStep()`` does not stop itself at ``tspan[1]``: like the
+        ``ts_exact_final_time="stepover"`` behaviour :meth:`solve` already
+        relies on, a step straddling the end time is taken in full and may
+        land past it. The caller's loop condition is what stops the drive,
+        exactly as in :meth:`solve`'s own ``while (t < maxtime) TSStep()``.
+
+        The accepted state lives in ``self.ts.getSolution()`` after each
+        call -- precisely what a ``monitor_callback`` already receives.
+        ``problem.u_restrict`` is only synced back from the TS's internal
+        work vector by :meth:`solve`, once, at the very end, so it does
+        not reflect intermediate accepted steps taken through this method.
+
+        Calling this on a solver that has already run :meth:`solve` to
+        completion, or mixing calls to the two methods, is not a supported
+        usage -- drive a given :class:`DAESolver` with one or the other.
+
+        :returns: ``True`` if the step was accepted. ``False`` if PETSc
+            exhausted its retry budget without accepting one -- reachable
+            only with ``ts_error_if_step_fails`` set to ``False``; at
+            PETSc's default (``True``, as in :meth:`solve`) that case
+            instead raises a :class:`petsc4py.PETSc.Error`.
+        """
+        if self._step_loop_started:
+            dm = self.ts.getDM()
+        else:
+            dm = self._prepare_solve()
+            with self._problem.u_restrict.dat.vec as u:
+                u.copy(self._work)
+            self.ts.setSolution(self._work)
+            self._step_loop_started = True
+
+        with ExitStack() as stack:
+            for ctx in chain(
+                (
+                    self.inserted_options(),
+                    dmhooks.add_hooks(dm, self, appctx=self._ctx),
+                ),
+                self._transfer_operators,
+            ):
+                stack.enter_context(ctx)
+            self._guarded_ts_call(self.ts.step)
+
+        return self.ts.getConvergedReason() >= 0
+
     def _python_stepper_context(self):
         """The Python context of a ``TSPYTHON`` stepper, or ``None``."""
         if self.ts.getType() != PETSc.TS.Type.PYTHON:
