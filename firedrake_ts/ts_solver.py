@@ -325,6 +325,11 @@ class DAESolver(OptionsManager):
         # Used for custom grid transfer.
         self._transfer_operators = ()
         self._setup = False
+        # Guards the one-time setup `step()` needs on its first call
+        # (`_prepare_solve`, `ts.setSolution`) but not on later ones --
+        # `solve()` redoes that setup unconditionally every call instead,
+        # since it is meant as a single one-shot run.
+        self._step_loop_started = False
 
     def _set_problem_eval_funcs(
         self, ctx, problem, nullspace, nullspace_T, near_nullspace
@@ -398,14 +403,15 @@ class DAESolver(OptionsManager):
         """
         self._ctx.transfer_manager = manager
 
-    def solve(self, bounds=None):
-        r"""Solve the time-dependent variational problem.
-        :arg bounds: Optional bounds on the solution (lower, upper).
-            ``lower`` and ``upper`` must both be
-            :class:`~.Function`\s. or :class:`~.Vector`\s.
-        .. note::
-           If bounds are provided the ``snes_type`` must be set to
-           ``vinewtonssls`` or ``vinewtonrsls``.
+    def _prepare_solve(self):
+        r"""One-time setup shared by :meth:`solve` and the first :meth:`step`.
+
+        Checks the ``G`` residual vanishes on algebraic rows, (re-)registers
+        the IFunction/IJacobian/RHS callbacks and nullspaces, and applies the
+        problem's Dirichlet BCs to the current solution.
+
+        :returns: the TS's DM, which the caller passes to
+            :func:`dmhooks.add_hooks`.
         """
         with self.inserted_options():
             self._ctx._check_G_vanishes_on_algebraic_rows()
@@ -421,6 +427,43 @@ class DAESolver(OptionsManager):
         dm = self.ts.getDM()
         for dbc in self._problem.dirichlet_bcs():
             dbc.apply(self._problem.u_restrict)
+        return dm
+
+    def _guarded_ts_call(self, call):
+        r"""Run one PETSc TS driving call with this fork's exception recovery.
+
+        A Python exception raised inside a ``TSPYTHON`` callback cannot be
+        recovered from ``exc.__cause__``: PETSc's default error handler
+        prints as the error unwinds through C, and under captured output
+        that print clears the thread's pending exception before it can be
+        attached. So the stepper records its own exception and this
+        re-raises that, which keeps PETSc's printed C-stack diagnostics
+        intact. Shared by :meth:`solve` (``ts.solve``) and :meth:`step`
+        (``ts.step``), which differ only in which call they make.
+
+        :arg call: a zero-argument callable making the actual TS call.
+        """
+        self._clear_python_stepper_error()
+        try:
+            call()
+        except PETSc.Error as exc:
+            original = (
+                self._python_stepper_error() if exc.ierr == _PETSC_ERR_PYTHON else None
+            )
+            if original is not None:
+                raise original from exc
+            raise
+
+    def solve(self, bounds=None):
+        r"""Solve the time-dependent variational problem.
+        :arg bounds: Optional bounds on the solution (lower, upper).
+            ``lower`` and ``upper`` must both be
+            :class:`~.Function`\s. or :class:`~.Vector`\s.
+        .. note::
+           If bounds are provided the ``snes_type`` must be set to
+           ``vinewtonssls`` or ``vinewtonrsls``.
+        """
+        dm = self._prepare_solve()
 
         if bounds is not None:
             lower, upper = bounds
@@ -441,26 +484,7 @@ class DAESolver(OptionsManager):
                     self._transfer_operators,
                 ):
                     stack.enter_context(ctx)
-                self._clear_python_stepper_error()
-                try:
-                    self.ts.solve(work)
-                except PETSc.Error as exc:
-                    # A Python exception raised inside a TSPYTHON callback
-                    # cannot be recovered from exc.__cause__: PETSc's default
-                    # error handler prints as the error unwinds through C,
-                    # and under captured output that print clears the
-                    # thread's pending exception before it can be attached.
-                    # So the stepper records its own exception and we
-                    # re-raise that, which keeps PETSc's printed C-stack
-                    # diagnostics intact.
-                    original = (
-                        self._python_stepper_error()
-                        if exc.ierr == _PETSC_ERR_PYTHON
-                        else None
-                    )
-                    if original is not None:
-                        raise original from exc
-                    raise
+                self._guarded_ts_call(lambda: self.ts.solve(work))
             work.copy(u)
         self._setup = True
         check_ts_convergence(self.ts)
