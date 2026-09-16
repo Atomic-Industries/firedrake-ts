@@ -832,12 +832,11 @@ class ARKSSP:
 
         * Stiffly accurate (b == A[-1] and bt == At[-1]): the completion IS the
           last stage value, which already carries the implicit contribution.
-          Boundedness still holds, because on the components a limiter acts on
-          Y[-1] was produced by convex-combination row s of [P | q] -- via the
-          stage, not via a separate completion formula.
+          Boundedness holds because Y[-1] was already limited as a stage.
         * Purely explicit (At identically zero): no implicit contribution
           exists to drop, so the Shu-Osher completion row applies directly and
-          is manifestly a convex combination.
+          is a convex combination of cell means. That convexity bounds the mean
+          of x^{n+1}, but not the nodal values, so this row also needs a limiter.
         * Neither: a non-stiffly-accurate tableau WITH an implicit part would
           need the Butcher implicit completion, which the Shu-Osher form cannot
           express.
@@ -857,6 +856,8 @@ class ARKSSP:
                     continue
                 result.axpy(psj, self._Y[j])
                 result.axpy(psj * h / self._r, self._L[j])
+            if self._limiter is not None:
+                self._limiter(result)
             result.copy(x)
             return
         raise ValueError(
