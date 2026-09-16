@@ -10,7 +10,7 @@ test proves nothing.
 from collections import namedtuple
 
 import numpy as np
-from conftest import ARK_SSP_G5, ARKIMEX_2C
+from conftest import ARK_SSP, ARK_SSP_G5, ARKIMEX_2C
 from firedrake import *
 
 import firedrake_ts
@@ -18,6 +18,9 @@ import firedrake_ts
 N = 40
 CFL = 0.064
 VELOCITY = 1.0
+
+#: ARKSSP on a purely-explicit SSPRK tableau
+ARK_SSP_SSPRK2 = {**ARK_SSP, "ts_ark_ssp_type": "ssprk2"}
 
 #: What one advection run yields. ``initial_mass`` is measured before the solve
 #: so the mass claim can be checked on the same run as the bounds claim rather
@@ -181,6 +184,28 @@ def test_shu_osher_form_holds_bounds_with_no_post_step_clamp():
     # must not move the mass at all
     assert run.initial_mass > 0.0
     final_mass = float(assemble(f * dx))
+    assert abs(final_mass - run.initial_mass) < 1e-13 * abs(run.initial_mass), (
+        f"mass drifted from {run.initial_mass} to {final_mass}"
+    )
+
+
+def test_purely_explicit_completion_is_limited():
+    """A purely-explicit tableau needs its completion limited too."""
+    mean_range = []
+    run = _advect(ARK_SSP_SSPRK2, limited=True, mean_range=mean_range)
+    assert run.lo >= -1e-10, f"min = {run.lo}, expected >= 0 to machine precision"
+    assert run.hi <= 1.0 + 1e-10, f"max = {run.hi}, expected <= 1 to machine precision"
+
+    # Same mechanistic claim as the stiffly-accurate test: the mean must
+    # never have left [0, 1] either, or the trace bounds above would only
+    # hold as an artifact of a reinstated clamp.
+    assert mean_range, "the limiter never ran; nothing was recorded"
+    mean_lo = min(r[0] for r in mean_range)
+    mean_hi = max(r[1] for r in mean_range)
+    assert mean_lo >= -1e-10, f"cell mean min = {mean_lo}, expected >= 0"
+    assert mean_hi <= 1.0 + 1e-10, f"cell mean max = {mean_hi}, expected <= 1"
+
+    final_mass = float(assemble(run.f * dx))
     assert abs(final_mass - run.initial_mass) < 1e-13 * abs(run.initial_mass), (
         f"mass drifted from {run.initial_mass} to {final_mass}"
     )

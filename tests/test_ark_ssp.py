@@ -365,7 +365,7 @@ def test_shu_osher_matches_butcher_on_the_same_problem():
 
 
 def test_limiter_fires_once_per_stage():
-    """The limiter must see every explicit substage, not just the last."""
+    """The limiter must see every explicit substage, and on completion."""
     calls = []
 
     def counting_limiter(vec):
@@ -388,8 +388,8 @@ def test_limiter_fires_once_per_stage():
     )
     solver.ts.getPythonContext().set_stage_limiter(counting_limiter)
     solver.solve()
-    # 2 stages x 5 steps
-    assert len(calls) == 10, f"limiter fired {len(calls)} times, expected 10"
+    # (2 stages + 1 completion) x 5 steps
+    assert len(calls) == 15, f"limiter fired {len(calls)} times, expected 15"
 
 
 def test_complete_refuses_when_neither_stiffly_accurate_nor_explicit():
